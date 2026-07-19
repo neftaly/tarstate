@@ -28,6 +28,8 @@ import {
   type JsonValue
 } from '../src/index.js';
 import { canonicalizeJsonWithCache } from '../src/internal-canonical-json.js';
+import { sameStructuralJson } from '../src/internal-structural-json-equality.js';
+import { deepFreezeObserverValue } from '../src/internal-observer-values.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 
@@ -72,6 +74,30 @@ describe('production foundation', () => {
   it('canonicalizes JSON deterministically and normalizes negative zero', () => {
     expect(canonicalizeJson({ z: -0, a: ['x', { b: true, a: null }] })).toBe('{"a":["x",{"a":null,"b":true}],"z":0}');
     expect(() => canonicalizeJson('\ud800')).toThrow(/Lone surrogate/);
+  });
+
+  it('compares portable values structurally without depending on key order', () => {
+    expect(sameStructuralJson(
+      { z: -0, nested: { second: [true, null], first: 'value' } },
+      { nested: { first: 'value', second: [true, null] }, z: 0 }
+    )).toBe(true);
+    expect(sameStructuralJson({ value: 1 }, { value: 2 })).toBe(false);
+    expect(sameStructuralJson({ value: Number.NaN }, { value: Number.NaN })).toBe(false);
+  });
+
+  it('detaches observer records without treating __proto__ as mutation', () => {
+    const input = Object.create(null) as Record<string, unknown>;
+    input.value = { nested: true };
+    input.__proto__ = { polluted: true };
+
+    const detached = deepFreezeObserverValue(input);
+
+    expect(Object.getPrototypeOf(detached)).toBe(Object.prototype);
+    expect(Object.hasOwn(detached, '__proto__')).toBe(true);
+    expect(detached.value).toEqual({ nested: true });
+    expect(detached.__proto__).toEqual({ polluted: true });
+    expect(Object.isFrozen(detached)).toBe(true);
+    expect(Object.isFrozen(detached.value)).toBe(true);
   });
 
   it('memoizes canonical subtrees only inside an explicit owned-graph context', () => {

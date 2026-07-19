@@ -1,4 +1,4 @@
-import { samePortableJson } from './internal-json-equality.js';
+import { sameStructuralJson } from './internal-structural-json-equality.js';
 import { freezeOwnedJsonValue } from './internal-owned-json.js';
 import { sealPreparedPlan } from './query/internal/prepared-plan.js';
 import type { PreparedPlan } from './query/plan-contract.js';
@@ -18,12 +18,17 @@ export const deepFreezeObserverValue = <Value>(value: Value, seen = new WeakMap<
   const output: Record<string, unknown> = {};
   seen.set(value, output);
   for (const [key, item] of Object.entries(value)) {
-    Object.defineProperty(output, key, {
-      value: deepFreezeObserverValue(item, seen),
-      enumerable: true,
-      configurable: true,
-      writable: true
-    });
+    const owned = deepFreezeObserverValue(item, seen);
+    if (key === '__proto__') {
+      Object.defineProperty(output, key, {
+        value: owned,
+        enumerable: true,
+        configurable: true,
+        writable: true
+      });
+    } else {
+      output[key] = owned;
+    }
   }
   return Object.freeze(output) as Value;
 };
@@ -51,5 +56,5 @@ export const detachPreparedPlan = <Query>(plan: PreparedPlan<Query>): PreparedPl
 };
 
 export const samePortableObserverValue = (left: unknown, right: unknown): boolean => {
-  return samePortableJson(left, right);
+  return sameStructuralJson(left, right);
 };

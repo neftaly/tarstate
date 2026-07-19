@@ -21,6 +21,7 @@ import {
   type RelationInput
 } from '../src/index.js';
 import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
+import { sameStructuralJson } from '../src/internal-structural-json-equality.js';
 import { propertyTest } from './support/property-test.js';
 
 const portableJson = fc.jsonValue({ maxDepth: 5 }).filter((value) => safeParseJsonValue(value).success);
@@ -108,6 +109,21 @@ describe('shrinking property laws', () => {
     const canonical = canonicalizeJson(value as JsonValue);
     expect(canonicalizeJson(JSON.parse(canonical) as JsonValue)).toBe(canonical);
   }));
+
+  propertyTest('portable-json-structural-equality-matches-canonical-round-trip', fc.property(portableJson, (value) => {
+    const canonicalRoundTrip = JSON.parse(canonicalizeJson(value as JsonValue)) as JsonValue;
+    expect(sameStructuralJson(value, canonicalRoundTrip)).toBe(true);
+  }));
+
+  propertyTest('portable-json-structural-equality-matches-canonical-equality', fc.property(
+    portableJson,
+    portableJson,
+    (left, right) => {
+      expect(sameStructuralJson(left, right)).toBe(
+        canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue)
+      );
+    }
+  ));
 
   propertyTest('canonical-json-object-order-invariance', fc.property(
     fc.dictionary(fc.string({ maxLength: 12 }), portableJson, { maxKeys: 12 }),

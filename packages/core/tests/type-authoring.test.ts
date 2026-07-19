@@ -68,6 +68,7 @@ const schema = await sealSchema({
           id: { type: { kind: 'string' } },
           name: { type: { kind: 'string' }, editCapabilities: [replace] },
           nickname: { type: { kind: 'string' }, optional: true },
+          rating: { type: { kind: 'integer' }, optional: true },
           biography: { type: { kind: 'string' }, nullable: true },
           score: { type: { kind: 'integer' } },
           slug: { type: customScalar<SlugValue>(customCodec) }
@@ -112,6 +113,7 @@ describe('literal-schema and query type authoring', () => {
       readonly id: string;
       readonly name: string;
       readonly nickname?: string;
+      readonly rating?: number;
       readonly biography: string | null;
       readonly score: number;
       readonly slug: SlugValue;
@@ -240,6 +242,54 @@ describe('literal-schema and query type authoring', () => {
     }));
     // @ts-expect-error null does not make incompatible string and number families compatible
     typedUnionAll(nullableText, incompatibleContents);
+  });
+
+  it('aligns optional fields in either union-all branch without widening their families', async () => {
+    const links = typedSelect(author, 'snapshot', (aliases) => ({
+      binaryContent: typedLiteral(null),
+      copyOf: aliases.author.row.nickname,
+      rowKind: typedLiteral('link')
+    }));
+    const contents = typedSelect(manager, 'snapshot', (aliases) => ({
+      binaryContent: aliases.manager.row.nickname,
+      copyOf: typedLiteral(null),
+      rowKind: typedLiteral('content')
+    }));
+    const forward = typedUnionAll(links, contents);
+    const reverse = typedUnionAll(contents, links);
+    type SnapshotRow =
+      | { readonly binaryContent: null; readonly copyOf?: string; readonly rowKind: 'link' }
+      | { readonly binaryContent?: string; readonly copyOf: null; readonly rowKind: 'content' };
+
+    expectTypeOf<QueryResultRowOf<typeof forward>>().toEqualTypeOf<SnapshotRow>();
+    expectTypeOf<QueryResultRowOf<typeof reverse>>().toEqualTypeOf<SnapshotRow>();
+
+    const prepared = await prepareTypedQuery(forward, {
+      registryFingerprint: 'registry:optional-set',
+      authorityFingerprint: 'authority:optional-set',
+      datasetId: 'dataset:optional-set'
+    });
+    expect(prepared.query).toEqual(forward.root);
+    expect(evaluateQuery({
+      root: prepared.query,
+      relations: [{
+        relation: { schemaView: people.schemaView, relationId: people.relationId },
+        rows: [{ id: 'person:one', name: 'One', nickname: 'one', biography: null, score: 1, slug: { type: 'slug', value: 'one' } }],
+        completeness: 'exact'
+      }]
+    }).rows).toEqual([
+      { binaryContent: null, copyOf: 'one', rowKind: 'link' },
+      { binaryContent: 'one', copyOf: null, rowKind: 'content' }
+    ]);
+
+    const optionalText = typedSelect(author, 'incompatible', (aliases) => ({
+      value: aliases.author.row.nickname
+    }));
+    const optionalNumber = typedSelect(manager, 'incompatible', (aliases) => ({
+      value: aliases.manager.row.rating
+    }));
+    // @ts-expect-error optional string and number fields remain incompatible
+    typedUnionAll(optionalText, optionalNumber);
   });
 
   it('prepares a detached query plan without losing inferred rows or parameters', async () => {

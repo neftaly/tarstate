@@ -294,6 +294,15 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
     const windowSession = openIncrementalQueryMaintenance(await plan('window-' + count, window), first);
     measurements.push(benchmark('window-one-row-update', count, updateIterations, (index) => windowSession.applyUpdate(index % 2 === 0 ? forward : backward)));
     windowSession.close();
+    const stableWindowChanged = {
+      relations: [input('score', rows.map((row, index) => index === 0 ? { ...row, active: !row.active } : row))]
+    };
+    const stableWindowSession = openIncrementalQueryMaintenance(await plan('window-stable-order-' + count, window), first);
+    const stableWindowForward = diffQueryMaintenanceSnapshots(first, stableWindowChanged);
+    const stableWindowBackward = diffQueryMaintenanceSnapshots(stableWindowChanged, first);
+    measurements.push(benchmark('window-stable-order-one-row-update', count, updateIterations, (index) =>
+      stableWindowSession.applyUpdate(index % 2 === 0 ? stableWindowForward : stableWindowBackward)));
+    stableWindowSession.close();
     const partitionBy = [field('score', 'group')];
     const partitionedWindow = { ...window, fields: {
       rowNumber: { kind: 'window', op: 'row-number', partitionBy, orderBy },
@@ -690,6 +699,7 @@ const ungroupedReducerUpdate10k = measurement('aggregate-reducer-ungrouped-one-r
 const groupedReducerOpen1k = measurement('aggregate-reducer-grouped-open', 1_000)?.millisecondsPerOperation;
 const groupedReducerOpen10k = measurement('aggregate-reducer-grouped-open', 10_000)?.millisecondsPerOperation;
 const windowUpdate10k = measurement('window-one-row-update', 10_000)?.millisecondsPerOperation;
+const stableOrderWindowUpdate10k = measurement('window-stable-order-one-row-update', 10_000)?.millisecondsPerOperation;
 const windowPure10k = measurement('window-three-fields', 10_000)?.millisecondsPerOperation;
 const partitionedWindowUpdate10k = measurement('window-partitioned-one-row-update', 10_000)?.millisecondsPerOperation;
 const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure', 10_000)?.millisecondsPerOperation;
@@ -735,6 +745,7 @@ const contracts = {
   // sorting alone sampled above 3.5 MB/update in the rejected implementation.
   highCardinalityDistinctAllocationCeiling: highCardinalityDistinctBytesPerUpdate <= 500_000,
   globalWindowIncrementalAdvantage: windowPure10k !== undefined && windowUpdate10k !== undefined && windowUpdate10k < windowPure10k * 0.5,
+  stableOrderWindowOneRow10kCeiling: stableOrderWindowUpdate10k !== undefined && stableOrderWindowUpdate10k <= 5,
   partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
   partitionedWindowOneRow10kCeiling: partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k <= 30,

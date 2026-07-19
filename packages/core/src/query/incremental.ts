@@ -82,7 +82,6 @@ export const openIncrementalQueryMaintenance = (
   let closed = false;
   let revision = 0;
   let rejectedUpdateCount = 0;
-  let valueIdentities = new WeakMap<ScopedRow, string>();
   const publicRows = new WeakMap<ScopedRow, QueryRecord>();
   let executionPhase: 'idle' | 'updating' = 'idle';
   let closeRequested = false;
@@ -105,7 +104,6 @@ export const openIncrementalQueryMaintenance = (
     materialized.clear();
     acceptedSnapshot = closedMaintenanceSnapshot;
     assertedRoot = undefined;
-    valueIdentities = new WeakMap();
   };
 
   return {
@@ -172,7 +170,7 @@ export const openIncrementalQueryMaintenance = (
           journal.set(node, previousNode);
           materialized.set(node, nextNode);
           updatedNodeCount += 1;
-          if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
+          if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode)) changedNodes.add(node);
         }
         acceptedSnapshot = nextSnapshot;
         const root = materialized.get(queryRoot);
@@ -184,7 +182,7 @@ export const openIncrementalQueryMaintenance = (
             updatedNodeCount,
             changedNodes.size,
             changedRelationIds(ownedUpdate.relations),
-            diffMaintainedResults(assertedRoot, root, valueIdentities),
+            diffMaintainedResults(assertedRoot, root),
             revision,
             rejectedUpdateCount,
             summarizeOperatorEvents(operatorEvents.values())
@@ -205,7 +203,6 @@ export const openIncrementalQueryMaintenance = (
           if (previous === undefined) materialized.delete(node);
           else materialized.set(node, previous);
         }
-        valueIdentities = new WeakMap();
         throw error;
       } finally {
         executionPhase = 'idle';
@@ -303,7 +300,6 @@ export const createPooledIncrementalQueryRuntime = (input: {
   let sharedPhysicalNodeCount = 0;
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
   const roots = new Set<PooledRootState>();
-  let valueIdentities = new WeakMap<ScopedRow, string>();
   const publicRows = new WeakMap<ScopedRow, QueryRecord>();
   let acceptedSnapshot: QueryMaintenanceSnapshot = ownedInitialSnapshot;
   let runtimeIssues = validateMaintenanceSnapshot(ownedInitialSnapshot);
@@ -416,7 +412,6 @@ export const createPooledIncrementalQueryRuntime = (input: {
     runtimeIssues = [];
     transitionEvidence = emptyPooledTransitionEvidence(false);
     assertionInvalidated = false;
-    valueIdentities = new WeakMap();
     refreshDiagnostics(0, 0, collected);
   };
 
@@ -476,7 +471,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
         summary.changedNodeCount,
         transitionEvidence.changedRelationIds,
         rootChanged || transitionEvidence.assertionWasInvalidated
-          ? diffMaintainedResults(previousRoot, nextRoot, valueIdentities)
+          ? diffMaintainedResults(previousRoot, nextRoot)
           : emptyIncrementalQueryResultDelta,
         revision,
         rejectedUpdateCount,
@@ -699,7 +694,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       materialized.set(node, nextNode);
       unmaterializedNodes.delete(node);
       updatedNodes.add(node);
-      if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) {
+      if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode)) {
         changedNodes.add(node);
         if (record.rootOwners.size > 0) {
           previousRootNodes.set(node, previousNode);
@@ -768,9 +763,6 @@ export const createPooledIncrementalQueryRuntime = (input: {
         root.currentIsAssertion = state.currentIsAssertion;
         root.publishedRevision = state.publishedRevision;
       }
-      // Identity entries computed from an aborted graph may refer to values
-      // that were never accepted. Rebuild them lazily from restored nodes.
-      valueIdentities = new WeakMap();
       throw error;
     } finally {
       executionPhase = 'idle';

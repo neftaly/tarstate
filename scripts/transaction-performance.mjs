@@ -59,6 +59,7 @@ const measure = async (changed) => {
 
 const noOp = await measure(false);
 const oneRow = await measure(true);
+const directAutomerge = await measureDirectAutomerge();
 const contracts = {
   independentRepeatedSamples: sampleCount >= 5,
   exactCommitSemantics: noOp.correctnessFailures.length === 0 && oneRow.correctnessFailures.length === 0,
@@ -76,6 +77,7 @@ const report = {
     warmupIterations,
     noOpMillisecondsPerTransaction: noOp.milliseconds,
     oneRowMillisecondsPerTransaction: oneRow.milliseconds,
+    directAutomergeOneRowMillisecondsPerChange: directAutomerge,
     correctnessFailures: [...noOp.correctnessFailures, ...oneRow.correctnessFailures]
   },
   node: process.version
@@ -88,6 +90,38 @@ if (Object.values(contracts).some((passed) => !passed)) {
 
 function reference(artifact) {
   return { id: artifact.id, contentHash: artifact.contentHash };
+}
+
+async function measureDirectAutomerge() {
+  const samples = [];
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const repo = new Repo();
+    const handle = repo.create({
+      tasks: Object.fromEntries(Array.from({ length: rowCount }, (_, index) => [
+        'task-' + index,
+        { id: 'task-' + index, title: 'Title ' + index }
+      ]))
+    });
+    let sequence = 0;
+    const change = () => {
+      const current = sequence;
+      sequence += 1;
+      handle.change((draft) => {
+        draft.tasks['task-0'].title = 'Changed ' + current;
+      });
+    };
+    try {
+      for (let index = 0; index < warmupIterations; index += 1) change();
+      globalThis.gc();
+      const started = performance.now();
+      for (let index = 0; index < iterations; index += 1) change();
+      samples.push((performance.now() - started) / iterations);
+    } finally {
+      await repo.shutdown();
+    }
+  }
+  samples.sort((left, right) => left - right);
+  return Number(samples[Math.floor(samples.length / 2)].toFixed(3));
 }
 
 async function openBenchmarkRuntime() {

@@ -331,7 +331,7 @@ type SetFieldCompatible<Left, Right> =
       ? SetFieldAcceptsNullAlignment<Left>
       : NonNullSetFieldCompatible<SetFieldFamily<Left>, SetFieldFamily<Right>>;
 type IncompatibleSetFields<Left, Right> = {
-  [Field in keyof Left]: Field extends keyof Right
+  [Field in keyof Left]-?: Field extends keyof Right
     ? SetFieldCompatible<Left[Field], Right[Field]> extends true ? never : Field
     : Field;
 }[keyof Left];

@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/react",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "description": "React observer and commit bindings for Tarstate",
   "license": "MIT",

@@ -1461,7 +1461,10 @@ export const maintenanceState = (
 
 export const emptyIncrementalQueryResultDelta: IncrementalQueryResultDelta = Object.freeze({ addedResultKeys: Object.freeze([]), removedResultKeys: Object.freeze([]), updatedResultKeys: Object.freeze([]) });
 
-export const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: MaterializedQueryNode, values: WeakMap<ScopedRow, string>): boolean => {
+export const materializedQueryNodeEqual = (
+  left: MaterializedQueryNode,
+  right: MaterializedQueryNode
+): boolean => {
   if (left.unavailable !== right.unavailable || left.result.completeness !== right.result.completeness) return false;
   if (left.issues.length !== right.issues.length || left.issues.some((issue, index) => issue.id !== right.issues[index]?.id)) return false;
   if (left.result.rows.length !== right.result.rows.length) return false;
@@ -1472,14 +1475,14 @@ export const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: M
       const candidate = right.result.rows[index];
       if (row === undefined
         || candidate === undefined
-        || row !== candidate && scopedRowIdentity(row, values) !== scopedRowIdentity(candidate, values)) return false;
+        || !sameResultRowValue(row, candidate)) return false;
     }
     return true;
   }
   for (let index = 0; index < left.result.rows.length; index += 1) {
     const row = left.result.rows[index] as ScopedRow;
     const candidate = right.result.rows[index] as ScopedRow;
-    if (row !== candidate && scopedRowIdentity(row, values) !== scopedRowIdentity(candidate, values)) return false;
+    if (!sameResultRowValue(row, candidate)) return false;
   }
   return true;
 };
@@ -1499,21 +1502,16 @@ const changedRowPositionsIfStableIdentity = (
   return changed;
 };
 
-const scopedRowIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => stringTupleKey(resultKey(row), rowValueIdentity(row, values));
-const rowValueIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => {
-  const cached = values.get(row);
-  if (cached !== undefined) return cached;
-  const identity = canonicalizeQueryValue(visibleRow(row));
-  values.set(row, identity);
-  return identity;
-};
-
-
+const sameResultRowValue = (
+  left: ScopedRow,
+  right: ScopedRow
+): boolean => left === right
+  || (resultKey(left) === resultKey(right)
+    && queryValueEqual(visibleRow(left), visibleRow(right)));
 
 export const diffMaintainedResults = (
   previousRoot: MaterializedQueryNode | undefined,
-  nextRoot: MaterializedQueryNode | undefined,
-  values: WeakMap<ScopedRow, string>
+  nextRoot: MaterializedQueryNode | undefined
 ): IncrementalQueryResultDelta => {
   // Invalidation withdraws the current assertion; it does not prove removals.
   if (nextRoot === undefined || nextRoot.unavailable || nextRoot.result.completeness === 'unknown') return emptyIncrementalQueryResultDelta;
@@ -1539,7 +1537,7 @@ export const diffMaintainedResults = (
       const before = beforeRows[index];
       const after = afterRows[index];
       if (before === undefined || after === undefined || before === after) continue;
-      if (rowValueIdentity(before, values) !== rowValueIdentity(after, values)) updatedResultKeys.push(resultKey(after));
+      if (!sameResultRowValue(before, after)) updatedResultKeys.push(resultKey(after));
     }
     return updatedResultKeys.length === 0
       ? emptyIncrementalQueryResultDelta
@@ -1555,28 +1553,28 @@ export const diffMaintainedResults = (
         identitiesStable = false;
         break;
       }
-      if (row !== after && rowValueIdentity(row, values) !== rowValueIdentity(after, values)) updatedResultKeys.push(resultKey(row));
+      if (!sameResultRowValue(row, after)) updatedResultKeys.push(resultKey(row));
     }
     if (identitiesStable) {
       return updatedResultKeys.length === 0 ? emptyIncrementalQueryResultDelta : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys };
     }
   }
-  const previousRows = resultIdentityMap(beforeRows, values);
-  const nextRows = resultIdentityMap(afterRows, values);
+  const previousRows = resultRowsByKey(beforeRows);
+  const nextRows = resultRowsByKey(afterRows);
   const added: string[] = [];
   const removed: string[] = [];
   const updated: string[] = [];
   for (const [key, before] of previousRows) {
     const after = nextRows.get(key);
     if (after === undefined) removed.push(key);
-    else if (before !== after) updated.push(key);
+    else if (!sameResultRowValue(before, after)) updated.push(key);
   }
   for (const key of nextRows.keys()) if (!previousRows.has(key)) added.push(key);
   return { addedResultKeys: added.sort(), removedResultKeys: removed.sort(), updatedResultKeys: updated.sort() };
 };
 
-const resultIdentityMap = (rows: readonly ScopedRow[], values: WeakMap<ScopedRow, string>): ReadonlyMap<string, string> =>
-  new Map(rows.map((row) => [resultKey(row), rowValueIdentity(row, values)]));
+const resultRowsByKey = (rows: readonly ScopedRow[]): ReadonlyMap<string, ScopedRow> =>
+  new Map(rows.map((row) => [resultKey(row), row]));
 
 const frozenInternalArray = <Value>(values: readonly Value[]): readonly Value[] =>
   Object.isFrozen(values) ? values : Object.freeze([...values]);

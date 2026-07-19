@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/automerge",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "description": "Automerge source and storage bindings for Tarstate",
   "license": "MIT",

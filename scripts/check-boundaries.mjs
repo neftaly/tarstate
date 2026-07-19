@@ -68,6 +68,7 @@ assignArchitectureGroup('foundation', [
   'internal-pipe.ts',
   'internal-provenance-registry.ts',
   'internal-seal.ts',
+  'internal-structural-json-equality.ts',
   'internal-string-key.ts',
   'issues.ts',
   'portable-bytes.ts',
