@@ -181,6 +181,58 @@ describe('Automerge shrinking model properties', () => {
     }
   ));
 
+  propertyTest('dependent local text changes survive concurrent delivery orders', fc.property(
+    unicodeText,
+    safeString,
+    fc.nat(),
+    fc.nat(),
+    unicodeText,
+    fc.nat(),
+    fc.nat(),
+    (initial, localText, localStart, localEnd, remoteText, remoteStart, remoteEnd) => {
+      const boundaries = codePointBoundaries(initial);
+      const localInsert = 'L' + localText + 'M';
+      const firstLocal = normalizedSplice(boundaries, localStart, localEnd, localInsert);
+      const remote = normalizedSplice(boundaries, remoteStart, remoteEnd, 'R' + remoteText);
+      const base = Automerge.from({ text: initial }, { actor: 'b'.repeat(64) });
+      const localFirst = Automerge.change(
+        Automerge.clone(base, { actor: 'c'.repeat(64) }),
+        (draft) => {
+          Automerge.splice(
+            draft,
+            ['text'],
+            firstLocal.index,
+            firstLocal.deleteCount,
+            firstLocal.insert
+          );
+        }
+      );
+      const localCandidate = Automerge.change(localFirst, (draft) => {
+        Automerge.splice(draft, ['text'], firstLocal.index + 1, 0, 'Z');
+      });
+      const remoteCandidate = Automerge.change(
+        Automerge.clone(base, { actor: 'd'.repeat(64) }),
+        (draft) => {
+          Automerge.splice(draft, ['text'], remote.index, remote.deleteCount, remote.insert);
+        }
+      );
+      const localThenRemote = Automerge.merge(
+        Automerge.clone(localCandidate),
+        Automerge.clone(remoteCandidate)
+      );
+      const remoteThenLocal = Automerge.merge(
+        Automerge.clone(remoteCandidate),
+        Automerge.clone(localCandidate)
+      );
+
+      expect(Automerge.getChanges(base, localCandidate)).toHaveLength(2);
+      expect(localThenRemote.text).toBe(remoteThenLocal.text);
+      expect(localThenRemote.text).toContain('LZ' + localText + 'M');
+      expect(Automerge.getHeads(localThenRemote).sort())
+        .toEqual(Automerge.getHeads(remoteThenLocal).sort());
+    }
+  ));
+
   propertyTest('staged generated identities equal committed and replayed evidence', fc.asyncProperty(
     fc.array(safeString, { minLength: 1, maxLength: 8 }),
     async (values) => {

@@ -97,10 +97,18 @@ does not represent a stream whose later offsets depend on earlier
 unacknowledged local insertions. This is a real generic editor capability, not a
 Patchpit convention and not a defect that numeric replay can safely repair.
 
+Private Automerge integration evidence confirms that a fresh-actor retained
+branch preserves dependent local changes across merge delivery order, buffered
+dependent splices can become one source-native change, and relative cursors
+converge with explicit before/after movement after deletion. This proves source
+feasibility, not the Tarstate session lifecycle.
+
 Implementation is deferred until one design proves a bounded source-native
-candidate lifecycle, segment-level rejection and unknown-outcome evidence,
-historical-basis loss behavior, constraint validation before every conditional
-publication, and delivery-order convergence against real Automerge branches.
+candidate lifecycle, segment-level rejection and unknown-outcome suspension,
+historical-basis loss behavior, and constraint validation before every
+conditional publication. In particular, retained history must not be squashed
+in a way that changes source-native identity, and later segments must not publish
+while an ancestor outcome is unknown.
 Opaque deletion-aware anchors should remain a separately advertised capability
 unless implementation evidence shows they require the same lifecycle. Memory
 and non-mergeable stores may honestly report both capabilities absent.
