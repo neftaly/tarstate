@@ -52,7 +52,7 @@ Maintainers and agents should then read:
 - **Should** records a strong default that may be violated only with concrete
   evidence and a documented tradeoff.
 - **May** identifies supported variation.
-- **Current fact** names behavior verified in the 0.5.1 source or checks.
+- **Current fact** names behavior verified in the 0.6.0 source or checks.
 - **Gap** names incomplete evidence or a known mismatch. A gap is not permission
   to invent a second path.
 - **Candidate** is deliberately non-normative until it survives review and gains

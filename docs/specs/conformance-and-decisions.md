@@ -1,6 +1,6 @@
 # Conformance, decisions, and review record
 
-This ledger records the 0.5.1 baseline reviewed on 2026-07-19. It separates
+This ledger records the 0.6.0 baseline reviewed on 2026-07-19. It separates
 verified current evidence from target rules and candidates. It is not a
 changelog.
 
