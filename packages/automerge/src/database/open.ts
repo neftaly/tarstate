@@ -29,6 +29,7 @@ import {
 import { adoptConflictFreeAutomergeJsonValue } from '../document/json-value.js';
 import { AutomergeAtomicSource } from '../adapter/atomic-source.js';
 import { AutomergeMappedStorageBinding } from '../adapter/mapped-storage.js';
+import { createAutomergeTextPositionResolver } from '../adapter/text-positions.js';
 import {
   createLiveAutomergeDatabase,
 } from './live.js';
@@ -125,7 +126,8 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
       bindings: [binding],
       registry,
       // The standard runtime ledger is process-local even when the document is persisted.
-      durability: 'memory'
+      durability: 'memory',
+      textPositions: createAutomergeTextPositionResolver(binding)
     });
     const transactions = transactionRuntime.transactions;
     const textIntents = createAttachmentTextIntentService({

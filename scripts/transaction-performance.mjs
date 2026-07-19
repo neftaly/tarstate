@@ -64,7 +64,7 @@ const noOp = await measure(false);
 const oneRow = await measure(true);
 const dependentText = await measureDependentText();
 const continuedText = await measureContinuedText();
-const largeTextAuthoring = await measureTextAuthoring(2_000, 16);
+const largeText = await measureLargeText(2_000, 16, 32);
 const directAutomerge = await measureDirectAutomerge();
 const contracts = {
   independentRepeatedSamples: sampleCount >= 5,
@@ -75,7 +75,10 @@ const contracts = {
   oneRow100RowsCeiling: oneRow.milliseconds <= 30,
   dependentText16SegmentsCeiling: dependentText.milliseconds <= 60,
   continuedText8Segments2PublicationsCeiling: continuedText.milliseconds <= 100,
-  textAuthoring16Segments2kRowsCeiling: largeTextAuthoring.milliseconds <= 20
+  textAuthoring16Segments2kRowsCeiling: largeText.authoringMilliseconds <= 20,
+  textPublication2kRowsCeiling: largeText.publicationMilliseconds <= 300,
+  textPositions32At2kRowsDeltaCeiling: largeText.positionDeltaMilliseconds <= 75,
+  textPositionSemantics: largeText.correctnessFailures.length === 0
 };
 const report = {
   benchmark: 'tarstate-public-automerge-database-transactions',
@@ -90,13 +93,17 @@ const report = {
     oneRowMillisecondsPerTransaction: oneRow.milliseconds,
     dependentText16SegmentsMillisecondsPerComposition: dependentText.milliseconds,
     continuedText8Segments2PublicationsMillisecondsPerComposition: continuedText.milliseconds,
-    textAuthoring16Segments2kRowsMilliseconds: largeTextAuthoring.milliseconds,
+    textAuthoring16Segments2kRowsMilliseconds: largeText.authoringMilliseconds,
+    textPublication2kRowsMilliseconds: largeText.publicationMilliseconds,
+    textPositions32At2kRowsMilliseconds: largeText.positionMilliseconds,
+    textPositions32At2kRowsDeltaMilliseconds: largeText.positionDeltaMilliseconds,
     directAutomergeOneRowMillisecondsPerChange: directAutomerge,
     correctnessFailures: [
       ...noOp.correctnessFailures,
       ...oneRow.correctnessFailures,
       ...dependentText.correctnessFailures,
-      ...continuedText.correctnessFailures
+      ...continuedText.correctnessFailures,
+      ...largeText.correctnessFailures
     ]
   },
   node: process.version
@@ -201,19 +208,51 @@ async function measureContinuedText() {
   };
 }
 
-async function measureTextAuthoring(inputRows, segments) {
-  const samples = [];
+async function measureLargeText(inputRows, segments, positionCount) {
+  const authoringSamples = [];
+  const publicationSamples = [];
+  const positionSamples = [];
+  const positionDeltaSamples = [];
+  const correctnessFailures = [];
   for (let sample = 0; sample < sampleCount; sample += 1) {
-    const runtime = await openBenchmarkRuntime(inputRows);
+    const authoringRuntime = await openBenchmarkRuntime(inputRows);
     try {
-      await runtime.authorText(segments);
-      samples.push(await runtime.authorText(segments));
+      await authoringRuntime.authorText(segments);
+      authoringSamples.push(await authoringRuntime.authorText(segments));
     } finally {
-      await runtime.close();
+      await authoringRuntime.close();
+    }
+    const publicationRuntime = await openBenchmarkRuntime(inputRows);
+    try {
+      const publication = await publicationRuntime.publishTextPositions(0);
+      publicationSamples.push(publication.milliseconds);
+      if (!publication.correct) correctnessFailures.push('text-publication-sample-' + sample);
+    } finally {
+      await publicationRuntime.close();
+    }
+    const positionRuntime = await openBenchmarkRuntime(inputRows);
+    try {
+      const positions = await positionRuntime.publishTextPositions(positionCount);
+      positionSamples.push(positions.milliseconds);
+      if (!positions.correct) correctnessFailures.push('text-position-sample-' + sample);
+    } finally {
+      await positionRuntime.close();
     }
   }
-  samples.sort((left, right) => left - right);
-  return { milliseconds: Number(samples[Math.floor(samples.length / 2)].toFixed(3)) };
+  authoringSamples.sort((left, right) => left - right);
+  publicationSamples.sort((left, right) => left - right);
+  positionSamples.sort((left, right) => left - right);
+  for (let index = 0; index < sampleCount; index += 1) {
+    positionDeltaSamples.push(positionSamples[index] - publicationSamples[index]);
+  }
+  positionDeltaSamples.sort((left, right) => left - right);
+  return {
+    authoringMilliseconds: Number(authoringSamples[Math.floor(authoringSamples.length / 2)].toFixed(3)),
+    publicationMilliseconds: Number(publicationSamples[Math.floor(publicationSamples.length / 2)].toFixed(3)),
+    positionMilliseconds: Number(positionSamples[Math.floor(positionSamples.length / 2)].toFixed(3)),
+    positionDeltaMilliseconds: Number(positionDeltaSamples[Math.floor(positionDeltaSamples.length / 2)].toFixed(3)),
+    correctnessFailures
+  };
 }
 
 async function openBenchmarkRuntime(inputRows = rowCount) {
@@ -365,6 +404,46 @@ async function openBenchmarkRuntime(inputRows = rowCount) {
       text.cancel();
       text.close();
       return milliseconds;
+    },
+    publishTextPositions: async (positionCount) => {
+      const visible = database.getSnapshot();
+      if (visible.state !== 'open' || visible.current.readiness !== 'ready') {
+        throw new Error('Transaction benchmark database is not ready');
+      }
+      const openedText = await database.openTextIntent({ observedBasis: visible.current.basis });
+      if (!openedText.success) {
+        throw new Error('Text benchmark session failed: ' + openedText.issues.map(({ code }) => code).join(', '));
+      }
+      const text = openedText.value;
+      const initialLength = handle.doc()?.tasks['task-0']?.title.length ?? 0;
+      text.append(
+        { kind: 'publish-text-positions' },
+        (snapshot) => snapshot.spliceText(
+          tasks,
+          ['task-0'],
+          'title',
+          { index: initialLength, deleteCount: 0, insert: 'x' }
+        )
+      );
+      const started = performance.now();
+      const positions = Array.from({ length: positionCount }, (_, index) =>
+        text.captureTextPosition({
+          name: 'position-' + index,
+          relation: tasks,
+          key: ['task-0'],
+          field: 'title',
+          index: initialLength,
+          affinity: index % 2 === 0 ? 'before' : 'after'
+        }));
+      const receipt = await text.publish({ textPositions: positions });
+      const milliseconds = performance.now() - started;
+      text.close();
+      return {
+        milliseconds,
+        correct: receipt.outcome === 'committed'
+          && receipt.textPositions.length === positionCount
+          && receipt.textPositions.every(({ state }) => state === 'resolved')
+      };
     },
     sequence: () => sequence,
     title: () => handle.doc()?.tasks['task-0']?.title,

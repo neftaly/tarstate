@@ -78,6 +78,52 @@ export type DatabaseTextIntentTransform = (
   snapshot: DatabaseTransactionSnapshot
 ) => DatabaseTransactionSnapshot;
 
+export type DatabaseTextPositionAffinity = 'before' | 'after';
+
+declare const databaseTextPositionRequestBrand: unique symbol;
+
+export type DatabaseTextPositionRequest = {
+  /** Opaque evidence that this request was captured by its owning session. */
+  readonly [databaseTextPositionRequestBrand]: true;
+  readonly name: string;
+  readonly relation: {
+    readonly schemaView: { readonly id: string; readonly contentHash: string };
+    readonly relationId: string;
+  };
+  readonly key: readonly [JsonValue, ...JsonValue[]];
+  readonly field: string;
+  readonly index: number;
+  readonly affinity: DatabaseTextPositionAffinity;
+};
+
+export type DatabaseTextPositionResult =
+  | {
+      readonly name: string;
+      readonly state: 'resolved';
+      readonly index: number;
+      readonly basis: SourceBasis;
+      readonly issues: readonly Issue[];
+    }
+  | {
+      readonly name: string;
+      readonly state: 'deleted';
+      readonly basis: SourceBasis;
+      readonly issues: readonly Issue[];
+    }
+  | {
+      readonly name: string;
+      readonly state: 'rejected' | 'unknown' | 'cancelled' | 'unsupported' | 'budget-exhausted';
+      readonly issues: readonly Issue[];
+    };
+
+export type DatabaseTextIntentReceipt = CommitReceipt & {
+  readonly textPositions: readonly DatabaseTextPositionResult[];
+};
+
+export type DatabaseTextIntentPublishOptions = {
+  readonly textPositions?: readonly DatabaseTextPositionRequest[];
+};
+
 export type DatabaseTextIntentSegmentStatus =
   | 'pending'
   | 'committed'
@@ -105,7 +151,7 @@ export type DatabaseTextIntentSessionSnapshot = {
   readonly current: DatabaseTransactionSnapshot;
   readonly segments: readonly DatabaseTextIntentSegment[];
   readonly issues: readonly Issue[];
-  readonly receipt?: CommitReceipt;
+  readonly receipt?: DatabaseTextIntentReceipt;
 };
 
 /**
@@ -119,7 +165,21 @@ export type DatabaseTextIntentSession = {
     intent: JsonValue,
     transform: DatabaseTextIntentTransform
   ) => DatabaseTextIntentSegment;
-  readonly publish: () => Promise<CommitReceipt>;
+  /** Captures one typed logical position against the session's exact current snapshot. */
+  readonly captureTextPosition: <
+    Body extends SchemaBody,
+    Name extends Extract<keyof Body['relations'], string>
+  >(input: {
+    readonly name: string;
+    readonly relation: LiteralRelation<Body, Name>;
+    readonly key: RelationKey<Body, Name>;
+    readonly field: StringField<Body, Name>;
+    readonly index: number;
+    readonly affinity: DatabaseTextPositionAffinity;
+  }) => DatabaseTextPositionRequest;
+  readonly publish: (
+    options?: DatabaseTextIntentPublishOptions
+  ) => Promise<DatabaseTextIntentReceipt>;
   readonly cancel: () => void;
   readonly close: () => void;
 };

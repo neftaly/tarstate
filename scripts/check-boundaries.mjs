@@ -175,6 +175,7 @@ assignArchitectureGroup('attachment-runtime', [
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
   'attachment/projection-selection.ts',
+  'attachment/retained-text-positions.ts',
   'attachment/retained-text-publication.ts',
   'attachment/retained-text-transaction-runtime.ts',
   'attachment/text-intent-core.ts',

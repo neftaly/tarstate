@@ -98,9 +98,17 @@ suspends every descendant because the session cannot prove which causal history
 is canonical. Sources without retained-branch capability must report the
 session unavailable; they must not emulate it with numeric offset transforms.
 
-Opaque source-native text anchors are related but separable. Any future anchor
-contract must define movement when referenced text is deleted, remain scoped to
-one source and field, and keep adapter cursor representations private. Presence,
+`captureTextPosition` creates an opaque, session-owned logical request against
+the exact current optimistic snapshot. Supplying those requests to `publish`
+captures source-native identity from that publication's local candidate and
+resolves it only against the exact committed `afterBasis`. Requests captured
+before another accepted segment are rejected rather than reinterpreted.
+
+The public receipt exposes named resolved offsets or explicit deleted,
+rejected, unknown, cancelled, unsupported, or budget-exhausted evidence. It
+never exposes native cursor encodings. Automerge's `before` and `after`
+affinities control movement when the referenced character is deleted; its
+unanchored start and end sentinels may coincide at an empty boundary. Presence,
 editor rendering, input methods, undo policy, and transport remain product
 concerns.
 

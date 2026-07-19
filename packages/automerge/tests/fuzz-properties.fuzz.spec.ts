@@ -189,7 +189,8 @@ describe('Automerge shrinking model properties', () => {
     unicodeText,
     fc.nat(),
     fc.nat(),
-    (initial, localText, localStart, localEnd, remoteText, remoteStart, remoteEnd) => {
+    fc.boolean(),
+    (initial, localText, localStart, localEnd, remoteText, remoteStart, remoteEnd, moveBefore) => {
       const boundaries = codePointBoundaries(initial);
       const localInsert = 'L' + localText + 'M';
       const firstLocal = normalizedSplice(boundaries, localStart, localEnd, localInsert);
@@ -210,6 +211,12 @@ describe('Automerge shrinking model properties', () => {
       const localCandidate = Automerge.change(localFirst, (draft) => {
         Automerge.splice(draft, ['text'], firstLocal.index + 1, 0, 'Z');
       });
+      const cursor = Automerge.getCursor(
+        localCandidate,
+        ['text'],
+        firstLocal.index + 2,
+        moveBefore ? 'before' : 'after'
+      );
       const remoteCandidate = Automerge.change(
         Automerge.clone(base, { actor: 'd'.repeat(64) }),
         (draft) => {
@@ -230,6 +237,22 @@ describe('Automerge shrinking model properties', () => {
       expect(localThenRemote.text).toContain('LZ' + localText + 'M');
       expect(Automerge.getHeads(localThenRemote).sort())
         .toEqual(Automerge.getHeads(remoteThenLocal).sort());
+      const localThenRemotePosition = Automerge.getCursorPosition(
+        localThenRemote,
+        ['text'],
+        cursor
+      );
+      const remoteThenLocalPosition = Automerge.getCursorPosition(
+        remoteThenLocal,
+        ['text'],
+        cursor
+      );
+      expect(localThenRemotePosition).toBe(remoteThenLocalPosition);
+      expect(isValidUtf16TextSplice(localThenRemote.text, {
+        index: localThenRemotePosition,
+        deleteCount: 0,
+        insert: ''
+      })).toBe(true);
     }
   ));
 

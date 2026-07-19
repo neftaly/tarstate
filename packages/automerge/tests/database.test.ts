@@ -276,6 +276,228 @@ describe('standard Automerge database', () => {
     await fixture.repo.shutdown();
   });
 
+  it('resolves a position inside dependent local text at the exact committed basis', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({
+      observedBasis: observed.current.basis
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+
+    session.append({ kind: 'insert-local-text' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'XY' }
+    ));
+    const focus = session.captureTextPosition({
+      name: 'selection-focus',
+      relation: fixture.tasks,
+      key: ['first'],
+      field: 'title',
+      index: 3,
+      affinity: 'after'
+    });
+    fixture.handle.change((draft) => {
+      Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 0, 'R');
+    });
+
+    const receipt = await session.publish({ textPositions: [focus] });
+
+    expect(receipt).toMatchObject({
+      outcome: 'committed',
+      textPositions: [{
+        name: 'selection-focus',
+        state: 'resolved',
+        index: 4,
+        basis: receipt.outcome === 'committed' ? receipt.afterBasis : undefined,
+        issues: []
+      }]
+    });
+    expect(Object.isFrozen(receipt.textPositions)).toBe(true);
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('RabXY');
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('reports a remotely deleted position target without rejecting unrelated text', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab', additionalTitle: 'cd' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({
+      observedBasis: observed.current.basis
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+
+    session.append({ kind: 'edit-first' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const other = session.captureTextPosition({
+      name: 'other-caret',
+      relation: fixture.tasks,
+      key: ['second'],
+      field: 'title',
+      index: 1,
+      affinity: 'before'
+    });
+    fixture.handle.change((draft) => { delete draft.tasks.second; });
+
+    const receipt = await session.publish({ textPositions: [other] });
+
+    expect(receipt).toMatchObject({
+      outcome: 'committed',
+      textPositions: [{ name: 'other-caret', state: 'deleted' }]
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('abX');
+    expect(fixture.handle.doc()?.tasks.second).toBeUndefined();
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('rejects a position captured before a later accepted segment', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({
+      observedBasis: observed.current.basis
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+    session.append({ kind: 'first' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const stale = session.captureTextPosition({
+      name: 'stale-caret',
+      relation: fixture.tasks,
+      key: ['first'],
+      field: 'title',
+      index: 3,
+      affinity: 'after'
+    });
+    session.append({ kind: 'second' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 3, deleteCount: 0, insert: 'Y' }
+    ));
+    const invalidRange = session.captureTextPosition({
+      name: 'invalid-range',
+      relation: fixture.tasks,
+      key: ['first'],
+      field: 'title',
+      index: 99,
+      affinity: 'after'
+    });
+    const duplicateOne = session.captureTextPosition({
+      name: 'duplicate',
+      relation: fixture.tasks,
+      key: ['first'],
+      field: 'title',
+      index: 1,
+      affinity: 'before'
+    });
+    const duplicateTwo = session.captureTextPosition({
+      name: 'duplicate',
+      relation: fixture.tasks,
+      key: ['first'],
+      field: 'title',
+      index: 2,
+      affinity: 'after'
+    });
+
+    const receipt = await session.publish({
+      textPositions: [stale, invalidRange, duplicateOne, duplicateTwo]
+    });
+
+    expect(receipt).toMatchObject({
+      outcome: 'committed',
+      textPositions: [
+        {
+          name: 'stale-caret',
+          state: 'rejected',
+          issues: [expect.objectContaining({
+            details: expect.objectContaining({ reason: 'text_position_snapshot_stale' })
+          })]
+        },
+        {
+          name: 'invalid-range',
+          state: 'rejected',
+          issues: [expect.objectContaining({
+            details: expect.objectContaining({ reason: 'text_position_range_invalid' })
+          })]
+        },
+        { name: 'duplicate', state: 'rejected' },
+        { name: 'duplicate', state: 'rejected' }
+      ]
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('abXY');
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('bounds source-native position work per publication', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({
+      observedBasis: observed.current.basis
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+    session.append({ kind: 'insert' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const positions = Array.from({ length: 65 }, (_, index) =>
+      session.captureTextPosition({
+        name: `caret-${index}`,
+        relation: fixture.tasks,
+        key: ['first'],
+        field: 'title',
+        index: 2,
+        affinity: 'after'
+      }));
+
+    const receipt = await session.publish({ textPositions: positions });
+
+    expect(receipt.textPositions).toHaveLength(65);
+    expect(receipt.textPositions.slice(0, 64).every(({ state }) => state === 'resolved'))
+      .toBe(true);
+    expect(receipt.textPositions[64]).toMatchObject({
+      name: 'caret-64',
+      state: 'budget-exhausted'
+    });
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
   it('retains accepted dependent text after rejecting a later invalid segment', async () => {
     const fixture = await openTaskDatabase({ initialTitle: 'abcd' });
     const observed = fixture.database.getSnapshot();
@@ -412,7 +634,7 @@ describe('standard Automerge database', () => {
       },
       publication: {
         openBranch: () => ({}),
-        publish: async () => ({ receipt: unknownReceipt })
+        publish: async () => ({ receipt: unknownReceipt, textPositions: [] })
       }
     });
     const opened = await service.openTextIntent({ observedBasis: basis });
@@ -432,7 +654,10 @@ describe('standard Automerge database', () => {
       { index: 3, deleteCount: 0, insert: 'Y' }
     ));
 
-    await expect(prefixPublication).resolves.toBe(unknownReceipt);
+    await expect(prefixPublication).resolves.toMatchObject({
+      ...unknownReceipt,
+      textPositions: []
+    });
     expect(session.getSnapshot()).toMatchObject({
       state: 'unknown',
       segments: [{ status: 'unknown' }, { status: 'unknown' }]
@@ -592,6 +817,36 @@ describe('standard Automerge database', () => {
       { observedBasis: observed.current.basis }
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect(fixture.readText()).toBe('New First');
+
+    const visible = fixture.database.getSnapshot();
+    if (visible.state !== 'open' || visible.current.readiness !== 'ready') {
+      throw new Error('Expected ready database after transaction');
+    }
+    const openedText = await fixture.database.openTextIntent({
+      observedBasis: visible.current.basis
+    });
+    if (!openedText.success) throw new Error(JSON.stringify(openedText.issues));
+    const text = openedText.value;
+    text.append({ kind: 'suffix-file-content' }, (snapshot) => snapshot.spliceText(
+      fixture.files,
+      ['file', 'text'],
+      'textContent',
+      { index: 9, deleteCount: 0, insert: '!' }
+    ));
+    const end = text.captureTextPosition({
+      name: 'content-end',
+      relation: fixture.files,
+      key: ['file', 'text'],
+      field: 'textContent',
+      index: 10,
+      affinity: 'after'
+    });
+    await expect(text.publish({ textPositions: [end] })).resolves.toMatchObject({
+      outcome: 'committed',
+      textPositions: [{ name: 'content-end', state: 'resolved', index: 10 }]
+    });
+    expect(fixture.readText()).toBe('New First!');
+    text.close();
 
     fixture.database.close();
     await fixture.repo.shutdown();
@@ -1441,6 +1696,7 @@ class ThrowingLeaseCatalog extends AttachmentCatalog {
 }
 
 const openTaskDatabase = async (options: {
+  readonly additionalTitle?: string;
   readonly artifactMap?: boolean;
   readonly allowedTitles?: readonly string[];
   readonly constrained?: boolean;
@@ -1517,7 +1773,12 @@ const openTaskDatabase = async (options: {
     : undefined;
   const repo = new Repo();
   const handle = repo.create<TaskDocument>({
-    tasks: { first: { id: 'first', title: options.initialTitle ?? 'First' } }
+    tasks: {
+      first: { id: 'first', title: options.initialTitle ?? 'First' },
+      ...(options.additionalTitle === undefined
+        ? {}
+        : { second: { id: 'second', title: options.additionalTitle } })
+    }
   });
   const declaration: OpenAutomergeDatabaseOptions<TaskDocument, readonly string[]>['declaration'] = {
     formatVersion: 1,

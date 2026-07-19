@@ -18,6 +18,7 @@ changelog.
 | Replayable exact-state transactions | conforms | source-neutral schedule properties plus attachment/external-store/Automerge integration tests |
 | Captured Automerge text reconciliation | conforms for eligible pure splice transactions | real branch/head integration and rejection tests |
 | Cross-publication dependent text | conforms for retained-branch Automerge sources | publication-race integration, unknown suspension, and fuzzed branch ancestry |
+| Text-intent result positions | conforms for mapped Automerge text | exact-basis integration, deletion evidence, bounded capture, and delivery-order fuzzing |
 | Candidate validation before reconciled publication | conforms | executor ordering and integration failure cases |
 | Official adapter one-path DX | conforms | `openAutomergeDatabase`, `openExternalStoreDatabase`, package recipes |
 | Topic entrypoints and acyclic core direction | conforms | source and built boundary scripts |
@@ -105,13 +106,17 @@ is merged only into each validated publication candidate. Rejection blocks
 dependent descendants and unknown outcome suspends them, so later segments
 never publish while ancestor publication is uncertain.
 
-Buffered dependent splices can still become one source-native change. Relative
-cursors also converge with explicit before/after movement after deletion, but
-opaque cursor authoring remains a separate capability rather than a requirement
-of the retained publication lifecycle.
-Opaque deletion-aware anchors should remain a separately advertised capability
-unless implementation evidence shows they require the same lifecycle. Memory
-and non-mergeable stores may honestly report both capabilities absent.
+Buffered dependent splices can still become one source-native change. A caller
+may capture named logical text positions from the session's exact current
+snapshot and request their resolution on the same `publish`. The result receipt
+contains only detached offsets and exact basis evidence. Native cursors, mapped
+paths, documents, and handles remain inside the adapter.
+
+Position resolution is optional beside retained publication. Memory and
+non-mergeable stores may report it unsupported without disabling ordinary text
+publication. Work is bounded per publication. Duplicate names, stale captures,
+invalid ranges, unsupported resolution, deletion, cancellation, rejection, and
+unknown outcomes produce explicit per-position evidence.
 
 ### Physical performance evidence
 

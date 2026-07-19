@@ -13,6 +13,10 @@ import {
 import type { JsonValue } from '../value.js';
 import type { TextIntentPublicationDriver } from './text-intent-service.js';
 import {
+  settleRetainedTextPositions,
+  type RetainedTextPositionResolver
+} from './retained-text-positions.js';
+import {
   ImmutableDatabaseTransactionSnapshot,
   sameTransactionSnapshotLineage
 } from './transaction-snapshot.js';
@@ -32,7 +36,8 @@ export const createRetainedTextPublicationDriver = <Storage, Command>(
   source: StagedBasisAtomicSource<Storage, Command>,
   context: PreparedWritableExecutionContext<Storage, Command>,
   prepareInput: PrepareTransactionInput,
-  supported: boolean
+  supported: boolean,
+  textPositions?: RetainedTextPositionResolver<Storage>
 ): TextIntentPublicationDriver<AttachmentPrivateBranch<Storage, Command>> | undefined => {
   const createPrivateBranch = source.createPrivateBranch;
   const snapshotAt = source.snapshotAt;
@@ -54,7 +59,7 @@ export const createRetainedTextPublicationDriver = <Storage, Command>(
         storage: createPrivateBranch(captured)
       });
     },
-    publish: async ({ intent, transforms, branch, signal }) => {
+    publish: async ({ intent, transforms, textPositions: requestedPositions, branch, signal }) => {
       let authored: ImmutableDatabaseTransactionSnapshot | undefined;
       const transform = async (initial: DatabaseTransactionSnapshot) => {
         if (!(initial instanceof ImmutableDatabaseTransactionSnapshot)) {
@@ -81,13 +86,32 @@ export const createRetainedTextPublicationDriver = <Storage, Command>(
         prepared,
         branch
       );
+      let committed: ReturnType<typeof snapshotAt> | undefined;
+      if (result.receipt.outcome === 'committed') {
+        try {
+          committed = snapshotAt(result.receipt.afterBasis);
+        } catch { /* Position evidence must not replace a known commit receipt. */ }
+      }
+      const resolvedPositions = settleRetainedTextPositions({
+        receipt: result.receipt,
+        signal,
+        positions: requestedPositions,
+        ...(result.continuation?.storage === undefined
+          ? {}
+          : { optimistic: result.continuation.storage }),
+        ...(committed?.state !== 'ready' || committed.storage === undefined
+          ? {}
+          : { committed: committed.storage }),
+        ...(textPositions === undefined ? {} : { resolve: textPositions })
+      });
       if (result.receipt.outcome !== 'committed'
         || result.continuation === undefined
         || authored === undefined) {
-        return { receipt: result.receipt };
+        return { receipt: result.receipt, textPositions: resolvedPositions };
       }
       return {
         receipt: result.receipt,
+        textPositions: resolvedPositions,
         continuation: result.continuation,
         optimisticBase: authored.continuationBase()
       };

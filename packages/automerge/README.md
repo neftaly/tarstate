@@ -127,7 +127,20 @@ if (visible.state === 'open' && visible.current.readiness === 'ready') {
       { index: 6, deleteCount: 0, insert: '!' }
     ));
     await prefix;
-    await text.publish();
+    const focus = text.captureTextPosition({
+      name: 'selection-focus',
+      relation: tasks,
+      key: ['first'],
+      field: 'title',
+      index: 7,
+      affinity: 'after'
+    });
+    const suffix = await text.publish({ textPositions: [focus] });
+    const resolvedFocus = suffix.textPositions[0];
+    if (resolvedFocus?.state === 'resolved') {
+      // Feed the detached offset and exact basis into product-owned presence.
+      void { index: resolvedFocus.index, basis: resolvedFocus.basis };
+    }
     text.close();
   }
 }
@@ -161,6 +174,14 @@ the next `publish`. A known commit advances the retained private branch; a
 rejected ancestor rejects its descendants, while an unknown ancestor outcome
 suspends them. Pending-work and recent-evidence budgets bound retained memory.
 The owner must call `close`.
+
+`captureTextPosition` is typed by the prepared relation and belongs to the
+session's exact current optimistic snapshot. Pass captured requests only to the
+next `publish`; accepting another segment first makes them stale. Automerge
+cursors remain adapter-private. Results expose detached UTF-16 offsets at the
+receipt's exact committed basis, or explicit non-resolution evidence. Affinity
+controls movement after referenced-character deletion; start/end sentinel
+positions can coincide at an empty string boundary.
 
 A document whose root is one logical entity needs no artificial array or
 object-map wrapper. Its storage mapping uses an explicit singleton and literal

@@ -1,6 +1,8 @@
 import type {
   DatabaseTextIntentService,
   DatabaseTextIntentTransform,
+  DatabaseTextPositionRequest,
+  DatabaseTextPositionResult,
   DatabaseTransactionService,
   DatabaseTransactionSnapshot
 } from '../database/transaction.js';
@@ -25,10 +27,12 @@ export type TextIntentPublicationDriver<Branch extends object> = {
   readonly publish: (input: {
     readonly intent: JsonValue;
     readonly transforms: readonly DatabaseTextIntentTransform[];
+    readonly textPositions: readonly DatabaseTextPositionRequest[];
     readonly branch: Branch;
     readonly signal: AbortSignal;
   }) => Promise<{
     readonly receipt: CommitReceipt;
+    readonly textPositions: readonly DatabaseTextPositionResult[];
     readonly continuation?: Branch;
     readonly optimisticBase?: ImmutableDatabaseTransactionSnapshot;
   }>;

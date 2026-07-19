@@ -1,8 +1,12 @@
 import type {
+  DatabaseTextIntentPublishOptions,
+  DatabaseTextIntentReceipt,
   DatabaseTextIntentSegment,
   DatabaseTextIntentSession,
   DatabaseTextIntentSessionSnapshot,
-  DatabaseTextIntentTransform
+  DatabaseTextIntentTransform,
+  DatabaseTextPositionRequest,
+  DatabaseTextPositionResult
 } from '../database/transaction.js';
 import { TarstateParseError, type Issue } from '../issues.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
@@ -28,6 +32,7 @@ import {
 const maxPendingSegments = 256;
 const maxPendingSplices = 1_024;
 const maxRetainedEvidence = 256;
+const maxTextPositionsPerPublication = 64;
 
 export type TextIntentSessionInput<Branch extends object> = {
   readonly observedBasis: SourceBasis;
@@ -40,10 +45,12 @@ export type TextIntentSessionInput<Branch extends object> = {
   readonly publish: (input: {
     readonly intent: JsonValue;
     readonly transforms: readonly DatabaseTextIntentTransform[];
+    readonly textPositions: readonly DatabaseTextPositionRequest[];
     readonly branch: Branch;
     readonly signal: AbortSignal;
   }) => Promise<{
     readonly receipt: CommitReceipt;
+    readonly textPositions: readonly DatabaseTextPositionResult[];
     readonly continuation?: Branch;
     readonly optimisticBase?: ImmutableDatabaseTransactionSnapshot;
   }>;
@@ -55,6 +62,7 @@ export const createTextIntentSession = <Branch extends object>(
 ): DatabaseTextIntentSession => {
   const sessionId = globalThis.crypto.randomUUID();
   const listeners = new Set<() => void>();
+  const positionSnapshots = new WeakMap<DatabaseTextPositionRequest, ImmutableDatabaseTransactionSnapshot>();
   let accepted: AcceptedTextIntentSegment[] = [];
   let allSegments: readonly DatabaseTextIntentSegment[] = Object.freeze([]);
   let nextSegmentIndex = 0;
@@ -66,9 +74,9 @@ export const createTextIntentSession = <Branch extends object>(
     ? 'stale'
     : 'current';
   let issues = Object.freeze([...input.initialIssues]);
-  let receipt: CommitReceipt | undefined;
+  let receipt: DatabaseTextIntentReceipt | undefined;
   let closed = false;
-  let publication: Promise<CommitReceipt> | undefined;
+  let publication: Promise<DatabaseTextIntentReceipt> | undefined;
   let nextPublicationIndex = 0;
   const abort = new AbortController();
 
@@ -80,6 +88,50 @@ export const createTextIntentSession = <Branch extends object>(
         listener();
       } catch { /* A listener cannot block lifecycle progress. */ }
     }
+  };
+  const captureTextPosition: DatabaseTextIntentSession['captureTextPosition'] = (position) => {
+    if (state !== 'ready' || closed) {
+      throw new Error('Text positions can only be captured from a ready session');
+    }
+    if (typeof position.name !== 'string' || position.name.length === 0) {
+      throw new TypeError('Text position name must not be empty');
+    }
+    if (typeof position.field !== 'string' || position.field.length === 0) {
+      throw new TypeError('Text position field must not be empty');
+    }
+    if (!Number.isSafeInteger(position.index) || position.index < 0) {
+      throw new TypeError('Text position index must be a non-negative safe integer');
+    }
+    if (position.affinity !== 'before' && position.affinity !== 'after') {
+      throw new TypeError('Text position affinity must be before or after');
+    }
+    const ownedKey = detachAndFreezeJsonValue(position.key);
+    if (!ownedKey.success) throw new TarstateParseError(ownedKey.issues);
+    if (!Array.isArray(ownedKey.value) || ownedKey.value.length === 0) {
+      throw new TypeError('Text position key must not be empty');
+    }
+    const relation = position.relation;
+    if (typeof relation?.relationId !== 'string'
+      || typeof relation.schemaView?.id !== 'string'
+      || typeof relation.schemaView.contentHash !== 'string') {
+      throw new TypeError('Text position relation must be a prepared literal relation');
+    }
+    const request = Object.freeze({
+      name: position.name,
+      relation: Object.freeze({
+        schemaView: Object.freeze({
+          id: relation.schemaView.id,
+          contentHash: relation.schemaView.contentHash
+        }),
+        relationId: relation.relationId
+      }),
+      key: ownedKey.value as unknown as readonly [JsonValue, ...JsonValue[]],
+      field: position.field,
+      index: position.index,
+      affinity: position.affinity
+    }) as unknown as DatabaseTextPositionRequest;
+    positionSnapshots.set(request, current);
+    return request;
   };
   const markStale = (): void => {
     if (freshness === 'stale' || closed) return;
@@ -161,8 +213,23 @@ export const createTextIntentSession = <Branch extends object>(
     }
   };
   let publicationPrefixCount = 0;
-  const publish = (): Promise<CommitReceipt> => {
-    if (publication !== undefined) return publication;
+  const publish = (
+    options: DatabaseTextIntentPublishOptions = {}
+  ): Promise<DatabaseTextIntentReceipt> => {
+    if (!isRecord(options)) {
+      return Promise.reject(new TypeError('Text publication options must be an object'));
+    }
+    const requestedPositions = options.textPositions ?? [];
+    if (!Array.isArray(requestedPositions)
+      || requestedPositions.some((position) => !isRecord(position))) {
+      return Promise.reject(new TypeError('Text publication positions must be captured requests'));
+    }
+    if (publication !== undefined) {
+      if (requestedPositions.length > 0) {
+        return Promise.reject(new Error('An in-flight text publication cannot accept new positions'));
+      }
+      return publication;
+    }
     if (closed || isTerminalTextIntentState(state)) {
       return Promise.reject(new Error('Text intent session is not publishable'));
     }
@@ -174,24 +241,34 @@ export const createTextIntentSession = <Branch extends object>(
     nextPublicationIndex += 1;
     const prefix = accepted.slice(0, publicationPrefixCount);
     const prefixIds = new Set(prefix.map(({ evidence }) => evidence.segmentId));
+    const selectedPositions = selectTextPositions(
+      requestedPositions,
+      current,
+      positionSnapshots
+    );
     const publishAbort = abort.signal;
     state = 'publishing';
     publication = Promise.resolve().then(() => input.publish({
       intent: composedTextIntent(sessionId, publicationIndex, prefix),
       transforms: Object.freeze(prefix.map(({ transform }) => transform)),
+      textPositions: selectedPositions.source,
       branch,
       signal: publishAbort
     })).then((settled) => {
-      receipt = settled.receipt;
-      issues = Object.freeze([...issues, ...settled.receipt.issues]);
-      if (settled.receipt.outcome === 'committed'
+      const publishedReceipt = Object.freeze({
+        ...settled.receipt,
+        textPositions: selectedPositions.complete(settled.textPositions)
+      });
+      receipt = publishedReceipt;
+      issues = Object.freeze([...issues, ...publishedReceipt.issues]);
+      if (publishedReceipt.outcome === 'committed'
         && settled.continuation !== undefined
         && settled.optimisticBase !== undefined) {
         allSegments = settleSelectedTextSegments(
           allSegments,
           prefixIds,
           'committed',
-          settled.receipt.issues
+          publishedReceipt.issues
         );
         accepted = accepted.slice(publicationPrefixCount);
         pendingSplices = accepted.reduce((total, segment) => total + segment.splices.length, 0);
@@ -217,28 +294,28 @@ export const createTextIntentSession = <Branch extends object>(
             state = 'blocked';
           }
         }
-      } else if (settled.receipt.outcome === 'committed') {
+      } else if (publishedReceipt.outcome === 'committed') {
         const failure = textIntentIssue(
           'lifecycle.adapter_failed',
           'text_intent_committed_continuation_unavailable'
         );
         issues = Object.freeze([...issues, failure]);
         settleUncertainDescendants(prefixIds, [failure]);
-      } else if (settled.receipt.outcome === 'unknown') {
-        settleUncertainDescendants(prefixIds, settled.receipt.issues);
+      } else if (publishedReceipt.outcome === 'unknown') {
+        settleUncertainDescendants(prefixIds, publishedReceipt.issues);
       } else if (state === 'cancelled' || closed) {
         allSegments = settleSelectedTextSegments(
           allSegments,
           prefixIds,
           'cancelled',
-          settled.receipt.issues
+          publishedReceipt.issues
         );
         accepted = [];
         pendingSplices = 0;
       } else {
-        settleRejectedDescendants(prefixIds, settled.receipt.issues);
+        settleRejectedDescendants(prefixIds, publishedReceipt.issues);
       }
-      return settled.receipt;
+      return publishedReceipt;
     }).catch((error: unknown) => {
       const failure = textIntentIssue(
         'lifecycle.adapter_failed',
@@ -276,6 +353,7 @@ export const createTextIntentSession = <Branch extends object>(
       return () => { listeners.delete(listener); };
     },
     append,
+    captureTextPosition,
     publish,
     cancel,
     close
@@ -340,3 +418,93 @@ export const createTextIntentSession = <Branch extends object>(
     });
   }
 };
+
+type SelectedTextPositions = {
+  readonly source: readonly DatabaseTextPositionRequest[];
+  readonly complete: (
+    sourceResults: readonly DatabaseTextPositionResult[]
+  ) => readonly DatabaseTextPositionResult[];
+};
+
+type SelectedTextPositionSlot =
+  | { readonly sourceIndex: number }
+  | { readonly result: DatabaseTextPositionResult };
+
+const selectTextPositions = (
+  requested: readonly DatabaseTextPositionRequest[],
+  current: ImmutableDatabaseTransactionSnapshot,
+  owners: WeakMap<DatabaseTextPositionRequest, ImmutableDatabaseTransactionSnapshot>
+): SelectedTextPositions => {
+  const names = new Map<string, number>();
+  for (const { name } of requested) names.set(name, (names.get(name) ?? 0) + 1);
+  const source: DatabaseTextPositionRequest[] = [];
+  const slots: SelectedTextPositionSlot[] = [];
+  for (let index = 0; index < requested.length; index += 1) {
+    const position = requested[index] as DatabaseTextPositionRequest;
+    if (index >= maxTextPositionsPerPublication) {
+      const result = unresolvedTextPosition(
+        position.name,
+        'budget-exhausted',
+        'text_position_budget_exceeded'
+      );
+      slots.push({ result });
+    } else if (names.get(position.name) !== 1) {
+      const result = unresolvedTextPosition(
+        position.name,
+        'rejected',
+        'text_position_name_duplicate'
+      );
+      slots.push({ result });
+    } else if (owners.get(position) !== current) {
+      const result = unresolvedTextPosition(
+        position.name,
+        'rejected',
+        'text_position_snapshot_stale'
+      );
+      slots.push({ result });
+    } else {
+      slots.push({ sourceIndex: source.length });
+      source.push(position);
+    }
+  }
+  return {
+    source: Object.freeze(source),
+    complete: (sourceResults) => {
+      const valid = sourceResults.length === source.length
+        && sourceResults.every((result, index) => result.name === source[index]?.name);
+      return Object.freeze(slots.map((slot, index) => {
+        if ('result' in slot) return slot.result;
+        if (!valid) {
+          return unresolvedTextPosition(
+            requested[index]?.name ?? '',
+            'rejected',
+            'text_position_adapter_result_invalid'
+          );
+        }
+        return ownTextPositionResult(
+          sourceResults[slot.sourceIndex] as DatabaseTextPositionResult
+        );
+      }));
+    }
+  };
+};
+
+const unresolvedTextPosition = (
+  name: string,
+  state: Extract<DatabaseTextPositionResult['state'], 'rejected' | 'unknown' | 'cancelled' | 'unsupported' | 'budget-exhausted'>,
+  reason: string
+): DatabaseTextPositionResult => Object.freeze({
+  name,
+  state,
+  issues: Object.freeze([textIntentIssue('lifecycle.command_invalid', reason)])
+});
+
+const ownTextPositionResult = (
+  result: DatabaseTextPositionResult
+): DatabaseTextPositionResult => Object.freeze({
+  ...result,
+  issues: Object.freeze([...result.issues])
+});
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);

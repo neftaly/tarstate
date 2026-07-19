@@ -31,16 +31,18 @@ try {
   // field-bounded projection.
   assertClosure('attachment/adapter/index.js', 332_100, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('attachment/mapped-adapter/index.js', 95_000, ['transaction-executor', 'relation-delta-authoring', 'lifecycle-governance']);
-  // Includes bounded queued-prefix lifecycle, evidence rolling, and replay
-  // validation without source-specific reconciliation or commit machinery.
-  assertClosure('attachment/text-intent-adapter/index.js', 79_150, [
+  // Includes bounded queued-prefix lifecycle, evidence rolling, replay
+  // validation, and exact-snapshot position selection without source-specific
+  // reconciliation or commit machinery.
+  assertClosure('attachment/text-intent-adapter/index.js', 82_150, [
     'transaction-executor',
     'commit-coordinator',
     'lifecycle-governance'
   ]);
-  // Opt-in source-native candidate retention and final publication validation;
-  // ordinary attachment and text-session topics remain separate.
-  assertClosure('attachment/retained-text-adapter/index.js', 207_150, [
+  // Opt-in source-native candidate retention, final publication validation,
+  // and detached exact-basis position settlement; ordinary attachment and
+  // text-session topics remain separate.
+  assertClosure('attachment/retained-text-adapter/index.js', 209_550, [
     'query-incremental',
     'observer-maintenance'
   ]);

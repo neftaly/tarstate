@@ -118,6 +118,14 @@ is publishing and are retained for the next publication. The session reports
 per-segment pending, committed, rejected, unknown, or cancelled evidence and
 must be closed by its owner. Consumers never manage source branches or heads.
 
+Use `session.captureTextPosition({ name, relation, key, field, index, affinity })`
+only after the final accepted segment for that publication. Pass its opaque
+request to `publish({ textPositions })`. The returned commit receipt keeps its
+ordinary transaction fields and adds ordered `textPositions` evidence. A
+resolved result includes a detached UTF-16 offset and the receipt's exact
+`afterBasis`; consumers may then create their own presence cursor at that
+projection boundary.
+
 `simulate` and `transact` accept the same intent and transform. Simulation
 cannot publish or allocate durable source identity.
 

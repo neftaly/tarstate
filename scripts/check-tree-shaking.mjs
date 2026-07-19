@@ -123,8 +123,8 @@ const cases = [
     source: selectedExport('packages/automerge/dist/index.js', 'openAutomergeDatabase'),
     // Automerge itself remains external. This covers Tarstate's complete
     // conflict-aware attachment, retained causal publication, transaction,
-    // and observation closure.
-    maxGzipBytes: 69_650
+    // exact-basis text positions, and observation closure.
+    maxGzipBytes: 71_850
   }
 ];
 

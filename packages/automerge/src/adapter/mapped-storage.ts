@@ -22,6 +22,7 @@ import {
   type SourceSnapshot,
   type StorageBinding
 } from '@tarstate/core/source';
+import type { DatabaseTextPositionRequest } from '@tarstate/core/transactions';
 import {
   automergePathFootprint,
   type AutomergePathFootprint,
@@ -63,6 +64,34 @@ export type AutomergeMappedStorageBindingOptions = {
   readonly relationIds?: readonly string[];
   readonly locatorNamespace?: string;
 };
+
+type AutomergeMappedTextPositionTarget =
+  | {
+      readonly state: 'ready';
+      readonly path: AutomergePath;
+      readonly text: string;
+      readonly issues: readonly Issue[];
+    }
+  | {
+      readonly state: 'missing' | 'invalid';
+      readonly issues: readonly Issue[];
+    };
+
+const textPositionSourceId = 'tarstate:automerge:text-position';
+const emptyTextPositionIssues: readonly Issue[] = Object.freeze([]);
+const textPositionBasis = Object.freeze({ kind: 'automerge-text-position-candidate' });
+
+const textPositionSnapshot = <T extends object>(
+  storage: Automerge.Doc<T>
+): SourceSnapshot<Automerge.Doc<T>> => ({
+  sourceId: textPositionSourceId,
+  operationEpoch: textPositionSourceId,
+  basis: textPositionBasis,
+  state: 'ready',
+  freshness: 'current',
+  storage,
+  issues: emptyTextPositionIssues
+});
 
 type MappedRelation = CompiledStorageMapping['relations'] extends ReadonlyMap<string, infer Relation> ? Relation : never;
 
@@ -254,6 +283,116 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       result
     });
     return result;
+  };
+
+  locateTextPositions = (
+    storage: Automerge.Doc<T>,
+    positions: readonly DatabaseTextPositionRequest[]
+  ): readonly AutomergeMappedTextPositionTarget[] => {
+    const directTargets = new Map<string, AutomergeMappedTextPositionTarget | undefined>();
+    const preliminary = positions.map((position): AutomergeMappedTextPositionTarget | undefined => {
+      const relationId = position.relation.relationId;
+      if (position.relation.schemaView.id !== this.#mapping.body.schema.id
+        || position.relation.schemaView.contentHash !== this.#mapping.body.schema.contentHash) {
+        return textPositionTargetIssue(
+          'invalid',
+          'transaction.delta_invalid',
+          relationId,
+          undefined,
+          { reason: 'text_position_schema_mismatch' }
+        );
+      }
+      const compiled = this.#relations.get(relationId);
+      const fieldMapping = compiled?.mapping.fields[position.field];
+      if (compiled === undefined
+        || fieldMapping === undefined
+        || fieldMapping.kind === 'absent'
+        || fieldMapping.kind === 'source-metadata'
+        || fieldMapping.write.textSplice === undefined
+        || this.writeCapabilities.get(relationId)?.fields[position.field]?.textSplice === undefined) {
+        return textPositionTargetIssue(
+          'invalid',
+          'transaction.capability_unavailable',
+          relationId,
+          undefined,
+          { capability: 'text-position-resolution', field: position.field }
+        );
+      }
+      const targetKey = compoundKey(
+        relationId,
+        canonicalizeJson(position.key),
+        position.field
+      );
+      if (directTargets.has(targetKey)) return directTargets.get(targetKey);
+      const target = directObjectMapTextPosition(
+        storage,
+        compiled,
+        fieldMapping.path,
+        position
+      );
+      directTargets.set(targetKey, target);
+      return target;
+    });
+    const fieldsByRelation = new Map<string, Set<string>>();
+    for (let index = 0; index < positions.length; index += 1) {
+      if (preliminary[index] !== undefined) continue;
+      const position = positions[index] as DatabaseTextPositionRequest;
+      const relationId = position.relation.relationId;
+      const fields = fieldsByRelation.get(relationId);
+      if (fields === undefined) fieldsByRelation.set(relationId, new Set([position.field]));
+      else fields.add(position.field);
+    }
+    const projections = new Map<string, ProjectionResult<AutomergeMappedStorageRow>>();
+    const rowsByKey = new Map<string, AutomergeMappedStorageRow | null>();
+    for (const [relationId, fields] of fieldsByRelation) {
+      const projection = this.project(
+        textPositionSnapshot(storage),
+        new Set([relationId]),
+        new Map([[relationId, fields]])
+      );
+      projections.set(relationId, projection);
+      for (const row of projection.rows) {
+        const key = compoundKey(row.relationId, canonicalizeJson(row.key));
+        rowsByKey.set(key, rowsByKey.has(key) ? null : row);
+      }
+    }
+    return Object.freeze(positions.map((position, positionIndex): AutomergeMappedTextPositionTarget => {
+      const direct = preliminary[positionIndex];
+      if (direct !== undefined) return direct;
+      const relationId = position.relation.relationId;
+      const compiled = this.#relations.get(relationId);
+      const fieldMapping = compiled?.mapping.fields[position.field];
+      if (compiled === undefined || fieldMapping === undefined
+        || fieldMapping.kind === 'absent' || fieldMapping.kind === 'source-metadata') {
+        throw new TypeError('Text position mapping changed during synchronous resolution');
+      }
+      const projection = projections.get(relationId);
+      if (projection === undefined || projection.completeness !== 'exact') {
+        return { state: 'invalid', issues: projection?.issues ?? emptyTextPositionIssues };
+      }
+      const row = rowsByKey.get(compoundKey(relationId, canonicalizeJson(position.key)));
+      if (row === undefined || row === null) {
+        return textPositionTargetIssue(
+          row === undefined ? 'missing' : 'invalid',
+          'transaction.delta_invalid',
+          relationId,
+          undefined,
+          { reason: row === undefined ? 'text_position_target_missing' : 'text_position_target_ambiguous' }
+        );
+      }
+      const path = [...row.storagePath, ...fieldMapping.path] as AutomergePath;
+      const text = valueAtAutomergePath(storage, path);
+      if (typeof text !== 'string') {
+        return textPositionTargetIssue(
+          'missing',
+          'transaction.delta_invalid',
+          relationId,
+          path,
+          { reason: 'text_position_field_missing', field: position.field }
+        );
+      }
+      return { state: 'ready', path: Object.freeze(path), text, issues: projection.issues };
+    }));
   };
 
   #rememberPreviousProjection(
@@ -1053,6 +1192,104 @@ const bindingIssue = (code: string, sourceId: string, relationId?: string, path?
   ...(path === undefined ? {} : { path }),
   ...(details === undefined ? {} : { details })
 });
+
+const textPositionTargetIssue = (
+  state: 'missing' | 'invalid',
+  code: string,
+  relationId: string,
+  path?: readonly unknown[],
+  details?: unknown
+): AutomergeMappedTextPositionTarget => ({
+  state,
+  issues: [bindingIssue(code, textPositionSourceId, relationId, path, details)]
+});
+
+const directObjectMapTextPosition = <T extends object>(
+  storage: Automerge.Doc<T>,
+  compiled: MappedRelation,
+  fieldPath: readonly (string | number)[],
+  position: DatabaseTextPositionRequest
+): AutomergeMappedTextPositionTarget | undefined => {
+  const collectionMapping = compiled.mapping.collection;
+  const keyFields = compiled.relation.declaration.key;
+  if (collectionMapping.kind !== 'object-map' || keyFields.length !== 1) return undefined;
+
+  const keyField = keyFields[0];
+  if (keyField === undefined) return undefined;
+  const keyMapping = compiled.mapping.keys[keyField];
+  const mapKey = position.key.length === 1 ? position.key[0] : undefined;
+  if (keyMapping?.kind !== 'map-key' || typeof mapKey !== 'string') return undefined;
+
+  const collectionPath = collectionMapping.path as AutomergePath;
+  const collection = valueAtAutomergePath(storage, collectionPath);
+  if (!isRecord(collection)) {
+    return textPositionTargetIssue(
+      'missing',
+      'transaction.delta_invalid',
+      position.relation.relationId,
+      collectionPath,
+      { reason: 'text_position_collection_missing' }
+    );
+  }
+  const rowPath = [...collectionPath, mapKey] as AutomergePath;
+  if (conflictsAt(collection, mapKey).length > 1) {
+    return textPositionTargetIssue(
+      'invalid',
+      'transaction.delta_invalid',
+      position.relation.relationId,
+      rowPath,
+      { reason: 'text_position_target_ambiguous' }
+    );
+  }
+  const row = collection[mapKey];
+  if (!isRecord(row)) {
+    return textPositionTargetIssue(
+      'missing',
+      'transaction.delta_invalid',
+      position.relation.relationId,
+      rowPath,
+      { reason: 'text_position_target_missing' }
+    );
+  }
+  const mappedPaths = keyMapping.mirrorPath === undefined
+    ? [fieldPath as AutomergePath]
+    : [keyMapping.mirrorPath as AutomergePath, fieldPath as AutomergePath];
+  const mappedConflicts = conflictsAlongMappedPaths(storage, rowPath, mappedPaths);
+  if (mappedConflicts.length > 0) {
+    const conflict = mappedConflicts[0]!;
+    return textPositionTargetIssue(
+      'invalid',
+      'automerge.conflict_observed',
+      position.relation.relationId,
+      conflict.path,
+      { changeHashes: conflict.changeHashes }
+    );
+  }
+  if (keyMapping.mirrorPath !== undefined) {
+    const mirroredKey = valueAtAutomergePath(row, keyMapping.mirrorPath as AutomergePath);
+    if (!samePortableJson(mirroredKey, mapKey)) {
+      return textPositionTargetIssue(
+        'invalid',
+        'mapping.map_key_mismatch',
+        position.relation.relationId,
+        [...rowPath, ...keyMapping.mirrorPath],
+        { field: keyField, mapKey }
+      );
+    }
+  }
+  const path = [...rowPath, ...fieldPath] as AutomergePath;
+  const text = valueAtAutomergePath(storage, path);
+  if (typeof text !== 'string') {
+    return textPositionTargetIssue(
+      'missing',
+      'transaction.delta_invalid',
+      position.relation.relationId,
+      path,
+      { reason: 'text_position_field_missing', field: position.field }
+    );
+  }
+  return { state: 'ready', path: Object.freeze(path), text, issues: emptyTextPositionIssues };
+};
 
 const sourceIssue = (sourceId: string, state: SourceSnapshot<unknown>['state']): Issue => createIssue({
   code: state === 'closed' ? 'source.closed' : 'source.not_ready',
