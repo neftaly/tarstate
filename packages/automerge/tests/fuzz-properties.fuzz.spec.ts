@@ -272,6 +272,86 @@ describe('Automerge shrinking model properties', () => {
     }
   ));
 
+  propertyTest('retained text branches preserve dependent splices across publications', fc.asyncProperty(
+    unicodeText,
+    safeString,
+    fc.nat(),
+    unicodeText,
+    async (initial, localText, localPosition, remoteText) => {
+      type TextDocument = { text: string };
+      const boundaries = codePointBoundaries(initial);
+      const insertionBoundary = boundaries[localPosition % boundaries.length] ?? 0;
+      const localInsert = 'L' + localText + 'M';
+      const base = Automerge.from<TextDocument>({ text: initial }, { actor: 'e'.repeat(64) });
+      const runtime = new AutomergeSourceRuntime({
+        sourceId: 'source:retained-text-fuzz',
+        doc: base
+      });
+      const source = new AutomergeAtomicSource({
+        runtime,
+        operationEpoch: 'epoch:retained-text-fuzz'
+      });
+      const observed = source.snapshot();
+      const privateBase = {
+        ...observed,
+        storage: source.createPrivateBranch!(observed)
+      };
+      const prefixCommand = {
+        apply: (draft: Parameters<Automerge.ChangeFn<TextDocument>>[0]) => {
+          Automerge.splice(draft, ['text'], insertionBoundary, 0, localInsert);
+        }
+      };
+      const prefix = source.stage(privateBase, [prefixCommand]);
+      const prefixBasis = source.basisForStagedStorage!(privateBase, prefix.storage);
+      runtime.merge(Automerge.change(
+        Automerge.clone(base, { actor: 'f'.repeat(64) }),
+        (draft) => {
+          Automerge.splice(draft, ['text'], 0, 0, 'R' + remoteText);
+        }
+      ));
+      const firstIntegration = source.snapshot();
+      const firstCandidate = source.reconcile!(
+        firstIntegration,
+        observed.basis,
+        [prefixCommand],
+        prefix.storage
+      );
+      expect(firstCandidate.issues).toEqual([]);
+      await expect(source.commitReconciled!({
+        operationEpoch: source.operationEpoch,
+        operationId: 'operation:retained-prefix',
+        intentHash: hash(8),
+        expectedBasis: firstIntegration.basis,
+        candidate: firstCandidate.storage
+      })).resolves.toMatchObject({ outcome: 'committed' });
+
+      const prefixBranch = { ...privateBase, basis: prefixBasis, storage: prefix.storage };
+      const suffixCommand = {
+        apply: (draft: Parameters<Automerge.ChangeFn<TextDocument>>[0]) => {
+          Automerge.splice(draft, ['text'], insertionBoundary + 1, 0, 'Z');
+        }
+      };
+      const suffix = source.stage(prefixBranch, [suffixCommand]);
+      const suffixCandidate = source.reconcile!(
+        source.snapshot(),
+        prefixBasis,
+        [suffixCommand],
+        suffix.storage
+      );
+      expect(suffixCandidate.issues).toEqual([]);
+      await expect(source.commitReconciled!({
+        operationEpoch: source.operationEpoch,
+        operationId: 'operation:retained-suffix',
+        intentHash: hash(9),
+        expectedBasis: source.snapshot().basis,
+        candidate: suffixCandidate.storage
+      })).resolves.toMatchObject({ outcome: 'committed' });
+      expect(runtime.snapshot().storage.text).toContain('LZ' + localText + 'M');
+      expect(runtime.snapshot().storage.text).toContain('R' + remoteText);
+      source.close();
+    }
+  ));
+
   propertyTest('staged generated identities equal committed and replayed evidence', fc.asyncProperty(
     fc.array(safeString, { minLength: 1, maxLength: 8 }),
     async (values) => {

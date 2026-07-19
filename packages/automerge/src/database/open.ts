@@ -3,9 +3,9 @@ import {
   bindAttachmentProjection,
   createLogicalConstraintQuery,
   prepareDatabaseAttachment,
-  type ReadyAttachmentPreparation,
-  createAttachmentTransactionService
+  type ReadyAttachmentPreparation
 } from '@tarstate/core/attachment/adapter';
+import { createAttachmentTransactionRuntime } from '@tarstate/core/attachment/retained-text-adapter';
 import { createAttachmentTextIntentService } from '@tarstate/core/attachment/text-intent-adapter';
 import {
   createMappedAttachmentProjector,
@@ -91,9 +91,9 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
         : [createIssue({ code: 'transaction.attachment_unavailable', details: { reason: 'writable_mapping_required' } })]
     };
   }
-  const runtime = automergeRepoSourceRuntime({ handle: input.handle });
+  const sourceRuntime = automergeRepoSourceRuntime({ handle: input.handle });
   const source = new AutomergeAtomicSource({
-    runtime,
+    runtime: sourceRuntime,
     operationEpoch: globalThis.crypto.randomUUID(),
     ownsRuntime: true
   });
@@ -116,7 +116,7 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
       preparation as ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
       projection
     );
-    const transactions = await createAttachmentTransactionService<Automerge.Doc<T>, AutomergeSourceCommand<T>>({
+    const transactionRuntime = await createAttachmentTransactionRuntime<Automerge.Doc<T>, AutomergeSourceCommand<T>>({
       attachmentId,
       attachmentIncarnation,
       authorityScope: input.authorityScope,
@@ -127,11 +127,13 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
       // The standard runtime ledger is process-local even when the document is persisted.
       durability: 'memory'
     });
+    const transactions = transactionRuntime.transactions;
     const textIntents = createAttachmentTextIntentService({
       transactions,
       source,
-      supported: [...binding.writeCapabilities.values()].some(({ fields }) =>
-        Object.values(fields).some(({ textSplice }) => textSplice !== undefined))
+      ...(transactionRuntime.retainedText === undefined
+        ? {}
+        : { publication: transactionRuntime.retainedText })
     });
     return {
       success: true,

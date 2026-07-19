@@ -63,14 +63,17 @@ const measure = async (changed) => {
 const noOp = await measure(false);
 const oneRow = await measure(true);
 const dependentText = await measureDependentText();
+const continuedText = await measureContinuedText();
 const directAutomerge = await measureDirectAutomerge();
 const contracts = {
   independentRepeatedSamples: sampleCount >= 5,
   exactCommitSemantics: noOp.correctnessFailures.length === 0 && oneRow.correctnessFailures.length === 0,
   dependentTextCompositionSemantics: dependentText.correctnessFailures.length === 0,
+  continuedTextCompositionSemantics: continuedText.correctnessFailures.length === 0,
   noOp100RowsCeiling: noOp.milliseconds <= 20,
   oneRow100RowsCeiling: oneRow.milliseconds <= 30,
-  dependentText16SegmentsCeiling: dependentText.milliseconds <= 60
+  dependentText16SegmentsCeiling: dependentText.milliseconds <= 60,
+  continuedText8Segments2PublicationsCeiling: continuedText.milliseconds <= 100
 };
 const report = {
   benchmark: 'tarstate-public-automerge-database-transactions',
@@ -84,11 +87,13 @@ const report = {
     noOpMillisecondsPerTransaction: noOp.milliseconds,
     oneRowMillisecondsPerTransaction: oneRow.milliseconds,
     dependentText16SegmentsMillisecondsPerComposition: dependentText.milliseconds,
+    continuedText8Segments2PublicationsMillisecondsPerComposition: continuedText.milliseconds,
     directAutomergeOneRowMillisecondsPerChange: directAutomerge,
     correctnessFailures: [
       ...noOp.correctnessFailures,
       ...oneRow.correctnessFailures,
-      ...dependentText.correctnessFailures
+      ...dependentText.correctnessFailures,
+      ...continuedText.correctnessFailures
     ]
   },
   node: process.version
@@ -152,6 +157,35 @@ async function measureDependentText() {
       samples.push((performance.now() - started) / textIterations);
       if (!runtime.title()?.endsWith('x'.repeat(segments * (textIterations + 1)))) {
         correctnessFailures.push('dependent-text-sample-' + sample);
+      }
+    } finally {
+      await runtime.close();
+    }
+  }
+  samples.sort((left, right) => left - right);
+  return {
+    milliseconds: Number(samples[Math.floor(samples.length / 2)].toFixed(3)),
+    correctnessFailures
+  };
+}
+
+async function measureContinuedText() {
+  const segments = 8;
+  const textIterations = 5;
+  const samples = [];
+  const correctnessFailures = [];
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const runtime = await openBenchmarkRuntime();
+    try {
+      await runtime.composeTextAcrossPublications(segments, 4);
+      globalThis.gc();
+      const started = performance.now();
+      for (let index = 0; index < textIterations; index += 1) {
+        await runtime.composeTextAcrossPublications(segments, 4);
+      }
+      samples.push((performance.now() - started) / textIterations);
+      if (!runtime.title()?.endsWith('x'.repeat(segments * (textIterations + 1)))) {
+        correctnessFailures.push('continued-text-sample-' + sample);
       }
     } finally {
       await runtime.close();
@@ -235,10 +269,50 @@ async function openBenchmarkRuntime() {
         }
       }
       try {
-        const receipt = await text.complete();
+        const receipt = await text.publish();
         if (receipt.outcome !== 'committed') {
           throw new Error('Text benchmark composition rejected: ' + receipt.issues.map(({ code }) => code).join(', '));
         }
+      } finally {
+        text.close();
+      }
+    },
+    composeTextAcrossPublications: async (segmentCount, publicationSize) => {
+      const visible = database.getSnapshot();
+      if (visible.state !== 'open' || visible.current.readiness !== 'ready') {
+        throw new Error('Transaction benchmark database is not ready');
+      }
+      const openedText = await database.openTextIntent({
+        observedBasis: visible.current.basis
+      });
+      if (!openedText.success) {
+        throw new Error('Text benchmark session failed: ' + openedText.issues.map(({ code }) => code).join(', '));
+      }
+      const text = openedText.value;
+      const initialLength = handle.doc()?.tasks['task-0']?.title.length ?? 0;
+      let publication;
+      let publishedSegments = 0;
+      try {
+        for (let index = 0; index < segmentCount; index += 1) {
+          const segment = text.append(
+            { kind: 'append-continued-text', index },
+            (snapshot) => snapshot.spliceText(
+              tasks,
+              ['task-0'],
+              'title',
+              { index: initialLength + index, deleteCount: 0, insert: 'x' }
+            )
+          );
+          if (segment.status !== 'pending') {
+            throw new Error('Text benchmark segment rejected: ' + segment.issues.map(({ code }) => code).join(', '));
+          }
+          if ((index + 1) % publicationSize !== 0) continue;
+          if (publication !== undefined) await publication;
+          publication = text.publish();
+          publishedSegments = index + 1;
+        }
+        if (publication !== undefined) await publication;
+        if (publishedSegments < segmentCount) await text.publish();
       } finally {
         text.close();
       }

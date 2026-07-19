@@ -94,9 +94,8 @@ export type DatabaseTextIntentSegment = {
 export type DatabaseTextIntentSessionSnapshot = {
   readonly state:
     | 'ready'
+    | 'publishing'
     | 'blocked'
-    | 'committing'
-    | 'committed'
     | 'rejected'
     | 'unknown'
     | 'cancelled'
@@ -110,8 +109,8 @@ export type DatabaseTextIntentSessionSnapshot = {
 };
 
 /**
- * Bounded composition of dependent text splices published as one transaction.
- * No intermediate optimistic snapshot is written to the attached source.
+ * Causal composition of dependent text splices. Each publication is atomic;
+ * later segments may be appended while an earlier prefix is publishing.
  */
 export type DatabaseTextIntentSession = {
   readonly getSnapshot: () => DatabaseTextIntentSessionSnapshot;
@@ -120,7 +119,7 @@ export type DatabaseTextIntentSession = {
     intent: JsonValue,
     transform: DatabaseTextIntentTransform
   ) => DatabaseTextIntentSegment;
-  readonly complete: () => Promise<CommitReceipt>;
+  readonly publish: () => Promise<CommitReceipt>;
   readonly cancel: () => void;
   readonly close: () => void;
 };
@@ -141,7 +140,7 @@ export type DatabaseFieldWriteCapabilities = {
   readonly textSplice?: {
     readonly indexUnit: 'utf16-code-unit';
     readonly concurrency: 'merge-captured-intent';
-    readonly dependentComposition: 'bounded-before-publish';
+    readonly dependentComposition?: 'retained-cross-publication';
   };
 };
 

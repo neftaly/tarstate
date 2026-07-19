@@ -140,6 +140,15 @@ current source into a private candidate. This phase is optional source
 capability. It cannot publish, evaluate product callbacks, or skip final
 validation.
 
+### Retained text publication
+
+Owns an opaque unpublished source branch and advances only text-only causal
+prefixes. The lifecycle shell may queue pure logical transforms while one prefix
+is publishing, but source-native branch creation, extension, and reconciliation
+remain adapter capabilities. Known commit returns the private descendant used
+for later local coordinates; rejection or unknown outcome returns no usable
+continuation.
+
 ### Candidate validation
 
 Projects integration and candidate snapshots, proves exact captured targets,

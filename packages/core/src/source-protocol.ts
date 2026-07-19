@@ -119,6 +119,8 @@ export type AtomicSource<Storage, Command> = {
   readonly relateFootprints: (left: Footprint, right: Footprint) => FootprintRelation;
   readonly mergeIntents: (plans: readonly PlanResult<Command>[]) => IntentMergeResult<Command>;
   readonly stage: (snapshot: SourceSnapshot<Storage>, commands: readonly Command[]) => { readonly storage: Storage; readonly issues: readonly Issue[] };
+  /** Creates an unpublished causal branch when the source can preserve one across commits. */
+  readonly createPrivateBranch?: (snapshot: SourceSnapshot<Storage>) => Storage;
   /** Builds a non-published candidate by applying captured commands at commandBasis to snapshot. */
   readonly reconcile?: (
     snapshot: SourceSnapshot<Storage>,

@@ -1,5 +1,6 @@
 import type {
   DatabaseTextIntentService,
+  DatabaseTextIntentTransform,
   DatabaseTransactionService,
   DatabaseTransactionSnapshot
 } from '../database/transaction.js';
@@ -8,21 +9,37 @@ import { samePortableJson } from '../internal-json-equality.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
 import type { AtomicSource } from '../source-protocol.js';
 import type { SourceBasis } from '../source-state.js';
+import type { CommitReceipt } from '../transaction.js';
+import type { JsonValue } from '../value.js';
 import { createTextIntentSession } from './text-intent-session.js';
 import { ImmutableDatabaseTransactionSnapshot } from './transaction-snapshot.js';
 
-export type AttachmentTextIntentServiceInput<Storage> = {
+export type AttachmentTextIntentServiceInput<Storage, Branch extends object> = {
   readonly transactions: DatabaseTransactionService;
   readonly source: Pick<AtomicSource<Storage, unknown>, 'sourceId' | 'snapshot' | 'subscribe'>;
-  readonly supported: boolean;
+  readonly publication?: TextIntentPublicationDriver<Branch>;
 };
 
-/** Optional bounded text lifecycle composed beside the ordinary transaction service. */
-export const createAttachmentTextIntentService = <Storage>(
-  input: AttachmentTextIntentServiceInput<Storage>
+export type TextIntentPublicationDriver<Branch extends object> = {
+  readonly openBranch: (observedBasis: SourceBasis) => Branch;
+  readonly publish: (input: {
+    readonly intent: JsonValue;
+    readonly transforms: readonly DatabaseTextIntentTransform[];
+    readonly branch: Branch;
+    readonly signal: AbortSignal;
+  }) => Promise<{
+    readonly receipt: CommitReceipt;
+    readonly continuation?: Branch;
+    readonly optimisticBase?: ImmutableDatabaseTransactionSnapshot;
+  }>;
+};
+
+/** Optional causal text lifecycle composed beside the ordinary transaction service. */
+export const createAttachmentTextIntentService = <Storage, Branch extends object>(
+  input: AttachmentTextIntentServiceInput<Storage, Branch>
 ): DatabaseTextIntentService => Object.freeze({
   openTextIntent: async (options) => {
-    if (!input.supported) {
+    if (input.publication === undefined) {
       return {
         success: false,
         issues: [createIssue({
@@ -59,11 +76,13 @@ export const createAttachmentTextIntentService = <Storage>(
       return { success: false, issues: [sourceSnapshotIssue(input.source, error)] };
     }
     try {
+      const branch = input.publication.openBranch(observedBasis);
       return {
         success: true,
         value: createTextIntentSession({
           observedBasis,
           initial,
+          branch,
           initialIssues: capture.issues,
           initiallyStale: !samePortableJson(currentBasis, observedBasis),
           ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -84,11 +103,7 @@ export const createAttachmentTextIntentService = <Storage>(
               throw error;
             }
           },
-          commit: ({ intent, finalSnapshot, signal }) => input.transactions.transact(
-            intent,
-            () => finalSnapshot,
-            { observedBasis, signal }
-          )
+          publish: input.publication.publish
         }),
         issues: capture.issues
       };

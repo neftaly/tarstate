@@ -26,14 +26,22 @@ try {
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/declaration/index.js', 35_000, ['preparation', 'projection-selection', 'transaction-service']);
   // Includes strict declarations, effective write capabilities, captured-basis
-  // reconciliation with one-stage text batching, generated-key authoring, and
-  // field-bounded projection.
-  assertClosure('attachment/adapter/index.js', 329_700, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // reconciliation with retained-candidate validation, one-stage text
+  // batching, generated-key authoring, and field-bounded projection.
+  assertClosure('attachment/adapter/index.js', 331_700, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('attachment/mapped-adapter/index.js', 95_000, ['transaction-executor', 'relation-delta-authoring', 'lifecycle-governance']);
-  assertClosure('attachment/text-intent-adapter/index.js', 74_300, [
+  // Includes bounded queued-prefix lifecycle, evidence rolling, and replay
+  // validation without source-specific reconciliation or commit machinery.
+  assertClosure('attachment/text-intent-adapter/index.js', 78_700, [
     'transaction-executor',
     'commit-coordinator',
     'lifecycle-governance'
+  ]);
+  // Opt-in source-native candidate retention and final publication validation;
+  // ordinary attachment and text-session topics remain separate.
+  assertClosure('attachment/retained-text-adapter/index.js', 206_800, [
+    'query-incremental',
+    'observer-maintenance'
   ]);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);

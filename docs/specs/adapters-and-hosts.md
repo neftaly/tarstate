@@ -46,6 +46,8 @@ The adapter must:
 - surface metadata conflicts, collisions, or malformed alternatives;
 - use exact head sets for optimistic basis evidence;
 - preserve native text-splice reconciliation where advertised;
+- advertise retained cross-publication text only when one private causal branch
+  can survive repeated conditional publications;
 - keep heads, changes, Repo handle staging, and object IDs private;
 - project portable bytes and immutable strings through the shared scalar
   boundary;

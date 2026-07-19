@@ -4,7 +4,7 @@ import type {
   DatabaseTextIntentSessionSnapshot,
   DatabaseTextIntentTransform
 } from '../database/transaction.js';
-import { createIssue, TarstateParseError, type Issue } from '../issues.js';
+import { TarstateParseError, type Issue } from '../issues.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
 import type { SourceBasis } from '../source-state.js';
 import type { CommitReceipt } from '../transaction.js';
@@ -13,40 +13,54 @@ import {
   ImmutableDatabaseTransactionSnapshot,
   sameTransactionSnapshotLineage
 } from './transaction-snapshot.js';
+import {
+  composedTextIntent,
+  isTerminalTextIntentState,
+  rebaseAcceptedTextSegments,
+  retainRecentTextEvidence,
+  settleSelectedTextSegments,
+  textIntentIssue,
+  textIntentSegmentEvidence,
+  validateTextContinuation,
+  type AcceptedTextIntentSegment
+} from './text-intent-core.js';
 
-type AcceptedSegment = {
-  readonly evidence: DatabaseTextIntentSegment;
-  readonly intent: JsonValue;
-};
+const maxPendingSegments = 256;
+const maxPendingSplices = 1_024;
+const maxRetainedEvidence = 256;
 
-// Keeps immutable per-publication segment evidence from becoming quadratic
-// editor-session churn while comfortably covering one UI input batch.
-const maxSegments = 256;
-const maxSplices = 1_024;
-
-export type TextIntentSessionInput = {
+export type TextIntentSessionInput<Branch extends object> = {
   readonly observedBasis: SourceBasis;
   readonly initial: ImmutableDatabaseTransactionSnapshot;
+  readonly branch: Branch;
   readonly initialIssues: readonly Issue[];
   readonly initiallyStale: boolean;
   readonly signal?: AbortSignal;
   readonly subscribeSource: (markStale: () => void) => () => void;
-  readonly commit: (input: {
+  readonly publish: (input: {
     readonly intent: JsonValue;
-    readonly finalSnapshot: ImmutableDatabaseTransactionSnapshot;
+    readonly transforms: readonly DatabaseTextIntentTransform[];
+    readonly branch: Branch;
     readonly signal: AbortSignal;
-  }) => Promise<CommitReceipt>;
+  }) => Promise<{
+    readonly receipt: CommitReceipt;
+    readonly continuation?: Branch;
+    readonly optimisticBase?: ImmutableDatabaseTransactionSnapshot;
+  }>;
 };
 
-/** Lifecycle shell over the immutable text-authoring core. */
-export const createTextIntentSession = (
-  input: TextIntentSessionInput
+/** Lifecycle shell over immutable causal text authoring and an opaque source branch. */
+export const createTextIntentSession = <Branch extends object>(
+  input: TextIntentSessionInput<Branch>
 ): DatabaseTextIntentSession => {
   const sessionId = globalThis.crypto.randomUUID();
   const listeners = new Set<() => void>();
-  const accepted: AcceptedSegment[] = [];
+  let accepted: AcceptedTextIntentSegment[] = [];
   let allSegments: readonly DatabaseTextIntentSegment[] = Object.freeze([]);
+  let nextSegmentIndex = 0;
+  let pendingSplices = 0;
   let current = input.initial;
+  let branch = input.branch;
   let state: DatabaseTextIntentSessionSnapshot['state'] = 'ready';
   let freshness: DatabaseTextIntentSessionSnapshot['freshness'] = input.initiallyStale
     ? 'stale'
@@ -54,11 +68,12 @@ export const createTextIntentSession = (
   let issues = Object.freeze([...input.initialIssues]);
   let receipt: CommitReceipt | undefined;
   let closed = false;
-  let completion: Promise<CommitReceipt> | undefined;
+  let publication: Promise<CommitReceipt> | undefined;
+  let nextPublicationIndex = 0;
   const abort = new AbortController();
 
   let snapshot = sessionSnapshot();
-  const publish = (): void => {
+  const publishSnapshot = (): void => {
     snapshot = sessionSnapshot();
     for (const listener of Array.from(listeners)) {
       try {
@@ -69,105 +84,178 @@ export const createTextIntentSession = (
   const markStale = (): void => {
     if (freshness === 'stale' || closed) return;
     freshness = 'stale';
-    publish();
+    publishSnapshot();
   };
   const unsubscribeSource = input.subscribeSource(markStale);
 
   const cancel = (): void => {
-    if (closed || isSettled(state) || state === 'cancelled') return;
+    if (closed || isTerminalTextIntentState(state)) return;
     abort.abort();
-    state = 'cancelled';
-    const cancellation = sessionIssue('lifecycle.cancelled', 'text_intent_cancelled');
+    const cancellation = textIntentIssue('lifecycle.cancelled', 'text_intent_cancelled');
     issues = Object.freeze([...issues, cancellation]);
-    allSegments = settlePendingSegments(allSegments, 'cancelled', [cancellation]);
-    publish();
+    const inFlightCount = state === 'publishing' ? publicationPrefixCount : 0;
+    const queuedIds = new Set(accepted.slice(inFlightCount).map(({ evidence }) => evidence.segmentId));
+    allSegments = settleSelectedTextSegments(allSegments, queuedIds, 'cancelled', [cancellation]);
+    state = 'cancelled';
+    publishSnapshot();
   };
   const append = (
     intent: JsonValue,
     transform: DatabaseTextIntentTransform
   ): DatabaseTextIntentSegment => {
-    if (state !== 'ready' || closed) {
-      throw new Error('Text intent segments can only be appended to a ready session');
+    if ((state !== 'ready' && state !== 'publishing') || closed) {
+      throw new Error('Text intent segments can only be appended to an active session');
     }
     if (typeof transform !== 'function') {
       throw new TypeError('Text intent transform must be a function');
     }
     const ownedIntent = detachAndFreezeJsonValue(intent);
     if (!ownedIntent.success) throw new TarstateParseError(ownedIntent.issues);
-    if (allSegments.length >= maxSegments) {
-      return rejectSegment('text_intent_segment_budget_exceeded');
+    if (accepted.length >= maxPendingSegments) {
+      return rejectSegment('text_intent_pending_segment_budget_exceeded');
     }
     const transformed = transform(current);
     if (!(transformed instanceof ImmutableDatabaseTransactionSnapshot)
       || !sameTransactionSnapshotLineage(transformed, current)) {
-      throw new TypeError('Text intent transform must return a snapshot created by this transaction service');
+      throw new TypeError('Text intent transform must return a snapshot created by this session');
     }
-    const segmentId = `${sessionId}:${allSegments.length}`;
+    const segmentId = `${sessionId}:${nextSegmentIndex}`;
+    nextSegmentIndex += 1;
     const segmentIssues = validateTextContinuation(current, transformed);
-    if (transformed.authoredTextSplices().length > maxSplices) {
-      return rejectSegment('text_intent_splice_budget_exceeded');
+    const beforeSpliceCount = current.authoredTextSplices().length;
+    const segmentSplices = transformed.authoredTextSplices().slice(beforeSpliceCount);
+    if (pendingSplices + segmentSplices.length > maxPendingSplices) {
+      return rejectSegment('text_intent_pending_splice_budget_exceeded', segmentId);
     }
     if (segmentIssues.length > 0) {
-      const rejected = segmentEvidence(segmentId, 'rejected', segmentIssues);
-      allSegments = Object.freeze([...allSegments, rejected]);
-      publish();
+      const rejected = textIntentSegmentEvidence(segmentId, 'rejected', segmentIssues);
+      allSegments = retainRecentTextEvidence([...allSegments, rejected], maxRetainedEvidence);
+      publishSnapshot();
       return rejected;
     }
     current = transformed;
-    const evidence = segmentEvidence(segmentId, 'pending', []);
-    accepted.push({ evidence, intent: ownedIntent.value });
-    allSegments = Object.freeze([...allSegments, evidence]);
-    publish();
+    pendingSplices += segmentSplices.length;
+    const evidence = textIntentSegmentEvidence(segmentId, 'pending', []);
+    accepted.push({
+      evidence,
+      intent: ownedIntent.value,
+      transform,
+      splices: Object.freeze(segmentSplices)
+    });
+    allSegments = retainRecentTextEvidence([...allSegments, evidence], maxRetainedEvidence);
+    publishSnapshot();
     return evidence;
 
-    function rejectSegment(reason: string): DatabaseTextIntentSegment {
-      const rejected = segmentEvidence(
-        `${sessionId}:${allSegments.length}`,
+    function rejectSegment(
+      reason: string,
+      segmentId = `${sessionId}:${nextSegmentIndex++}`
+    ): DatabaseTextIntentSegment {
+      const rejected = textIntentSegmentEvidence(
+        segmentId,
         'rejected',
-        [sessionIssue('lifecycle.command_invalid', reason)]
+        [textIntentIssue('lifecycle.command_invalid', reason)]
       );
-      allSegments = Object.freeze([...allSegments, rejected]);
-      state = 'blocked';
-      issues = Object.freeze([...issues, ...rejected.issues]);
-      publish();
+      allSegments = retainRecentTextEvidence([...allSegments, rejected], maxRetainedEvidence);
+      publishSnapshot();
       return rejected;
     }
   };
-  const complete = (): Promise<CommitReceipt> => {
-    if (completion !== undefined) return completion;
-    if (closed || state === 'cancelled') {
-      return Promise.reject(new Error('Text intent session is not completable'));
+  let publicationPrefixCount = 0;
+  const publish = (): Promise<CommitReceipt> => {
+    if (publication !== undefined) return publication;
+    if (closed || isTerminalTextIntentState(state)) {
+      return Promise.reject(new Error('Text intent session is not publishable'));
     }
     if (accepted.length === 0) {
-      return Promise.reject(new Error('Text intent session has no accepted segments'));
+      return Promise.reject(new Error('Text intent session has no unpublished segments'));
     }
-    state = 'committing';
-    const commitInput = {
-      intent: composedIntent(sessionId, accepted),
-      finalSnapshot: current,
-      signal: abort.signal
-    };
-    completion = Promise.resolve().then(() => input.commit(commitInput)).then((settled) => {
-      receipt = settled;
-      if (!closed) state = settled.outcome;
-      issues = Object.freeze([...issues, ...settled.issues]);
-      allSegments = settlePendingSegments(allSegments, settled.outcome, settled.issues);
-      publish();
-      return settled;
+    publicationPrefixCount = accepted.length;
+    const publicationIndex = nextPublicationIndex;
+    nextPublicationIndex += 1;
+    const prefix = accepted.slice(0, publicationPrefixCount);
+    const prefixIds = new Set(prefix.map(({ evidence }) => evidence.segmentId));
+    const publishAbort = abort.signal;
+    state = 'publishing';
+    publication = Promise.resolve().then(() => input.publish({
+      intent: composedTextIntent(sessionId, publicationIndex, prefix),
+      transforms: Object.freeze(prefix.map(({ transform }) => transform)),
+      branch,
+      signal: publishAbort
+    })).then((settled) => {
+      receipt = settled.receipt;
+      issues = Object.freeze([...issues, ...settled.receipt.issues]);
+      if (settled.receipt.outcome === 'committed'
+        && settled.continuation !== undefined
+        && settled.optimisticBase !== undefined) {
+        allSegments = settleSelectedTextSegments(
+          allSegments,
+          prefixIds,
+          'committed',
+          settled.receipt.issues
+        );
+        accepted = accepted.slice(publicationPrefixCount);
+        pendingSplices = accepted.reduce((total, segment) => total + segment.splices.length, 0);
+        branch = settled.continuation;
+        if (state === 'cancelled' || closed) {
+          settleQueuedAfterCancellation();
+        } else {
+          const rebased = rebaseAcceptedTextSegments(settled.optimisticBase, accepted);
+          if (rebased.success) {
+            current = rebased.current;
+            state = 'ready';
+          } else {
+            issues = Object.freeze([...issues, rebased.issue]);
+            const queuedIds = new Set(accepted.map(({ evidence }) => evidence.segmentId));
+            allSegments = settleSelectedTextSegments(
+              allSegments,
+              queuedIds,
+              'rejected',
+              [rebased.issue]
+            );
+            accepted = [];
+            pendingSplices = 0;
+            state = 'blocked';
+          }
+        }
+      } else if (settled.receipt.outcome === 'committed') {
+        const failure = textIntentIssue(
+          'lifecycle.adapter_failed',
+          'text_intent_committed_continuation_unavailable'
+        );
+        issues = Object.freeze([...issues, failure]);
+        settleUncertainDescendants(prefixIds, [failure]);
+      } else if (settled.receipt.outcome === 'unknown') {
+        settleUncertainDescendants(prefixIds, settled.receipt.issues);
+      } else if (state === 'cancelled' || closed) {
+        allSegments = settleSelectedTextSegments(
+          allSegments,
+          prefixIds,
+          'cancelled',
+          settled.receipt.issues
+        );
+        accepted = [];
+        pendingSplices = 0;
+      } else {
+        settleRejectedDescendants(prefixIds, settled.receipt.issues);
+      }
+      return settled.receipt;
     }).catch((error: unknown) => {
-      state = closed ? 'closed' : 'unknown';
-      const failure = sessionIssue(
+      const failure = textIntentIssue(
         'lifecycle.adapter_failed',
-        'text_intent_completion_failed',
+        'text_intent_publication_failed',
         error
       );
       issues = Object.freeze([...issues, failure]);
-      allSegments = settlePendingSegments(allSegments, 'unknown', [failure]);
-      publish();
+      settleUncertainDescendants(prefixIds, [failure]);
       throw error;
+    }).finally(() => {
+      publication = undefined;
+      publicationPrefixCount = 0;
+      allSegments = retainRecentTextEvidence(allSegments, maxRetainedEvidence);
+      publishSnapshot();
     });
-    publish();
-    return completion;
+    publishSnapshot();
+    return publication;
   };
   const close = (): void => {
     if (closed) return;
@@ -176,7 +264,7 @@ export const createTextIntentSession = (
     state = 'closed';
     unsubscribeSource();
     input.signal?.removeEventListener('abort', cancel);
-    publish();
+    publishSnapshot();
     listeners.clear();
   };
 
@@ -188,13 +276,57 @@ export const createTextIntentSession = (
       return () => { listeners.delete(listener); };
     },
     append,
-    complete,
+    publish,
     cancel,
     close
   });
   if (input.signal?.aborted === true) cancel();
   else input.signal?.addEventListener('abort', cancel, { once: true });
   return service;
+
+  function settleQueuedAfterCancellation(): void {
+    const cancellation = textIntentIssue('lifecycle.cancelled', 'text_intent_descendant_cancelled');
+    const queuedIds = new Set(accepted.map(({ evidence }) => evidence.segmentId));
+    allSegments = settleSelectedTextSegments(allSegments, queuedIds, 'cancelled', [cancellation]);
+    accepted = [];
+    pendingSplices = 0;
+  }
+
+  function settleUncertainDescendants(
+    prefixIds: ReadonlySet<string>,
+    settlementIssues: readonly Issue[]
+  ): void {
+    const descendant = textIntentIssue(
+      'lifecycle.adapter_failed',
+      'text_intent_ancestor_outcome_unknown'
+    );
+    allSegments = settleSelectedTextSegments(allSegments, prefixIds, 'unknown', settlementIssues);
+    const queuedIds = new Set(accepted
+      .filter(({ evidence }) => !prefixIds.has(evidence.segmentId))
+      .map(({ evidence }) => evidence.segmentId));
+    allSegments = settleSelectedTextSegments(allSegments, queuedIds, 'unknown', [descendant]);
+    accepted = [];
+    pendingSplices = 0;
+    if (!closed) state = 'unknown';
+  }
+
+  function settleRejectedDescendants(
+    prefixIds: ReadonlySet<string>,
+    settlementIssues: readonly Issue[]
+  ): void {
+    const descendant = textIntentIssue(
+      'lifecycle.command_invalid',
+      'text_intent_ancestor_rejected'
+    );
+    allSegments = settleSelectedTextSegments(allSegments, prefixIds, 'rejected', settlementIssues);
+    const queuedIds = new Set(accepted
+      .filter(({ evidence }) => !prefixIds.has(evidence.segmentId))
+      .map(({ evidence }) => evidence.segmentId));
+    allSegments = settleSelectedTextSegments(allSegments, queuedIds, 'rejected', [descendant]);
+    accepted = [];
+    pendingSplices = 0;
+    if (!closed) state = 'rejected';
+  }
 
   function sessionSnapshot(): DatabaseTextIntentSessionSnapshot {
     return Object.freeze({
@@ -208,76 +340,3 @@ export const createTextIntentSession = (
     });
   }
 };
-
-const validateTextContinuation = (
-  before: ImmutableDatabaseTransactionSnapshot,
-  after: ImmutableDatabaseTransactionSnapshot
-): readonly Issue[] => {
-  const beforeSplices = before.authoredTextSplices();
-  const afterSplices = after.authoredTextSplices();
-  const authoringIssues = after.rejectionIssues();
-  if (authoringIssues.length > before.rejectionIssues().length) {
-    return authoringIssues.slice(before.rejectionIssues().length);
-  }
-  if (after.changedRelations().size > 0 || after.generatedInserts().length > 0) {
-    return [sessionIssue('lifecycle.command_invalid', 'text_intent_operation_required')];
-  }
-  if (afterSplices.length <= beforeSplices.length) {
-    return [sessionIssue('lifecycle.command_invalid', 'text_intent_splice_required')];
-  }
-  for (let index = 0; index < beforeSplices.length; index += 1) {
-    if (beforeSplices[index] !== afterSplices[index]) {
-      return [sessionIssue('lifecycle.command_invalid', 'text_intent_lineage_mismatch')];
-    }
-  }
-  return Object.freeze([]);
-};
-
-const composedIntent = (
-  sessionId: string,
-  accepted: readonly AcceptedSegment[]
-): JsonValue => Object.freeze({
-  kind: 'tarstate.dependent-text-intent',
-  formatVersion: 1,
-  sessionId,
-  segments: Object.freeze(accepted.map(({ evidence, intent }) => Object.freeze({
-    segmentId: evidence.segmentId,
-    intent
-  })))
-});
-
-const segmentEvidence = (
-  segmentId: string,
-  status: DatabaseTextIntentSegment['status'],
-  issues: readonly Issue[]
-): DatabaseTextIntentSegment => Object.freeze({
-  segmentId,
-  status,
-  issues: Object.freeze([...issues])
-});
-
-const settlePendingSegments = (
-  segments: readonly DatabaseTextIntentSegment[],
-  status: Exclude<DatabaseTextIntentSegment['status'], 'pending'>,
-  issues: readonly Issue[]
-): readonly DatabaseTextIntentSegment[] => Object.freeze(segments.map((segment) =>
-  segment.status === 'pending'
-    ? segmentEvidence(segment.segmentId, status, issues)
-    : segment));
-
-const isSettled = (state: DatabaseTextIntentSessionSnapshot['state']): boolean =>
-  state === 'committed' || state === 'rejected' || state === 'unknown';
-
-const sessionIssue = (
-  code: 'lifecycle.adapter_failed' | 'lifecycle.cancelled' | 'lifecycle.command_invalid',
-  reason: string,
-  error?: unknown
-): Issue => createIssue({
-  code,
-  details: {
-    reason,
-    ...(error === undefined
-      ? {}
-      : { error: error instanceof Error ? error.name : typeof error })
-  }
-});

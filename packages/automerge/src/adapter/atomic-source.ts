@@ -233,6 +233,13 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     }
   };
 
+  createPrivateBranch = (snapshot: SourceSnapshot<Automerge.Doc<T>>): Automerge.Doc<T> => {
+    if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
+      throw new TypeError('Cannot branch a non-ready Automerge snapshot');
+    }
+    return Automerge.clone(snapshot.storage);
+  };
+
   reconcile = (
     snapshot: SourceSnapshot<Automerge.Doc<T>>,
     commandBasis: import('@tarstate/core/source').SourceBasis,
@@ -251,7 +258,18 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
         })]
       };
     }
-    if (commands.length === 0) return { storage: snapshot.storage, issues: [] };
+    if (priorCandidate !== undefined
+      && !Automerge.hasHeads(priorCandidate, [...basis.heads])) {
+      return {
+        storage: snapshot.storage,
+        issues: [adapterIssue('transaction.expected_basis_stale', 'plan', this.sourceId, undefined, undefined, {
+          reason: 'retained_candidate_missing_captured_basis'
+        })]
+      };
+    }
+    if (commands.length === 0 && priorCandidate === undefined) {
+      return { storage: snapshot.storage, issues: [] };
+    }
     try {
       const storage = priorCandidate === undefined
         ? Automerge.merge(

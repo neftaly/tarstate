@@ -2,7 +2,11 @@ import * as Automerge from '@automerge/automerge';
 import { Repo } from '@automerge/automerge-repo';
 import { builtInCapabilityRefs } from '@tarstate/core/capabilities';
 import { sealConstraintSet } from '@tarstate/core/artifacts/constraint-set';
-import type { DatabaseTransactionSnapshot } from '@tarstate/core/transactions';
+import { createAttachmentTextIntentService } from '@tarstate/core/attachment/text-intent-adapter';
+import type {
+  CommitReceipt,
+  DatabaseTransactionSnapshot
+} from '@tarstate/core/transactions';
 import {
   AttachmentCatalog,
   type AttachmentLease,
@@ -222,7 +226,7 @@ describe('standard Automerge database', () => {
       throw new Error('Expected ready database');
     }
     expect(fixture.database.capabilities(fixture.tasks).fields.title?.textSplice)
-      .toMatchObject({ dependentComposition: 'bounded-before-publish' });
+      .toMatchObject({ dependentComposition: 'retained-cross-publication' });
     const opened = await fixture.database.openTextIntent({
       observedBasis: observed.current.basis
     });
@@ -259,10 +263,10 @@ describe('standard Automerge database', () => {
     });
     expect(session.getSnapshot()).toMatchObject({ state: 'ready', freshness: 'stale' });
 
-    const receipt = await session.complete();
+    const receipt = await session.publish();
     expect(receipt).toMatchObject({ outcome: 'committed' });
     expect(session.getSnapshot()).toMatchObject({
-      state: 'committed',
+      state: 'ready',
       segments: [{ status: 'committed' }, { status: 'committed' }]
     });
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('RabXZ');
@@ -307,10 +311,134 @@ describe('standard Automerge database', () => {
       'title',
       { index: 3, deleteCount: 0, insert: 'Y' }
     ));
-    await expect(session.complete()).resolves.toMatchObject({ outcome: 'committed' });
+    await expect(session.publish()).resolves.toMatchObject({ outcome: 'committed' });
     expect(session.getSnapshot().segments.map(({ status }) => status))
       .toEqual(['committed', 'rejected', 'committed']);
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('abXYcd');
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('accepts a dependent suffix while its causal prefix is publishing', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({
+      observedBasis: observed.current.basis
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+
+    session.append({ kind: 'prefix' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const prefixPublication = session.publish();
+    expect(session.getSnapshot().state).toBe('publishing');
+    session.append({ kind: 'dependent-suffix' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 3, deleteCount: 0, insert: 'Y' }
+    ));
+    expect(session.publish()).toBe(prefixPublication);
+    fixture.handle.change((draft) => {
+      Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 0, 'R');
+    });
+
+    await expect(prefixPublication).resolves.toMatchObject({ outcome: 'committed' });
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'ready',
+      freshness: 'stale',
+      segments: [{ status: 'committed' }, { status: 'pending' }]
+    });
+    expect(session.getSnapshot().current.rows(fixture.tasks))
+      .toEqual([{ id: 'first', title: 'abXY' }]);
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('RabX');
+
+    await expect(session.publish()).resolves.toMatchObject({ outcome: 'committed' });
+    expect(session.getSnapshot().segments.map(({ status }) => status))
+      .toEqual(['committed', 'committed']);
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('RabXY');
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('suspends a dependent suffix when its prefix publication outcome is unknown', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const basis = observed.current.basis;
+    const unknownReceipt = {
+      kind: 'commit',
+      receiptVersion: 1,
+      operationEpoch: 'epoch:unknown',
+      operationId: 'operation:unknown',
+      transactionHash: '0'.repeat(64),
+      intentHash: '1'.repeat(64),
+      attachmentId: 'attachment:unknown',
+      attachmentFingerprint: '2'.repeat(64),
+      sourceId: 'source:unknown',
+      statementResults: [],
+      issues: [],
+      outcome: 'unknown',
+      beforeBasis: basis,
+      durability: 'unknown'
+    } as CommitReceipt;
+    const service = createAttachmentTextIntentService({
+      transactions: fixture.database,
+      source: {
+        sourceId: 'source:unknown',
+        snapshot: () => ({
+          sourceId: 'source:unknown',
+          operationEpoch: 'epoch:unknown',
+          basis,
+          state: 'ready',
+          freshness: 'current',
+          storage: {},
+          issues: []
+        }),
+        subscribe: () => () => undefined
+      },
+      publication: {
+        openBranch: () => ({}),
+        publish: async () => ({ receipt: unknownReceipt })
+      }
+    });
+    const opened = await service.openTextIntent({ observedBasis: basis });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+    session.append({ kind: 'prefix' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const prefixPublication = session.publish();
+    session.append({ kind: 'dependent-suffix' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 3, deleteCount: 0, insert: 'Y' }
+    ));
+
+    await expect(prefixPublication).resolves.toBe(unknownReceipt);
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'unknown',
+      segments: [{ status: 'unknown' }, { status: 'unknown' }]
+    });
+    await expect(session.publish()).rejects.toThrow('not publishable');
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('ab');
 
     session.close();
     fixture.database.close();
@@ -339,12 +467,49 @@ describe('standard Automerge database', () => {
       state: 'cancelled',
       segments: [{ status: 'cancelled' }]
     });
-    await expect(session.complete()).rejects.toThrow('not completable');
+    await expect(session.publish()).rejects.toThrow('not publishable');
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('abcd');
     session.close();
     session.close();
     expect(session.getSnapshot().state).toBe('closed');
 
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('cancels both an unpublished prefix and descendants queued during publication', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({ observedBasis: observed.current.basis });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+    session.append({ kind: 'prefix' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const publication = session.publish();
+    session.append({ kind: 'descendant' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 3, deleteCount: 0, insert: 'Y' }
+    ));
+
+    session.cancel();
+
+    await expect(publication).resolves.toMatchObject({ outcome: 'rejected' });
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'cancelled',
+      segments: [{ status: 'cancelled' }, { status: 'cancelled' }]
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('ab');
+
+    session.close();
     fixture.database.close();
     await fixture.repo.shutdown();
   });
@@ -368,15 +533,22 @@ describe('standard Automerge database', () => {
       'title',
       { index: 6, deleteCount: 0, insert: 'd' }
     ));
+    const publication = session.publish();
+    session.append({ kind: 'dependent-descendant' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 7, deleteCount: 0, insert: '!' }
+    ));
     fixture.handle.change((draft) => {
       Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 6, 'Forbidde');
     });
 
-    const receipt = await session.complete();
+    const receipt = await publication;
     expect(receipt).toMatchObject({ outcome: 'rejected' });
     expect(session.getSnapshot()).toMatchObject({
       state: 'rejected',
-      segments: [{ status: 'rejected' }]
+      segments: [{ status: 'rejected' }, { status: 'rejected' }]
     });
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('Forbidde');
 

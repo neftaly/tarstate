@@ -53,6 +53,10 @@ type TransactionSnapshotContext = {
 };
 
 const emptyRows: LogicalRows = Object.freeze([]);
+const emptyChangedRelationIds: ReadonlySet<string> = new Set<string>();
+const emptyGeneratedKeyInserts: readonly GeneratedKeyInsert[] = Object.freeze([]);
+const emptyTextSplices: readonly AuthoredTextSplice[] = Object.freeze([]);
+const emptyAuthoringIssues: readonly Issue[] = Object.freeze([]);
 const snapshotLineages = new WeakMap<object, object>();
 
 /** Immutable functional core value; lifecycle and replay stay in the service shell. */
@@ -257,6 +261,17 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
 
   rejectionIssues(): readonly Issue[] {
     return this.#context.authoringIssues;
+  }
+
+  continuationBase(): ImmutableDatabaseTransactionSnapshot {
+    return new ImmutableDatabaseTransactionSnapshot({
+      ...this.#context,
+      lineage: Object.freeze({}),
+      changedRelationIds: emptyChangedRelationIds,
+      generatedKeyInserts: emptyGeneratedKeyInserts,
+      textSplices: emptyTextSplices,
+      authoringIssues: emptyAuthoringIssues
+    });
   }
 
   #relation(relation: {

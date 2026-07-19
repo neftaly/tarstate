@@ -100,9 +100,8 @@ if (visible.state === 'open' && visible.current.readiness === 'ready') {
     { observedBasis: visible.current.basis }
   );
 
-  // Dependent offsets can be composed before one publication. The canonical
-  // document remains unchanged until complete(); concurrent Automerge changes
-  // are merged and the complete candidate is validated before publication.
+  // Each publish is atomic. A later offset may depend on an earlier local
+  // splice even when that earlier prefix is already publishing.
   const openedText = await opened.value.openTextIntent({
     observedBasis: visible.current.basis
   });
@@ -120,7 +119,15 @@ if (visible.state === 'open' && visible.current.readiness === 'ready') {
       'title',
       { index: 0, deleteCount: 5, insert: 'Ready' }
     ));
-    await text.complete();
+    const prefix = text.publish();
+    text.append({ kind: 'suffix-after-prefix' }, (snapshot) => snapshot.spliceText(
+      tasks,
+      ['first'],
+      'title',
+      { index: 6, deleteCount: 0, insert: '!' }
+    ));
+    await prefix;
+    await text.publish();
     text.close();
   }
 }
@@ -145,13 +152,15 @@ whose embedded `id` disagrees with its key. The standard constraint evaluator
 uses a deterministic work budget; exhausting it makes the constraint result
 indeterminate and prevents publication.
 
-`openTextIntent` is a bounded pre-publication composition, not a hidden editor
-or writer. Each `append` is synchronous and pure, updates only the session's
+`openTextIntent` is a causal publication session, not a hidden editor or
+writer. Each `append` is synchronous and pure, updates only the session's
 optimistic snapshot, and produces pending or rejected segment evidence.
-`complete` is idempotent and publishes all accepted dependent splices as one
-ordinary captured transaction. A session cannot continue accepting edits after
-completion starts; retaining dependent intent across several publications is a
-separate optional source capability.
+`publish` atomically captures the currently pending prefix. Appends made while
+that prefix is publishing form its causal suffix and remain unpublished until
+the next `publish`. A known commit advances the retained private branch; a
+rejected ancestor rejects its descendants, while an unknown ancestor outcome
+suspends them. Pending-work and recent-evidence budgets bound retained memory.
+The owner must call `close`.
 
 A document whose root is one logical entity needs no artificial array or
 object-map wrapper. Its storage mapping uses an explicit singleton and literal
@@ -260,9 +269,10 @@ the complete mapped state.
 
 Multiplayer changes are ordinary input to this loop. Replayable row transforms
 run again against a newer logical snapshot when needed. Position-sensitive
-text edits instead become one private Automerge branch at their observed basis;
-Tarstate merges that branch with current heads, re-projects and validates the
-exact candidate, then conditionally publishes it. Disjoint remote work is
+text edits instead extend one private Automerge branch from their observed
+basis. Each publication merges the next causal prefix with current heads,
+re-projects and validates the exact candidate, then conditionally publishes it.
+Disjoint remote work is
 preserved, while conflicts already present in mapped data remain explicit
 projection evidence rather than being selected or JSON-round-tripped away.
 Required constraints are also evaluated for live and remotely received states,

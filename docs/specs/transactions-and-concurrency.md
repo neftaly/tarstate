@@ -73,24 +73,30 @@ future source-neutral rule proves reconciliation safe for the complete unit.
 
 ### Dependent collaborative text streams
 
-`openTextIntent({ observedBasis })` owns one bounded pre-publication segment
-stream. Each synchronous `append` is evaluated against the stream's current
-optimistic logical snapshot, so a later numeric splice may depend on text added
-by an earlier accepted segment. `complete` lowers the full ordered stream to one
-captured transaction. No intermediate candidate reaches the source. The normal
-captured-text reconciliation loop then merges, projects, validates, and
-conditionally publishes that complete source-native change.
+`openTextIntent({ observedBasis })` owns one retained causal segment stream.
+Each synchronous `append` is evaluated against the stream's current optimistic
+logical snapshot, so a later numeric splice may depend on text added by an
+earlier accepted segment. `publish` captures the currently pending prefix and
+lowers it to one text-only transaction. Appends remain available while that
+prefix is publishing and become the next causal suffix.
 
-The session retains per-segment pending and settlement evidence, source
-freshness, cancellation, and idempotent completion/close. Invalid segments do
-not replace the last accepted optimistic snapshot. Segment and splice budgets
-bound retained work.
+The source adapter creates one unpublished branch at the observed basis. A
+successful publication advances that private branch without importing unrelated
+remote state into local numeric coordinates. The next publication extends the
+same source-native history, merges it with current integration state, projects
+and validates the exact candidate, and conditionally publishes it. The private
+branch and canonical source remain distinct until that handoff succeeds.
 
-This does not provide continuation across publication boundaries. A future
-flush-while-editing session would need to retain one private causal source
-candidate after a prefix starts publication, suspend descendants after unknown
-outcomes, and preserve source-native identity across reconciliation. Sources
-without that capability must not emulate it with offset transforms.
+The session retains bounded pending work and recent per-segment settlement
+evidence, source freshness, cancellation, and idempotent in-flight publication.
+Invalid segments do not replace the last accepted optimistic snapshot. Queued
+pure transforms are replayed only against the advanced private branch to reset
+cumulative authoring state and bound GC churn.
+
+A rejected prefix rejects its dependent descendants. An unknown prefix outcome
+suspends every descendant because the session cannot prove which causal history
+is canonical. Sources without retained-branch capability must report the
+session unavailable; they must not emulate it with numeric offset transforms.
 
 Opaque source-native text anchors are related but separable. Any future anchor
 contract must define movement when referenced text is deleted, remain scoped to

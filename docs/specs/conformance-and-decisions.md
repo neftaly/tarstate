@@ -17,6 +17,7 @@ changelog.
 | Source-link discovery and settlement | conforms for current feature set | source-link unit and fuzz tests |
 | Replayable exact-state transactions | conforms | source-neutral schedule properties plus attachment/external-store/Automerge integration tests |
 | Captured Automerge text reconciliation | conforms for eligible pure splice transactions | real branch/head integration and rejection tests |
+| Cross-publication dependent text | conforms for retained-branch Automerge sources | publication-race integration, unknown suspension, and fuzzed branch ancestry |
 | Candidate validation before reconciled publication | conforms | executor ordering and integration failure cases |
 | Official adapter one-path DX | conforms | `openAutomergeDatabase`, `openExternalStoreDatabase`, package recipes |
 | Topic entrypoints and acyclic core direction | conforms | source and built boundary scripts |
@@ -93,22 +94,21 @@ normalized set query.
 ### Collaborative text intent sessions and anchors
 
 `spliceText` correctly reconciles one eligible captured transaction.
-`openTextIntent` now composes a bounded ordered stream whose later offsets
-depend on earlier unpublished local splices, then publishes the stream as one
-captured transaction. This is generic editor behavior rather than a product
-convention.
+`openTextIntent` composes an ordered stream whose later offsets depend on
+earlier local splices. Each `publish` captures one pending prefix, while later
+segments can continue on the retained private branch. This is generic editor
+behavior rather than a product convention.
 
-Private Automerge integration evidence confirms that a fresh-actor retained
-branch preserves dependent local changes across merge delivery order, buffered
-dependent splices can become one source-native change, and relative cursors
-converge with explicit before/after movement after deletion. This proves source
-feasibility for a larger retained-candidate lifecycle. The implemented bounded
-composition deliberately performs no intermediate publication.
+Automerge integration retains a fresh-actor private branch across conditional
+publications. A known commit advances branch ancestry; concurrent remote work
+is merged only into each validated publication candidate. Rejection blocks
+dependent descendants and unknown outcome suspends them, so later segments
+never publish while ancestor publication is uncertain.
 
-Continuation while a prefix is already publishing remains deferred until one
-design proves unknown-outcome suspension and preserves source-native causal
-identity across multiple conditional publications. Later segments must never
-publish while an ancestor outcome is unknown.
+Buffered dependent splices can still become one source-native change. Relative
+cursors also converge with explicit before/after movement after deletion, but
+opaque cursor authoring remains a separate capability rather than a requirement
+of the retained publication lifecycle.
 Opaque deletion-aware anchors should remain a separately advertised capability
 unless implementation evidence shows they require the same lifecycle. Memory
 and non-mergeable stores may honestly report both capabilities absent.

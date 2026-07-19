@@ -47,10 +47,20 @@ export type AttachmentTransactionServiceInput<Storage, Command> = {
   readonly operationLedger?: OperationLedgerProtocol<CommitReceipt>;
 };
 
-/** Combines portable attachment evidence with one live source and authority view. */
-export const createAttachmentTransactionService = async <Storage, Command>(
+export type PreparedAttachmentTransactionService<Storage, Command> = {
+  readonly transactions: DatabaseTransactionService;
+  readonly context: PreparedWritableExecutionContext<Storage, Command>;
+  readonly capabilities: ReadonlyMap<string, DatabaseRelationCapabilities>;
+  readonly prepareInput: (
+    intent: JsonValue,
+    transform: DatabaseTransactionTransform,
+    options: DatabaseTransactionOptions
+  ) => Promise<import('../transaction-executor.js').ReplayablePreparedTransactionInput>;
+};
+
+export const prepareAttachmentTransactionService = async <Storage, Command>(
   input: AttachmentTransactionServiceInput<Storage, Command>
-): Promise<DatabaseTransactionService> => {
+): Promise<PreparedAttachmentTransactionService<Storage, Command>> => {
   assertWritablePreparation(input.preparation);
   const preparation = input.preparation;
   const capabilities = effectiveCapabilities(preparation, input.bindings, input.source);
@@ -108,8 +118,19 @@ export const createAttachmentTransactionService = async <Storage, Command>(
     simulate: async (intent, transform, options = {}) =>
       simulateReplayablePreparedTransaction(context, await prepareInput(intent, transform, options))
   };
-  return Object.freeze(service);
+  return {
+    transactions: Object.freeze(service),
+    context,
+    capabilities,
+    prepareInput
+  };
 };
+
+/** Combines portable attachment evidence with one live source and authority view. */
+export const createAttachmentTransactionService = async <Storage, Command>(
+  input: AttachmentTransactionServiceInput<Storage, Command>
+): Promise<DatabaseTransactionService> =>
+  (await prepareAttachmentTransactionService(input)).transactions;
 
 const createExecutionContext = async <Storage, Command>(
   input: AttachmentTransactionServiceInput<Storage, Command>,
@@ -211,8 +232,10 @@ const effectiveCapabilities = <Storage, Command>(
           ? {}
           : { textSplice: Object.freeze({
             indexUnit: textSplice.indexUnit,
-              concurrency: 'merge-captured-intent' as const,
-              dependentComposition: 'bounded-before-publish' as const
+            concurrency: 'merge-captured-intent' as const,
+            ...(source.createPrivateBranch === undefined
+              ? {}
+              : { dependentComposition: 'retained-cross-publication' as const })
             }) })
       });
     }

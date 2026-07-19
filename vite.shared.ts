@@ -15,6 +15,7 @@ export const corePublicEntryNames = [
   'attachment/adapter',
   'attachment/declaration',
   'attachment/mapped-adapter',
+  'attachment/retained-text-adapter',
   'attachment/text-intent-adapter',
   'capabilities',
   'database',

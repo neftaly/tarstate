@@ -462,14 +462,15 @@ const containsCapturedBasisEdit = (transaction: Transaction): boolean =>
 const reconcileCapturedBasisExecution = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   prepared: PreparedExecution,
-  evaluated: EvaluatedExecution<Storage, Command>
+  evaluated: EvaluatedExecution<Storage, Command>,
+  initialCandidate?: Storage
 ): Promise<ReconciledPreparedCommit> => {
   const reconcile = context.source.reconcile;
   const commitReconciled = context.source.commitReconciled;
   if (reconcile === undefined || commitReconciled === undefined) {
     throw new TypeError('Captured-basis reconciliation requires source support');
   }
-  let priorCandidate: Storage | undefined;
+  let priorCandidate = initialCandidate;
   for (let attemptIndex = 0; attemptIndex < maxReconciliationAttempts; attemptIndex += 1) {
     const captured = captureExecutionSnapshot(context);
     if ('issue' in captured) return { prepared, receipt: rejectedBeforeSnapshotReceipt(context, prepared, captured.issue) };
@@ -686,6 +687,83 @@ export const executeReplayablePreparedTransaction = async <Storage, Command>(
   return completePreparedExecution(context, completed.prepared, reservation.entry, completed.receipt);
 };
 
+export type RetainedCandidateCommitResult<Storage, Command> = {
+  readonly receipt: CommitReceipt;
+  readonly continuation?: ReturnType<AtomicSource<Storage, Command>['snapshot']>;
+};
+
+/** Publishes one text-only descendant of an unpublished source-native branch. */
+export const executeRetainedCandidatePreparedTransaction = async <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  input: ReplayablePreparedTransactionInput,
+  branch: ReturnType<AtomicSource<Storage, Command>['snapshot']>
+): Promise<RetainedCandidateCommitResult<Storage, Command>> => {
+  assertPreparedWritableContext(context);
+  if (context.source.reconcile === undefined || context.source.commitReconciled === undefined) {
+    throw new TypeError('Retained candidate publication requires source reconciliation');
+  }
+  const preparedResult = await prepareReplayableExecution(context, input, branch);
+  if ('receipt' in preparedResult) return { receipt: preparedResult.receipt };
+  const prepared = preparedResult;
+  const reservation = await reservePreparedExecution(context, prepared);
+  if ('receipt' in reservation) return { receipt: reservation.receipt };
+  const evaluated = evaluatePreparedExecution(context, prepared, branch, true);
+  if (evaluated.blockingIssues.length > 0 || evaluated.stagedSnapshot.storage === undefined) {
+    let rejected = evaluated;
+    if (evaluated.blockingIssues.length === 0) {
+      const unavailable = transactionIssue(
+        'source.not_ready',
+        prepared.attempt,
+        { reason: 'retained_candidate_storage_unavailable' }
+      );
+      rejected = {
+        ...evaluated,
+        issues: [...evaluated.issues, unavailable],
+        blockingIssues: [unavailable]
+      };
+    }
+    return {
+      receipt: await completePreparedExecution(
+        context,
+        prepared,
+        reservation.entry,
+        rejectedReceipt(context, prepared, rejected)
+      )
+    };
+  }
+  if (prepared.attempt.signal?.aborted === true) {
+    const cancellation = transactionIssue(
+      'transaction.cancelled',
+      prepared.attempt,
+      { timing: 'before_handoff' },
+      'never'
+    );
+    const receipt = rejectedReceipt(context, prepared, {
+      ...evaluated,
+      issues: [...evaluated.issues, cancellation],
+      blockingIssues: [cancellation]
+    });
+    return {
+      receipt: await completePreparedExecution(context, prepared, reservation.entry, receipt)
+    };
+  }
+  const completed = await reconcileCapturedBasisExecution(
+    context,
+    prepared,
+    evaluated,
+    evaluated.stagedSnapshot.storage
+  );
+  const receipt = await completePreparedExecution(
+    context,
+    completed.prepared,
+    reservation.entry,
+    completed.receipt
+  );
+  return receipt.outcome === 'committed'
+    ? { receipt, continuation: evaluated.stagedSnapshot }
+    : { receipt };
+};
+
 export const simulateReplayablePreparedTransaction = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   input: ReplayablePreparedTransactionInput
@@ -871,7 +949,8 @@ const prepareExecution = async <Storage, Command>(
 const evaluatePreparedExecution = <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   prepared: PreparedExecution,
-  beforeSnapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
+  beforeSnapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>,
+  deferFinalValidation = false
 ): EvaluatedExecution<Storage, Command> => {
   const beforeBasis = beforeSnapshot.basis;
   const earlyIssues: Issue[] = [];
@@ -1002,7 +1081,10 @@ const evaluatePreparedExecution = <Storage, Command>(
     issues.push(...guardIssues);
     blockingIssues = guardIssues.filter(isError);
   }
-  if (blockingIssues.length === 0 && context.constraints !== undefined && context.constraints.length > 0) {
+  if (!deferFinalValidation
+    && blockingIssues.length === 0
+    && context.constraints !== undefined
+    && context.constraints.length > 0) {
     const checked = checkFinalConstraints({
       constraints: context.constraints,
       before: beforeState,
@@ -1014,7 +1096,7 @@ const evaluatePreparedExecution = <Storage, Command>(
     issues.push(...checked.blockingIssues, ...checked.auditIssues);
     blockingIssues = [...checked.blockingIssues];
   }
-  const returning = blockingIssues.length === 0
+  const returning = !deferFinalValidation && blockingIssues.length === 0
     ? evaluateReturning(context, prepared, logicalState, stagedBasis)
     : undefined;
   if (returning !== undefined) issues.push(...returning.flatMap(({ issues: resultIssues }) => resultIssues));

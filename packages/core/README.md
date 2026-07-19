@@ -90,7 +90,8 @@ Artifact semantics and attachment preparation also have opt-in execution seams:
 | `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
 | `@tarstate/core/attachment/adapter` | Adapter-facing preparation and replayable transaction-service composition |
 | `@tarstate/core/attachment/mapped-adapter` | Shared mapped projection and embedded-artifact composition for source adapters |
-| `@tarstate/core/attachment/text-intent-adapter` | Optional bounded dependent-text lifecycle for merge-capable source adapters |
+| `@tarstate/core/attachment/retained-text-adapter` | Optional source-native retained publication composition for merge-capable adapters |
+| `@tarstate/core/attachment/text-intent-adapter` | Bounded source-neutral dependent-text session lifecycle |
 | `@tarstate/core/values` | Portable built-in scalar conversion at host boundaries |
 
 The portable `artifacts` entry never imports query evaluation, mapping, lens,
