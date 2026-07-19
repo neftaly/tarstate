@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/zustand",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "description": "Zustand adapter for Tarstate's atomic external-store protocol",
   "license": "MIT",
