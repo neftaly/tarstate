@@ -190,6 +190,58 @@ describe('literal-schema and query type authoring', () => {
     typedUnionAll(folder, wrongAlias);
   });
 
+  it('aligns null placeholders without weakening non-null set-field compatibility', async () => {
+    const links = typedSelect(author, 'snapshot', (aliases) => ({
+      rowKind: typedLiteral('link'),
+      resourceRef: aliases.author.row.id,
+      textContent: typedLiteral(null)
+    }));
+    const contents = typedSelect(manager, 'snapshot', (aliases) => ({
+      rowKind: typedLiteral('content'),
+      resourceRef: typedLiteral(null),
+      textContent: aliases.manager.row.nickname
+    }));
+    const snapshot = typedUnionAll(links, contents);
+    const prepared = await prepareTypedQuery(snapshot, {
+      registryFingerprint: 'registry:nullable-set',
+      authorityFingerprint: 'authority:nullable-set',
+      datasetId: 'dataset:nullable-set'
+    });
+
+    expect(prepared.query).toMatchObject({ kind: 'set', op: 'union-all' });
+    expect(evaluateQuery({
+      root: prepared.query,
+      relations: [{
+        relation: {
+          schemaView: people.schemaView,
+          relationId: people.relationId
+        },
+        rows: [{ id: 'resource:one', name: 'One' }],
+        completeness: 'exact'
+      }]
+    }).rows).toEqual([
+      { rowKind: 'link', resourceRef: 'resource:one', textContent: null },
+      { rowKind: 'content', resourceRef: null }
+    ]);
+    expectTypeOf<QueryResultRowOf<typeof snapshot>>().toEqualTypeOf<
+      | { readonly rowKind: 'link'; readonly resourceRef: string; readonly textContent: null }
+      | { readonly rowKind: 'content'; readonly resourceRef: null; readonly textContent?: string }
+    >();
+
+    const incompatibleContents = typedSelect(manager, 'snapshot', (aliases) => ({
+      rowKind: typedLiteral('content'),
+      resourceRef: typedLiteral(null),
+      textContent: aliases.manager.row.score
+    }));
+    const nullableText = typedSelect(author, 'snapshot', (aliases) => ({
+      rowKind: typedLiteral('link'),
+      resourceRef: aliases.author.row.id,
+      textContent: aliases.author.row.biography
+    }));
+    // @ts-expect-error null does not make incompatible string and number families compatible
+    typedUnionAll(nullableText, incompatibleContents);
+  });
+
   it('prepares a detached query plan without losing inferred rows or parameters', async () => {
     const prepared = await prepareTypedQuery(projected, {
       registryFingerprint: 'registry:one',

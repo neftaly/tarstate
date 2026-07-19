@@ -85,9 +85,11 @@ from a schema or prepared plan.
 
 Use `typedUnionAll` when compatible typed branches need bag-union semantics.
 It compiles to the ordinary set query, retains branch literal discriminants,
-and rejects incompatible fields, aliases, or logical value families. Selecting
-a possibly missing expression produces an optional result property, matching
-the runtime row rather than a required property containing `undefined`.
+and rejects incompatible fields, aliases, or non-null logical value families.
+A `null`-only field may align with a typed field in another branch without
+weakening compatibility between non-null values. Selecting a possibly missing
+expression produces an optional result property, matching the runtime row
+rather than a required property containing `undefined`.
 
 Type cleverness is subordinate to predictable diagnostics and compiler cost.
 An overload or conditional type is justified when it removes a real consumer

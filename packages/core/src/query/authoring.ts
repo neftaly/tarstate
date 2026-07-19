@@ -303,16 +303,33 @@ type AliasRow<Alias> = Alias extends TypedAlias<string, infer Row> ? Row : never
 type SameKeys<Left, Right> = [Exclude<keyof Left, keyof Right> | Exclude<keyof Right, keyof Left>] extends [never]
   ? true
   : false;
+type SetFieldFamily<Value> = NonNullable<Value>;
+type NullSetFieldPlaceholder<Value> = [SetFieldFamily<Value>] extends [never]
+  ? null extends Value ? true : false
+  : false;
+type SetFieldAcceptsNullAlignment<Value> = NullSetFieldPlaceholder<Value> extends true
+  ? true
+  : [SetFieldFamily<Value>] extends [never] ? false : true;
+type NonNullSetFieldCompatible<Left, Right> =
+  [Left] extends [never]
+    ? [Right] extends [never] ? true : false
+    : [Right] extends [never]
+      ? false
+      : [Left] extends [string]
+        ? [Right] extends [string] ? true : false
+        : [Left] extends [number]
+          ? [Right] extends [number] ? true : false
+          : [Left] extends [boolean]
+            ? [Right] extends [boolean] ? true : false
+            : [Left] extends [Right]
+              ? [Right] extends [Left] ? true : false
+              : false;
 type SetFieldCompatible<Left, Right> =
-  [Exclude<Left, undefined>] extends [string]
-    ? [Exclude<Right, undefined>] extends [string] ? true : false
-    : [Exclude<Left, undefined>] extends [number]
-      ? [Exclude<Right, undefined>] extends [number] ? true : false
-      : [Exclude<Left, undefined>] extends [boolean]
-        ? [Exclude<Right, undefined>] extends [boolean] ? true : false
-        : [Exclude<Left, undefined>] extends [Exclude<Right, undefined>]
-          ? [Exclude<Right, undefined>] extends [Exclude<Left, undefined>] ? true : false
-          : false;
+  NullSetFieldPlaceholder<Left> extends true
+    ? SetFieldAcceptsNullAlignment<Right>
+    : NullSetFieldPlaceholder<Right> extends true
+      ? SetFieldAcceptsNullAlignment<Left>
+      : NonNullSetFieldCompatible<SetFieldFamily<Left>, SetFieldFamily<Right>>;
 type IncompatibleSetFields<Left, Right> = {
   [Field in keyof Left]: Field extends keyof Right
     ? SetFieldCompatible<Left[Field], Right[Field]> extends true ? never : Field

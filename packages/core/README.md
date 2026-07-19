@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.6.0.tgz
+npm install ./tarstate-core-0.6.1.tgz
 ```
 
 ## Choose the application path
@@ -108,8 +108,10 @@ const { createIncrementalDatabaseQueryMaintenance } =
 
 `typedFrom`, `typedWhere`, `typedJoin`, `typedSelect`, and `typedUnionAll` cover
 the common path while preserving exact aliases, parameters, literal
-discriminants, and result rows. Selecting a possibly missing expression infers
-an optional result property, matching the runtime row. Advanced queries use the
+discriminants, and result rows. Union branches may use `typedLiteral(null)` to
+align a field with another branch's typed value while incompatible non-null
+families remain errors. Selecting a possibly missing expression infers an
+optional result property, matching the runtime row. Advanced queries use the
 exhaustive `Expr` and `QueryNode` unions directly, optionally composed with the
 functional builders. This is an explicit authoring boundary; runtime evaluation
 never falls back from typed to untyped behavior.

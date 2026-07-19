@@ -1,14 +1,23 @@
-import { prepareSchema } from '@tarstate/core/schema';
-import { describe, expect, it, vi } from 'vitest';
+import { prepareSchema, type SchemaRow } from '@tarstate/core/schema';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import {
   AutomergeSystemRelationState,
   automergeSystemRelationIds,
   automergeSystemSchema,
-  materializeAutomergeConflictRows
+  materializeAutomergeConflictRows,
+  type AutomergePeerSystemRow
 } from '../src/system-relations.js';
 import type { AutomergeConflictFact } from '../src/document/projection.js';
 
 describe('Automerge system relations', () => {
+  it('preserves exact readonly schema literals for typed consumers', () => {
+    expectTypeOf(automergeSystemSchema.relations.peers.key).toEqualTypeOf<
+      readonly ['attachmentId', 'peerId']
+    >();
+    expectTypeOf<SchemaRow<typeof automergeSystemSchema, 'peers'>>()
+      .toEqualTypeOf<AutomergePeerSystemRow>();
+  });
+
   it('declares the five normalized relations with measured identity keys', () => {
     const prepared = prepareSchema(automergeSystemSchema);
     expect(prepared.success).toBe(true);

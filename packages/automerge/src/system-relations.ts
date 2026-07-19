@@ -17,9 +17,9 @@ export const automergeSystemRelationIds = Object.freeze({
   presence: 'tarstate.automerge.presence'
 } as const);
 
-const stringField = { type: { kind: 'string' as const } };
-const integerField = { type: { kind: 'integer' as const } };
-const jsonField = { type: { kind: 'json' as const } };
+const stringField = { type: { kind: 'string' } } as const;
+const integerField = { type: { kind: 'integer' } } as const;
+const jsonField = { type: { kind: 'json' } } as const;
 
 /** Adapter-owned portable schema for the five built-in Automerge relations. */
 export const automergeSystemSchema = deepFreezeClone({
@@ -96,7 +96,7 @@ export const automergeSystemSchema = deepFreezeClone({
       }
     }
   }
-} satisfies SchemaBody);
+} as const satisfies SchemaBody);
 
 export type AutomergePeerSystemRow = {
   readonly attachmentId: string;
