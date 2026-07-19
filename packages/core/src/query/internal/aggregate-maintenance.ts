@@ -8,7 +8,8 @@ import {
   projectExpressionFields as projectFields,
   type QueryExpressionResult as ExpressionResult
 } from './expression.js';
-import { aggregateValue, exprContext, scopedRow } from './evaluator.js';
+import { aggregateValue, exprContext } from './evaluator.js';
+import { scopedRow } from './rows.js';
 import { containsNamedCall, containsSubquery } from './graph.js';
 import {
   withMaintenanceEvent,
@@ -51,12 +52,20 @@ export const incrementallyMaterializeAggregateWith = (
   if (stablePositions !== undefined && previous.aggregate.inputs.length === child.result.rows.length && stablePositions.length <= Math.max(32, child.result.rows.length >>> 3)) {
     const sparse = sparselyMaterializeAggregate(node, child.result.rows, stablePositions, previous.aggregate, context);
     if (sparse !== undefined && !context.state.unavailable && issues.length === 0) {
-      return withMaintenanceEvent({ result: { rows: [...sparse.groups.values()].map(({ output }) => output), completeness: 'exact' }, issues: [], unavailable: false, aggregate: sparse }, { operator: 'aggregate', strategy: 'selective', affectedUnitCount: stablePositions.length, compactionCount: context.state.aggregateCompactionCount - compactionsBefore });
+      return withMaintenanceEvent({ result: { rows: aggregateOutputRows(sparse.groups), completeness: 'exact' }, issues: [], unavailable: false, aggregate: sparse }, { operator: 'aggregate', strategy: 'selective', affectedUnitCount: stablePositions.length, compactionCount: context.state.aggregateCompactionCount - compactionsBefore });
     }
   }
   const indexed = buildAggregateState(node, child.result.rows, context, previous.aggregate);
   if (context.state.unavailable || issues.length > 0) return withMaintenanceEvent(fallback(), { operator: 'aggregate', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
-  return withMaintenanceEvent({ result: { rows: [...indexed.groups.values()].map(({ output }) => output), completeness: 'exact' }, issues: [], unavailable: false, aggregate: indexed }, { operator: 'aggregate', strategy: 'full', affectedUnitCount: child.result.rows.length, compactionCount: context.state.aggregateCompactionCount - compactionsBefore });
+  return withMaintenanceEvent({ result: { rows: aggregateOutputRows(indexed.groups), completeness: 'exact' }, issues: [], unavailable: false, aggregate: indexed }, { operator: 'aggregate', strategy: 'full', affectedUnitCount: child.result.rows.length, compactionCount: context.state.aggregateCompactionCount - compactionsBefore });
+};
+
+const aggregateOutputRows = (
+  groups: ReadonlyMap<string, AggregateGroupState>
+): readonly ScopedRow[] => {
+  const rows: ScopedRow[] = [];
+  for (const group of groups.values()) rows.push(group.output);
+  return rows;
 };
 
 const aggregateGroupRow = (
@@ -68,7 +77,8 @@ const aggregateGroupRow = (
 ): ScopedRow => {
   const output: Record<string, QueryLogicalValue> = { ...key };
   let rows: readonly ScopedRow[] | undefined;
-  for (const [name, aggregate] of Object.entries(node.measures)) {
+  for (const name in node.measures) {
+    const aggregate = node.measures[name] as AggregateExpr;
     const reducer = reducers.get(name);
     if (reducer !== undefined) output[name] = aggregateReducerValue(aggregate, reducer);
     else {
@@ -112,7 +122,8 @@ const updateAggregateReducer = (aggregate: AggregateExpr, state: AggregateReduce
   const key = canonicalizeJson(contribution.value);
   const before = distinctIndexCount(state.index, key);
   const after = before + delta;
-  const changed = new Map([[key, after]]);
+  const changed = new Map<string, number>();
+  changed.set(key, after);
   let base = state.index.base;
   let overlays = [...state.index.overlays, changed];
   if (overlays.length >= 64) {
@@ -140,7 +151,8 @@ const updateExtremeReducer = (
   const existing = extremeIndexEntry(state.index, key);
   const after = (existing?.count ?? 0) + delta;
   const changedEntry: ExtremeValueEntry = { count: after, value: existing?.value ?? contribution.value };
-  const changed = new Map<string, ExtremeValueEntry | undefined>([[key, changedEntry]]);
+  const changed = new Map<string, ExtremeValueEntry | undefined>();
+  changed.set(key, changedEntry);
   let base = state.index.base;
   let overlays = [...state.index.overlays, changed];
   if (overlays.length >= 64) {
@@ -326,7 +338,16 @@ export const indexAggregateState = (
   if (groups.size === 0 && Object.keys(node.groupBy).length === 0) groups.set('{}', { key: {}, members: [] });
   if (groups.size !== outputs.length || context.state.unavailable) return undefined;
   const indexed = new Map<string, AggregateGroupState>();
-  [...groups].forEach(([canonical, group], index) => indexed.set(canonical, { key: group.key, members: group.members, reducers: buildAggregateReducers(node, group.members, context), output: outputs[index] as ScopedRow }));
+  let outputIndex = 0;
+  for (const [canonical, group] of groups) {
+    indexed.set(canonical, {
+      key: group.key,
+      members: group.members,
+      reducers: buildAggregateReducers(node, group.members, context),
+      output: outputs[outputIndex] as ScopedRow
+    });
+    outputIndex += 1;
+  }
   return { inputs, groupKeys: { entries: groupKeyByRow, depth: 0 }, groups: indexed };
 };
 

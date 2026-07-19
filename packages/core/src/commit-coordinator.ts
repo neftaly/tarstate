@@ -48,7 +48,8 @@ export const stageSourceEdits = <Storage, Command>(input: {
   const issues: Issue[] = [];
   const plans: PlanResult<Command>[] = [];
   const editHandlers = input.edits.map(() => [] as { readonly bindingId: string; readonly mode: 'exclusive' | 'cooperative' }[]);
-  const editedRelations = new Set(input.edits.map(({ relationId }) => relationId));
+  const editedRelations = new Set<string>();
+  for (const edit of input.edits) editedRelations.add(edit.relationId);
   for (const binding of sortedBindings(input.bindings)) {
     if (binding.relationIds !== undefined && !binding.relationIds.some((relationId) => editedRelations.has(relationId))) continue;
     let plan: PlanResult<Command>;

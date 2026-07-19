@@ -1,7 +1,12 @@
 import { canonicalizeJsonValue as canonicalizeJson } from '../../internal-canonical-json.js';
 import { memoizeFrozenAnalysis } from '../../internal-frozen-analysis.js';
 import type { Issue } from '../../issues.js';
-import type { EvaluationRun, QueryContext, ScopedRow } from './evaluation-context.js';
+import {
+  emptyQueryFunctions,
+  type EvaluationRun,
+  type QueryContext,
+  type ScopedRow
+} from './evaluation-context.js';
 import {
   evaluateQueryExpression as evaluateExpr,
   expressionJson,
@@ -17,13 +22,19 @@ import {
   publicQueryIssues,
   publicQueryRow,
   publicQueryRows,
-  replaceScopedAlias,
   requiredAlias,
-  resultKey,
-  scopedRow,
-  tagSetRow,
-  visibleRow
+  tagSetRow
 } from './evaluator.js';
+import {
+  provenanceEntryIdentity,
+  replaceScopedAlias,
+  resultKey,
+  resultKeyPositions,
+  rowReferencePositions,
+  rowsByResultKey,
+  scopedRow,
+  visibleRow
+} from './rows.js';
 import { containsNamedCall, containsSubquery } from './graph.js';
 import { selectProjectionDependenciesEqual } from './dependency.js';
 import { transitionOrderedRows } from './ordering.js';
@@ -56,7 +67,13 @@ import {
   type WindowMaintenanceLayout
 } from './window-maintenance.js';
 import { canonicalizeQueryValue, queryValueEqual } from './values.js';
-import { groupRelationInputs, relationInputKey, relationKey, relationOccurrence } from './relations.js';
+import {
+  groupRelationInputs,
+  namespacedOccurrence,
+  relationInputKey,
+  relationKey,
+  relationOccurrence
+} from './relations.js';
 import { stringTupleKey } from '../../internal-string-key.js';
 import type {
   Expr,
@@ -326,7 +343,10 @@ const microMaterializeStableWindow = (
     const inputAlias = requiredAlias(input, node.alias, context);
     const priorAlias = requiredAlias(prior, node.alias, context);
     if (inputAlias === undefined || priorAlias === undefined) return undefined;
-    const retainedFields = Object.fromEntries([...outputFields].map((field) => [field, priorAlias[field] as QueryLogicalValue]));
+    const retainedFields: Record<string, QueryLogicalValue> = {};
+    for (const field of outputFields) {
+      retainedFields[field] = priorAlias[field] as QueryLogicalValue;
+    }
     output[position] = replaceScopedAlias(input, node.alias, { ...inputAlias, ...retainedFields });
     affected.add(position);
   }
@@ -569,13 +589,18 @@ const indexDistinctState = (inputs: readonly ScopedRow[]): DistinctMaterializedS
     if (positions === undefined) positionsByKey.set(key, [position]);
     else positions.push(position);
   });
-  const outputKeys = [...positionsByKey.keys()];
+  const outputKeys: string[] = [];
+  const outputPositionByKey = new Map<string, number>();
+  for (const key of positionsByKey.keys()) {
+    outputPositionByKey.set(key, outputKeys.length);
+    outputKeys.push(key);
+  }
   return {
     inputs,
     keys: { base, overlays: [] },
     positions: { base: positionsByKey, overlays: [] },
     outputKeys,
-    outputPositionByKey: new Map(outputKeys.map((key, position) => [key, position]))
+    outputPositionByKey
   };
 };
 
@@ -735,7 +760,13 @@ export const incrementallyMaterializeDistinct = (
   }
 
   const positionsByKey = materializeDistinctPositions(positions);
-  const previousOutputByKey = new Map(previous.distinct.outputKeys.map((key, position) => [key, previous.result.rows[position] as ScopedRow]));
+  const previousOutputByKey = new Map<string, ScopedRow>();
+  for (let position = 0; position < previous.distinct.outputKeys.length; position += 1) {
+    previousOutputByKey.set(
+      previous.distinct.outputKeys[position] as string,
+      previous.result.rows[position] as ScopedRow
+    );
+  }
   const entries = [...positionsByKey].sort((left, right) => (left[1][0] as number) - (right[1][0] as number));
   const outputKeys = entries.map(([key]) => key);
   const candidateOutput = entries.map(([key, keyPositions]) => affectedKeys.has(key)
@@ -743,11 +774,15 @@ export const incrementallyMaterializeDistinct = (
     : previousOutputByKey.get(key) ?? child.result.rows[keyPositions[0] as number] as ScopedRow);
   const changedOutputPositions = changedRowPositionsIfStableIdentity(candidateOutput, previous.result.rows);
   const output = changedOutputPositions?.length === 0 ? previous.result.rows : candidateOutput;
+  const outputPositionByKey = new Map<string, number>();
+  for (let position = 0; position < outputKeys.length; position += 1) {
+    outputPositionByKey.set(outputKeys[position] as string, position);
+  }
   return withMaintenanceEvent({
     result: { rows: output, completeness: child.result.completeness },
     issues: [], unavailable: false,
     ...(changedOutputPositions === undefined ? {} : { stableChangedPositions: changedOutputPositions }),
-    distinct: { inputs: child.result.rows, keys, positions, outputKeys, outputPositionByKey: new Map(outputKeys.map((key, position) => [key, position])) }
+    distinct: { inputs: child.result.rows, keys, positions, outputKeys, outputPositionByKey }
   }, { operator: 'distinct', strategy: 'selective', affectedUnitCount: affectedKeys.size, compactionCount });
 };
 
@@ -781,14 +816,19 @@ export const incrementallyMaterializeOrder = (
     );
     if (transitioned !== undefined && !context.state.unavailable && issues.length === 0) {
       const changedOutputPositions = changedRowPositionsIfStableIdentity(transitioned, previous.result.rows);
-      const verifiedUpdatedResultKeys = stableChanges.flatMap((position) => {
+      const verifiedUpdatedResultKeys: string[] = [];
+      for (const position of stableChanges) {
         const before = previous.order?.inputs[position];
         const after = child.result.rows[position];
-        return before === undefined || after === undefined
-          || queryValueEqual(visibleRow(before) as QueryLogicalValue, visibleRow(after) as QueryLogicalValue)
-          ? []
-          : [resultKey(after)];
-      });
+        if (before !== undefined
+          && after !== undefined
+          && !queryValueEqual(
+            visibleRow(before) as QueryLogicalValue,
+            visibleRow(after) as QueryLogicalValue
+          )) {
+          verifiedUpdatedResultKeys.push(resultKey(after));
+        }
+      }
       return withMaintenanceEvent({
         result: { rows: changedOutputPositions?.length === 0 ? previous.result.rows : transitioned, completeness: 'exact' },
         issues: [],
@@ -799,7 +839,7 @@ export const incrementallyMaterializeOrder = (
       }, { operator: 'order', strategy: 'selective', affectedUnitCount: stableChanges.length });
     }
   }
-  const nextPositions = new Map(child.result.rows.map((row, index) => [row, index]));
+  const nextPositions = rowReferencePositions(child.result.rows);
   const previousInputs = new Set(previous.order.inputs);
   const retained = previous.result.rows.filter((row) => nextPositions.has(row));
   // Stable sort ties follow input order. Insert/delete preserves the relative
@@ -884,7 +924,7 @@ const materializationContext = (
   environment: {
     relations: groupRelationInputs(snapshot.relations),
     parameters: snapshot.parameters ?? {},
-    functions: snapshot.functions ?? new Map(),
+    functions: snapshot.functions ?? emptyQueryFunctions,
     ...(snapshot.basis === undefined ? {} : { basis: snapshot.basis }),
     ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision }),
     evaluationCache: new MaterializedEvaluationCache(materializedNodes, activeNode)
@@ -1001,7 +1041,7 @@ export const incrementallyMaterializeFrom = (
     if (!changed.has(occurrence)) {
       if (aligned?.provenance[node.alias]?.occurrence === occurrence) retained = aligned;
       else {
-        previousByIdentity ??= new Map(previous.result.rows.map((row) => [resultKey(row), row]));
+        previousByIdentity ??= rowsByResultKey(previous.result.rows);
         retained = previousByIdentity.get(singleAliasResultKey(node.alias, occurrence));
       }
     }
@@ -1022,9 +1062,6 @@ export const incrementallyMaterializeFrom = (
 const relationInputChangeKey = (input: RelationInputChange): string =>
   stringTupleKey(relationKey(input.relation), input.attachmentId ?? input.sourceId ?? '');
 
-const namespacedOccurrence = (namespace: string | undefined, occurrenceId: string): string =>
-  namespace === undefined ? occurrenceId : namespace.length + ':' + namespace + occurrenceId.length + ':' + occurrenceId;
-
 const changedOccurrences = (update: QueryMaintenanceUpdate, relation: RelationUse): ReadonlySet<string> => {
   const changed = new Set<string>();
   for (const input of update.relations) {
@@ -1032,14 +1069,13 @@ const changedOccurrences = (update: QueryMaintenanceUpdate, relation: RelationUs
     const namespace = input.sourceId ?? input.attachmentId;
     for (const row of input.rows) {
       if (row.before !== undefined && row.after !== undefined && queryValueEqual(row.before.row, row.after.row)) continue;
-      const occurrence = namespace === undefined ? row.occurrenceId : namespace.length + ':' + namespace + row.occurrenceId.length + ':' + row.occurrenceId;
-      changed.add(occurrence);
+      changed.add(namespacedOccurrence(namespace, row.occurrenceId));
     }
   }
   return changed;
 };
 
-const singleAliasResultKey = (alias: string, occurrence: string): string => alias.length + ':' + alias + occurrence.length + ':' + occurrence;
+const singleAliasResultKey = provenanceEntryIdentity;
 
 export const incrementallyMaterializeLocal = (
   node: Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }>,
@@ -1163,7 +1199,7 @@ export const incrementallyMaterializeLocal = (
     let previousIndex = index;
     const aligned = previous.local.inputs[index];
     if (aligned === undefined || resultKey(aligned) !== key) {
-      previousPositions ??= new Map(previous.local.inputs.map((input, position) => [resultKey(input), position]));
+      previousPositions ??= resultKeyPositions(previous.local.inputs);
       previousIndex = previousPositions.get(key) ?? -1;
     }
     const canRetain = previousIndex >= 0 && previous.local.inputs[previousIndex] === row;
@@ -1250,7 +1286,7 @@ const indexLocalSegments = (
   if (isOneToOneLocallyMaintainedNode(node) && outputs.length === inputs.length) {
     return { inputs, segments: outputs };
   }
-  const positions = new Map(inputs.map((row, index) => [resultKey(row), index]));
+  const positions = resultKeyPositions(inputs);
   const segments: LocalSegment[] = Array.from({ length: inputs.length });
   for (const row of outputs) {
     const key = node.kind === 'where' ? resultKey(row) : row.origin;
@@ -1574,9 +1610,13 @@ export const diffMaintainedResults = (
 };
 
 const resultRowsByKey = (rows: readonly ScopedRow[]): ReadonlyMap<string, ScopedRow> =>
-  new Map(rows.map((row) => [resultKey(row), row]));
+  rowsByResultKey(rows);
 
 const frozenInternalArray = <Value>(values: readonly Value[]): readonly Value[] =>
   Object.isFrozen(values) ? values : Object.freeze([...values]);
 
-const deduplicateQueryIssues = (issues: readonly Issue[]): readonly Issue[] => [...new Map(issues.map((issue) => [issue.id, issue])).values()];
+const deduplicateQueryIssues = (issues: readonly Issue[]): readonly Issue[] => {
+  const byId = new Map<string, Issue>();
+  for (const issue of issues) byId.set(issue.id, issue);
+  return [...byId.values()];
+};

@@ -12,8 +12,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.6.8.tgz \
-  ./tarstate-zustand-0.6.8.tgz \
+  ./tarstate-core-0.6.9.tgz \
+  ./tarstate-zustand-0.6.9.tgz \
   zustand
 ```
 

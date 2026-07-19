@@ -606,16 +606,18 @@ const validateReconciledCandidate = <Storage, Command>(
   const before = logicalProjectionState(beforeProjection);
   const after = logicalProjectionState(afterProjection);
   if (blockingIssues.length === 0 && context.constraints !== undefined && context.constraints.length > 0) {
+    const touchedRelations = new Set<string>();
+    for (const statement of prepared.transaction.body.statements) {
+      const relation = statementRelation(statement);
+      if (relation !== undefined) touchedRelations.add(relation.relationId);
+    }
     const checked = checkFinalConstraints({
       constraints: context.constraints,
       before,
       after,
       beforeBasis: integration.basis,
       afterBasis: candidate.basis,
-      touchedRelations: new Set(prepared.transaction.body.statements.flatMap((statement) => {
-        const relation = statementRelation(statement);
-        return relation === undefined ? [] : [relation.relationId];
-      }))
+      touchedRelations
     });
     issues.push(...checked.blockingIssues, ...checked.auditIssues);
     blockingIssues = [...checked.blockingIssues];
@@ -623,7 +625,9 @@ const validateReconciledCandidate = <Storage, Command>(
   const returning = blockingIssues.length === 0
     ? evaluateReturning(context, prepared, after, candidate.basis)
     : undefined;
-  if (returning !== undefined) issues.push(...returning.flatMap(({ issues: resultIssues }) => resultIssues));
+  if (returning !== undefined) {
+    for (const result of returning) issues.push(...result.issues);
+  }
   return { issues, blockingIssues, ...(returning === undefined ? {} : { returning }) };
 };
 
@@ -1099,7 +1103,9 @@ const evaluatePreparedExecution = <Storage, Command>(
   const returning = !deferFinalValidation && blockingIssues.length === 0
     ? evaluateReturning(context, prepared, logicalState, stagedBasis)
     : undefined;
-  if (returning !== undefined) issues.push(...returning.flatMap(({ issues: resultIssues }) => resultIssues));
+  if (returning !== undefined) {
+    for (const result of returning) issues.push(...result.issues);
+  }
   return {
     beforeBasis,
     stagedSnapshot,
@@ -1561,9 +1567,12 @@ const projectLogicalState = <Storage, Command>(
       else (relationRows as WritableLogicalRow[]).push(row);
     }
   }
+  for (const [relationId, rows] of rowsByRelation) {
+    if (!Object.isFrozen(rows)) rowsByRelation.set(relationId, Object.freeze(rows));
+  }
   return {
     byBinding,
-    rowsByRelation: new Map([...rowsByRelation].map(([relationId, rows]) => [relationId, Object.freeze(rows)])),
+    rowsByRelation,
     issues: Object.freeze(issues)
   };
 };
@@ -1943,7 +1952,10 @@ const isJsonRecord = (value: unknown): value is Readonly<Record<string, JsonValu
 const isIndex = (value: JsonValue): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const uniqueOutcomes = (
   outcomes: readonly SemanticEditOutcome[]
-): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [
-  canonicalizeJson(outcome as unknown as JsonValue),
-  outcome
-])).values()];
+): readonly SemanticEditOutcome[] => {
+  const unique = new Map<string, SemanticEditOutcome>();
+  for (const outcome of outcomes) {
+    unique.set(canonicalizeJson(outcome as unknown as JsonValue), outcome);
+  }
+  return [...unique.values()];
+};

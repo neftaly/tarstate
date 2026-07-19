@@ -1,5 +1,4 @@
 import type { Issue } from '../../issues.js';
-import type { QueryExpressionRow } from './expression.js';
 import type {
   Completeness,
   FunctionRegistry,
@@ -10,6 +9,8 @@ import type {
 } from '../model.js';
 import type { JsonValue } from '../../value.js';
 
+export const emptyQueryFunctions: FunctionRegistry = new Map();
+
 type Provenance = {
   readonly sourceId?: string;
   readonly attachmentId?: string;
@@ -18,7 +19,7 @@ type Provenance = {
   readonly occurrence: string;
 };
 
-export type ScopedRow = QueryExpressionRow & {
+export type ScopedRow = {
   readonly scope: Readonly<Record<string, QueryRecord>>;
   readonly provenance: Readonly<Record<string, Provenance>>;
   readonly identity: string;

@@ -12,6 +12,13 @@ export const relationInputIdentity = (relation: RelationUse, namespace = ''): st
 export const relationInputKey = (input: RelationInput): string =>
   relationInputIdentity(input.relation, input.attachmentId ?? input.sourceId);
 
+export const namespacedOccurrence = (
+  namespace: string | undefined,
+  occurrence: string
+): string => namespace === undefined
+  ? occurrence
+  : namespace.length + ':' + namespace + occurrence.length + ':' + occurrence;
+
 const groupedRelationInputs = new WeakMap<readonly RelationInput[], ReadonlyMap<string, readonly RelationInput[]>>();
 
 export const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyMap<string, readonly RelationInput[]> => {
@@ -30,8 +37,7 @@ export const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyM
 
 export const relationOccurrence = (input: RelationInput, index: number): string => {
   const occurrence = input.occurrenceIds?.[index] ?? relationKey(input.relation) + ':' + index;
-  const namespace = input.sourceId ?? input.attachmentId;
-  return namespace === undefined ? occurrence : namespace.length + ':' + namespace + occurrence.length + ':' + occurrence;
+  return namespacedOccurrence(input.sourceId ?? input.attachmentId, occurrence);
 };
 
 export const indexedRelationInputs = (relations: readonly RelationInput[]): Map<string, IndexedRelationInput> => {

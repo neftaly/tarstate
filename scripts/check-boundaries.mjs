@@ -114,6 +114,7 @@ assignArchitectureGroup('query-batch', [
   'query/internal/occurrence-identity.ts',
   'query/internal/ownership.ts',
   'query/internal/relations.ts',
+  'query/internal/rows.ts',
   'query/internal/values.ts',
   'query/internal/window-maintenance.ts',
   'query/authoring.ts',

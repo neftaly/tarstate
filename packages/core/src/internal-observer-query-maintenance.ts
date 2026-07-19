@@ -291,7 +291,11 @@ const databaseResultFromMaintained = ({ state, rows, resultKeys, completeness, i
   const result = Object.freeze({ rows, resultKeys, completeness, issues });
   let resultKeyPositions = resultKeyPositionCache.get(resultKeys);
   if (resultKeyPositions === undefined) {
-    resultKeyPositions = new Map(resultKeys.map((key, position) => [key, position]));
+    const positions = new Map<string, number>();
+    for (let position = 0; position < resultKeys.length; position += 1) {
+      positions.set(resultKeys[position] as string, position);
+    }
+    resultKeyPositions = positions;
     resultKeyPositionCache.set(resultKeys, resultKeyPositions);
   }
   trustedIncrementalResults.set(result, Object.freeze({ revision: state.revision, resultDelta: state.resultDelta, resultKeyPositions, owner }));

@@ -70,7 +70,10 @@ export const checkFinalConstraints = <State>(input: {
   for (const constraint of input.constraints) {
     const before = evaluateConstraint(constraint, input.before, input.beforeBasis);
     const after = evaluateConstraint(constraint, input.after, input.afterBasis);
-    const previous = new Map(failuresOf(before, constraint.id).map((failure) => [failure.id, failure]));
+    const previous = new Map<string, ConstraintFailure>();
+    for (const failure of failuresOf(before, constraint.id)) {
+      previous.set(failure.id, failure);
+    }
     const current = failuresOf(after, constraint.id);
     const dependencyTouched = constraint.dependencyRelations.some((relationId) => input.touchedRelations.has(relationId));
     const rejected = current.filter((failure) => {

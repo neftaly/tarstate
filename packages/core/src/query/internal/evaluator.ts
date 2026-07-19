@@ -1,6 +1,12 @@
 import { canonicalizeJsonValue as canonicalizeJson } from '../../internal-canonical-json.js';
 import { createIssue, type Issue } from '../../issues.js';
-import { WorkBudgetLedger, type NodeResult, type QueryContext, type ScopedRow } from './evaluation-context.js';
+import {
+  emptyQueryFunctions,
+  WorkBudgetLedger,
+  type NodeResult,
+  type QueryContext,
+  type ScopedRow
+} from './evaluation-context.js';
 import {
   evaluateQueryExpression as evaluateExpr,
   expressionJson,
@@ -16,9 +22,7 @@ import {
   adoptJsonValue,
   adoptMaintenanceSnapshot,
   adoptQueryRequest,
-  isOwnedQueryLogicalContainer,
-  sealOwnedQueryLogicalContainer,
-  sealOwnedQueryScope
+  sealOwnedQueryLogicalContainer
 } from './ownership.js';
 import { canonicalizeQueryValue, compareQueryJsonValuesTotal } from './values.js';
 import { compareOrderedExpressions } from './ordering.js';
@@ -32,6 +36,14 @@ import {
 } from './window-maintenance.js';
 import { groupRelationInputs, relationKey, relationOccurrence } from './relations.js';
 import { validateRelationInputs } from './input-validation.js';
+import {
+  queryRowIdentity,
+  replaceScopedAlias,
+  resultKey,
+  rowReferencePositions,
+  scopedRow,
+  visibleRow
+} from './rows.js';
 import type { PreparedPlan } from '../plan-contract.js';
 import { comparePortableStrings } from '../../portable-order.js';
 import type {
@@ -92,7 +104,7 @@ const evaluateOwnedQuery = (root: QueryNode, owned: QueryMaintenanceSnapshot): Q
     environment: {
       relations: groupRelationInputs(owned.relations),
       parameters: owned.parameters ?? {},
-      functions: owned.functions ?? new Map(),
+      functions: owned.functions ?? emptyQueryFunctions,
       ...(owned.basis === undefined ? {} : { basis: owned.basis }),
       ...(owned.membershipRevision === undefined ? {} : { membershipRevision: owned.membershipRevision })
     },
@@ -291,7 +303,7 @@ const evaluateJoin = (node: Extract<QueryNode, { readonly kind: 'join' }>, conte
   if (reverseIndexed && equality !== undefined) {
     const leftIndex = indexedRows(node, node.left, left.rows, equality.left, context);
     const leftPositions = indexedRowPositions.get(leftIndex);
-    const rightPositions = new Map(right.rows.map((row, index) => [row, index]));
+    const rightPositions = rowReferencePositions(right.rows);
     const matches: { readonly left: ScopedRow; readonly right: ScopedRow }[] = [];
     outer: for (const rightRow of right.rows) {
       for (const leftRow of lookupIndexedRows(leftIndex, equality.right, rightRow, context)) {
@@ -716,7 +728,7 @@ const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive'
     const normalizedProvenance = Object.keys(provenance).length === 0
       ? { [node.name]: { relationId: 'recursive', occurrence } }
       : provenance;
-    const identity = provenanceIdentity(normalizedProvenance);
+    const identity = queryRowIdentity(normalizedProvenance);
     const accepted = candidate.identity === identity ? candidate : { ...candidate, provenance: normalizedProvenance, identity, origin: identity };
     rows.push(accepted);
     return accepted;
@@ -829,12 +841,6 @@ const mapProjection = (inner: NodeResult, alias: string, project: (row: ScopedRo
   return context.state.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
 };
 
-export const visibleRow = (row: ScopedRow): QueryRecord => {
-  const aliases = Object.keys(row.scope);
-  if (aliases.length === 1) return row.scope[aliases[0] as string] as QueryRecord;
-  return row.scope as unknown as QueryRecord;
-};
-
 export const requiredAlias = (row: ScopedRow, alias: string, context: QueryContext): QueryRecord | undefined => {
   const record = row.scope[alias];
   if (record !== undefined) return record;
@@ -845,30 +851,6 @@ export const requiredAlias = (row: ScopedRow, alias: string, context: QueryConte
   return undefined;
 };
 
-export const resultKey = (row: ScopedRow): string => row.identity;
-const provenanceIdentity = (provenance: ScopedRow['provenance']): string => {
-  const aliases = Object.keys(provenance);
-  if (aliases.length === 0) return '';
-  if (aliases.length > 1) aliases.sort(comparePortableStrings);
-  let identity = '';
-  for (const alias of aliases) {
-    const occurrence = provenance[alias]?.occurrence ?? '';
-    identity += alias.length + ':' + alias + occurrence.length + ':' + occurrence;
-  }
-  return identity;
-};
-export const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'], origin?: string): ScopedRow => {
-  for (const record of Object.values(scope)) {
-    if (!isOwnedQueryLogicalContainer(record)) sealOwnedQueryLogicalContainer(Object.freeze(record));
-  }
-  const ownedScope = sealOwnedQueryScope(scope);
-  return { scope: ownedScope, provenance, identity: provenanceIdentity(provenance), origin };
-};
-export const replaceScopedAlias = (row: ScopedRow, alias: string, record: QueryRecord): ScopedRow => {
-  if (!isOwnedQueryLogicalContainer(record)) sealOwnedQueryLogicalContainer(Object.freeze(record));
-  const scope = sealOwnedQueryScope({ ...row.scope, [alias]: record });
-  return { ...row, scope, origin: resultKey(row) };
-};
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => {
   const renamed = Object.fromEntries(
     Object.entries(record).map(([name, value]) => [fields[name] ?? name, value])
@@ -881,7 +863,11 @@ const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryReco
   ) as Record<string, QueryLogicalValue>;
   return sealOwnedQueryLogicalContainer(Object.freeze(retained));
 };
-const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
+const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => {
+  const unique = new Map<string, ScopedRow>();
+  for (const row of rows) unique.set(canonicalizeQueryValue(visibleRow(row)), row);
+  return unique;
+};
 export const tagSetRow = (row: ScopedRow, branch: 'left' | 'right'): ScopedRow => scopedRow(
   row.scope,
   Object.fromEntries(Object.entries(row.provenance).map(([alias, value]) => [alias, { ...value, occurrence: branch + ':' + value.occurrence }]))

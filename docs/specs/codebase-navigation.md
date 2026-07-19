@@ -74,13 +74,16 @@ Read:
 
 - `query/model.ts`, `query/builder.ts`, `query/authoring.ts`
 - `query/prepare.ts` and `query/internal/prepared-plan.ts`
-- `query/internal/evaluator.ts`
+- `query/internal/rows.ts` and `query/internal/evaluator.ts`
 - the matching incremental operator module and maintenance engine
 - `query/projection-demand.ts`
 - query unit, property, incremental, perf, tree-shake, and type-budget evidence
 
 Define batch semantics first, then differential incremental behavior. Update
 typed authoring only after runtime semantics are settled.
+
+`query/internal/rows.ts` owns scoped-row construction, identity, and indexes;
+keep those domain mechanics out of operator evaluation and maintenance shells.
 
 ### Change database observation or source discovery
 

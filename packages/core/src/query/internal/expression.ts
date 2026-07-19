@@ -11,6 +11,7 @@ import {
   sealOwnedQueryLogicalContainer
 } from './ownership.js';
 import { compareQueryJsonValues, compareQueryJsonValuesTotal, containsQueryLogicalUnknown } from './values.js';
+import { emptyQueryFunctions } from './evaluation-context.js';
 import type { Expr, FunctionRegistry, PreparedExpression, QueryFunction, QueryLogicalValue, QueryNode, QueryRecord, Completeness } from '../model.js';
 import {
   capabilityUnavailable,
@@ -118,7 +119,7 @@ export const evaluateExpression = (
   return publicExpressionValue(evaluateQueryExpression(ownedExpression, {
     row: scoped,
     parameters,
-    functions: options.functions === undefined ? new Map() : adoptFunctionRegistry(options.functions),
+    functions: options.functions === undefined ? emptyQueryFunctions : adoptFunctionRegistry(options.functions),
     issues
   }));
 };
@@ -136,7 +137,7 @@ export const evaluatePreparedExpression = (
   return publicExpressionValue(evaluateQueryExpression(prepared.expression, {
     row: scoped,
     parameters,
-    functions: options.functions === undefined ? new Map() : adoptFunctionRegistry(options.functions),
+    functions: options.functions === undefined ? emptyQueryFunctions : adoptFunctionRegistry(options.functions),
     issues
   }));
 };

@@ -49,8 +49,8 @@ const expressionInputsEqual = (expression: Expr, before: ScopedRow, after: Scope
     return expressionInputsEqual(expression.otherwise, before, after);
   }
   if (expression.kind === 'record') {
-    for (const field of Object.values(expression.fields)) {
-      if (!expressionInputsEqual(field, before, after)) return false;
+    for (const name in expression.fields) {
+      if (!expressionInputsEqual(expression.fields[name] as Expr, before, after)) return false;
     }
     return true;
   }
@@ -67,8 +67,8 @@ const selectProjectionInputsEqual = (
   after: ScopedRow
 ): boolean => {
   if (before.identity !== after.identity) return false;
-  for (const expression of Object.values(node.fields)) {
-    if (!expressionInputsEqual(expression, before, after)) return false;
+  for (const name in node.fields) {
+    if (!expressionInputsEqual(node.fields[name] as Expr, before, after)) return false;
   }
   return true;
 };

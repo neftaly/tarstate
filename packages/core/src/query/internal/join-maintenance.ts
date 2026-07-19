@@ -5,9 +5,14 @@ import {
   equijoinFields,
   indexKey,
   joinLeftRow,
-  resultKey,
   type EquijoinExpressions
 } from './evaluator.js';
+import {
+  indexedRowsByResultKey,
+  resultKey,
+  resultKeyPositions,
+  rowReferencePositions
+} from './rows.js';
 import { OverlayMap } from './overlay-map.js';
 import { withMaintenanceEvent, type MaterializedQueryNode } from './maintenance-model.js';
 import type { Expr, QueryNode } from '../model.js';
@@ -210,7 +215,7 @@ export const incrementallyMaterializeJoinWith = (
     const aligned = previous.join.leftInputs[index];
     let previousIndex = index;
     if (aligned === undefined || resultKey(aligned) !== identity) {
-      previousPositions ??= new Map(previous.join.leftInputs.map((input, position) => [resultKey(input), position]));
+      previousPositions ??= resultKeyPositions(previous.join.leftInputs);
       previousIndex = previousPositions.get(identity) ?? -1;
     }
     const previousInput = previous.join.leftInputs[previousIndex];
@@ -290,7 +295,7 @@ const updateIndexedRows = (
     if (previousRow !== undefined && previousKey !== undefined) operation(previousKey).removed.push(previousRow);
     if (nextRow !== undefined && nextKey !== undefined) operation(nextKey).added.push(nextRow);
   }
-  const nextPositions = movedBetweenKeys ? new Map(after.map((row, index) => [row, index])) : undefined;
+  const nextPositions = movedBetweenKeys ? rowReferencePositions(after) : undefined;
   const overrides = new Map<string, readonly ScopedRow[] | undefined>();
   for (const [key, { removed, added, replacements }] of operations) {
     const removedRows = new Set(removed);
@@ -345,8 +350,8 @@ const updateLeftJoinPositions = (
 
 const changedExpressionKeys = (before: readonly ScopedRow[], after: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlySet<string> => {
   const changed = new Set<string>();
-  const beforeByIdentity = new Map(before.map((row, index) => [resultKey(row), { row, index }]));
-  const afterByIdentity = new Map(after.map((row, index) => [resultKey(row), { row, index }]));
+  const beforeByIdentity = indexedRowsByResultKey(before);
+  const afterByIdentity = indexedRowsByResultKey(after);
   for (const identity of new Set([...beforeByIdentity.keys(), ...afterByIdentity.keys()])) {
     const previous = beforeByIdentity.get(identity);
     const next = afterByIdentity.get(identity);
@@ -364,7 +369,7 @@ export const indexJoinSegments = (
   outputs: readonly ScopedRow[],
   context: QueryContext
 ): NonNullable<MaterializedQueryNode['join']> => {
-  const positions = new Map(leftInputs.map((row, index) => [resultKey(row), index]));
+  const positions = resultKeyPositions(leftInputs);
   const segments = leftInputs.map(() => [] as ScopedRow[]);
   for (const row of outputs) {
     const key = node.join === 'semi' || node.join === 'anti' ? resultKey(row) : row.origin;
