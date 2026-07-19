@@ -92,23 +92,23 @@ normalized set query.
 
 ### Collaborative text intent sessions and anchors
 
-Current `spliceText` correctly reconciles one eligible captured transaction but
-does not represent a stream whose later offsets depend on earlier
-unacknowledged local insertions. This is a real generic editor capability, not a
-Patchpit convention and not a defect that numeric replay can safely repair.
+`spliceText` correctly reconciles one eligible captured transaction.
+`openTextIntent` now composes a bounded ordered stream whose later offsets
+depend on earlier unpublished local splices, then publishes the stream as one
+captured transaction. This is generic editor behavior rather than a product
+convention.
 
 Private Automerge integration evidence confirms that a fresh-actor retained
 branch preserves dependent local changes across merge delivery order, buffered
 dependent splices can become one source-native change, and relative cursors
 converge with explicit before/after movement after deletion. This proves source
-feasibility, not the Tarstate session lifecycle.
+feasibility for a larger retained-candidate lifecycle. The implemented bounded
+composition deliberately performs no intermediate publication.
 
-Implementation is deferred until one design proves a bounded source-native
-candidate lifecycle, segment-level rejection and unknown-outcome suspension,
-historical-basis loss behavior, and constraint validation before every
-conditional publication. In particular, retained history must not be squashed
-in a way that changes source-native identity, and later segments must not publish
-while an ancestor outcome is unknown.
+Continuation while a prefix is already publishing remains deferred until one
+design proves unknown-outcome suspension and preserves source-native causal
+identity across multiple conditional publications. Later segments must never
+publish while an ancestor outcome is unknown.
 Opaque deletion-aware anchors should remain a separately advertised capability
 unless implementation evidence shows they require the same lifecycle. Memory
 and non-mergeable stores may honestly report both capabilities absent.

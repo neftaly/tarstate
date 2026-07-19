@@ -1,4 +1,5 @@
 import type {
+  DatabaseTextIntentService,
   DatabaseTransactionService,
 } from '@tarstate/core/transactions';
 import type { OwnedDatabaseSource } from '@tarstate/core/database/session';
@@ -8,7 +9,7 @@ export type AutomergeDatabaseResult = MappedDatabaseResult;
 
 export type AutomergeDatabaseSnapshot = MappedDatabaseSnapshot;
 
-export type AutomergeDatabase = DatabaseTransactionService & OwnedDatabaseSource & {
+export type AutomergeDatabase = DatabaseTransactionService & DatabaseTextIntentService & OwnedDatabaseSource & {
   readonly getSnapshot: () => AutomergeDatabaseSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
 };

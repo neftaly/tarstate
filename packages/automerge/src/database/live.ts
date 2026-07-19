@@ -5,6 +5,7 @@ import {
 } from '@tarstate/core/attachment/adapter';
 import { createLiveAttachmentDatabase } from '@tarstate/core/database/adapter';
 import type {
+  DatabaseTextIntentService,
   DatabaseTransactionService
 } from '@tarstate/core/transactions';
 import type { RelationInput } from '@tarstate/core/query/model';
@@ -24,7 +25,7 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
   readonly incarnation: string;
   readonly authorityScope: string;
   readonly schemaView: ArtifactRef;
-  readonly transactions: DatabaseTransactionService;
+  readonly transactions: DatabaseTransactionService & DatabaseTextIntentService;
   readonly preparation: ReadyAttachmentPreparation<Automerge.Doc<T>, readonly RelationInput[], WritableLogicalState>;
   readonly source: AutomergeAtomicSource<T>;
   readonly projector: MappedAttachmentProjector<Automerge.Doc<T>, AutomergeMappedStorageRow>;

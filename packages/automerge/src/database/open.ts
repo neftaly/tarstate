@@ -6,6 +6,7 @@ import {
   type ReadyAttachmentPreparation,
   createAttachmentTransactionService
 } from '@tarstate/core/attachment/adapter';
+import { createAttachmentTextIntentService } from '@tarstate/core/attachment/text-intent-adapter';
 import {
   createMappedAttachmentProjector,
   createMappedDatabaseProjection,
@@ -126,6 +127,12 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
       // The standard runtime ledger is process-local even when the document is persisted.
       durability: 'memory'
     });
+    const textIntents = createAttachmentTextIntentService({
+      transactions,
+      source,
+      supported: [...binding.writeCapabilities.values()].some(({ fields }) =>
+        Object.values(fields).some(({ textSplice }) => textSplice !== undefined))
+    });
     return {
       success: true,
       value: createLiveAutomergeDatabase({
@@ -133,7 +140,7 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
         incarnation: attachmentIncarnation,
         authorityScope: input.authorityScope,
         schemaView: preparation.declaration.storageSchema,
-        transactions,
+        transactions: Object.freeze({ ...transactions, ...textIntents }),
         preparation: boundPreparation,
         source,
         projector

@@ -175,6 +175,8 @@ assignArchitectureGroup('attachment-runtime', [
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
   'attachment/projection-selection.ts',
+  'attachment/text-intent-service.ts',
+  'attachment/text-intent-session.ts',
   'attachment/transaction-state-authoring.ts',
   'attachment/transaction-snapshot.ts',
   'attachment/transaction-service.ts'
@@ -265,6 +267,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'attachment/index.ts': ['foundation', 'source-contract'],
   'attachment/adapter/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'attachment-runtime'],
   'attachment/mapped-adapter/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime'],
+  'attachment/text-intent-adapter/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'transaction-model', 'attachment-runtime'],
   'query/model/index.ts': ['foundation', 'query-model'],
   'query/prepare/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
   'query/authoring/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
@@ -287,6 +290,7 @@ const publicRuntimePolicies = new Map(Object.entries({
 
 const publicDeclarationPolicyAdditions = new Map(Object.entries({
   'attachment/mapped-adapter/index.ts': ['capability'],
+  'attachment/text-intent-adapter/index.ts': ['query-model', 'query-batch'],
   'database/index.ts': ['artifact-resolution', 'semantic-artifact'],
   'database/observer/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],
   'database/session/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],

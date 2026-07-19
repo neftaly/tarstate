@@ -1,6 +1,7 @@
 import type { SchemaBody } from '../schema.js';
 import type { LiteralRelation, SchemaKey, SchemaRow } from '../schema-authoring.js';
 import type { CommitReceipt, SimulationReceipt } from '../transaction.js';
+import type { Issue } from '../issues.js';
 import type { JsonValue } from '../value.js';
 import type { SourceBasis } from '../source-state.js';
 
@@ -73,12 +74,74 @@ export type DatabaseTransactionOptions = {
   readonly observedBasis?: SourceBasis;
 };
 
+export type DatabaseTextIntentTransform = (
+  snapshot: DatabaseTransactionSnapshot
+) => DatabaseTransactionSnapshot;
+
+export type DatabaseTextIntentSegmentStatus =
+  | 'pending'
+  | 'committed'
+  | 'rejected'
+  | 'unknown'
+  | 'cancelled';
+
+export type DatabaseTextIntentSegment = {
+  readonly segmentId: string;
+  readonly status: DatabaseTextIntentSegmentStatus;
+  readonly issues: readonly Issue[];
+};
+
+export type DatabaseTextIntentSessionSnapshot = {
+  readonly state:
+    | 'ready'
+    | 'blocked'
+    | 'committing'
+    | 'committed'
+    | 'rejected'
+    | 'unknown'
+    | 'cancelled'
+    | 'closed';
+  readonly freshness: 'current' | 'stale';
+  readonly observedBasis: SourceBasis;
+  readonly current: DatabaseTransactionSnapshot;
+  readonly segments: readonly DatabaseTextIntentSegment[];
+  readonly issues: readonly Issue[];
+  readonly receipt?: CommitReceipt;
+};
+
+/**
+ * Bounded composition of dependent text splices published as one transaction.
+ * No intermediate optimistic snapshot is written to the attached source.
+ */
+export type DatabaseTextIntentSession = {
+  readonly getSnapshot: () => DatabaseTextIntentSessionSnapshot;
+  readonly subscribe: (listener: () => void) => () => void;
+  readonly append: (
+    intent: JsonValue,
+    transform: DatabaseTextIntentTransform
+  ) => DatabaseTextIntentSegment;
+  readonly complete: () => Promise<CommitReceipt>;
+  readonly cancel: () => void;
+  readonly close: () => void;
+};
+
+export type OpenDatabaseTextIntentResult =
+  | { readonly success: true; readonly value: DatabaseTextIntentSession; readonly issues: readonly Issue[] }
+  | { readonly success: false; readonly issues: readonly Issue[] };
+
+export type OpenDatabaseTextIntentOptions = {
+  /** Exact source basis underlying the first locally observed splice. */
+  readonly observedBasis: SourceBasis;
+  readonly signal?: AbortSignal;
+};
+
 /** Prepared logical write facts for one relation, independent of source readiness. */
 export type DatabaseFieldWriteCapabilities = {
   readonly replace?: { readonly concurrency: 'replay-transform' };
   readonly textSplice?: {
     readonly indexUnit: 'utf16-code-unit';
     readonly concurrency: 'merge-captured-intent';
+    readonly dependentComposition: 'bounded-before-publish';
   };
 };
 
@@ -109,4 +172,10 @@ export type DatabaseTransactionService = {
     transform: DatabaseTransactionTransform,
     options?: DatabaseTransactionOptions
   ) => Promise<SimulationReceipt>;
+};
+
+export type DatabaseTextIntentService = {
+  readonly openTextIntent: (
+    options: OpenDatabaseTextIntentOptions
+  ) => Promise<OpenDatabaseTextIntentResult>;
 };

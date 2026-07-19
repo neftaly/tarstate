@@ -110,6 +110,14 @@ must not build generic diff transactions.
 `spliceText` is reserved for position-sensitive text intent and requires the
 basis the user observed. These are semantic operations, not public fast paths.
 
+`openTextIntent({ observedBasis })` is the focused form for several bounded
+splices whose later offsets depend on earlier local splices. `append` applies a
+pure synchronous transform only to the session's optimistic snapshot;
+`complete` publishes the accepted sequence as one ordinary transaction. The
+session reports per-segment pending, committed, rejected, unknown, or cancelled
+evidence and must be closed by its owner. It does not claim that dependent edits
+can continue across several publications.
+
 `simulate` and `transact` accept the same intent and transform. Simulation
 cannot publish or allocate durable source identity.
 

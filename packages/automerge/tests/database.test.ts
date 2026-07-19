@@ -117,7 +117,7 @@ describe('standard Automerge database', () => {
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
     const fixture = await openTaskDatabase();
     expect(Object.keys(fixture.database).sort()).toEqual([
-      'capabilities', 'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
+      'capabilities', 'close', 'getSnapshot', 'mount', 'openTextIntent', 'simulate', 'subscribe', 'transact'
     ]);
     expect(fixture.database.capabilities(fixture.tasks)).toMatchObject({
       relationId: 'tasks',
@@ -211,6 +211,176 @@ describe('standard Automerge database', () => {
     expect(receipt.outcome === 'committed' && receipt.integrationBasis).not.toEqual(observedBasis);
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('New First!');
     expect(fixture.handle.doc()?.tasks.first?.unknownPhysicalField).toBe('preserved');
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('composes dependent text segments before one multiplayer publication', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'ab' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    expect(fixture.database.capabilities(fixture.tasks).fields.title?.textSplice)
+      .toMatchObject({ dependentComposition: 'bounded-before-publish' });
+    const opened = await fixture.database.openTextIntent({
+      observedBasis: observed.current.basis
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+
+    const first = session.append(
+      { kind: 'insert-local-text', value: 'XY' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 2, deleteCount: 0, insert: 'XY' }
+      )
+    );
+    const second = session.append(
+      { kind: 'replace-dependent-local-text', value: 'Z' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 3, deleteCount: 1, insert: 'Z' }
+      )
+    );
+
+    expect(first).toMatchObject({ status: 'pending' });
+    expect(second).toMatchObject({ status: 'pending' });
+    expect(session.getSnapshot().current.rows(fixture.tasks))
+      .toEqual([{ id: 'first', title: 'abXZ' }]);
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('ab');
+
+    fixture.handle.change((draft) => {
+      Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 0, 'R');
+    });
+    expect(session.getSnapshot()).toMatchObject({ state: 'ready', freshness: 'stale' });
+
+    const receipt = await session.complete();
+    expect(receipt).toMatchObject({ outcome: 'committed' });
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'committed',
+      segments: [{ status: 'committed' }, { status: 'committed' }]
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('RabXZ');
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('retains accepted dependent text after rejecting a later invalid segment', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'abcd' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({ observedBasis: observed.current.basis });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+
+    session.append({ kind: 'first' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 2, deleteCount: 0, insert: 'X' }
+    ));
+    const rejected = session.append({ kind: 'invalid' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 99, deleteCount: 0, insert: 'lost' }
+    ));
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      issues: [expect.objectContaining({ code: 'transaction.delta_invalid' })]
+    });
+    expect(session.getSnapshot().current.rows(fixture.tasks))
+      .toEqual([{ id: 'first', title: 'abXcd' }]);
+
+    session.append({ kind: 'second' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 3, deleteCount: 0, insert: 'Y' }
+    ));
+    await expect(session.complete()).resolves.toMatchObject({ outcome: 'committed' });
+    expect(session.getSnapshot().segments.map(({ status }) => status))
+      .toEqual(['committed', 'rejected', 'committed']);
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('abXYcd');
+
+    session.close();
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('cancels and closes an unpublished text composition idempotently', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'abcd' });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({ observedBasis: observed.current.basis });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+    session.append({ kind: 'unpublished' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 0, deleteCount: 0, insert: 'local' }
+    ));
+
+    session.cancel();
+    session.cancel();
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'cancelled',
+      segments: [{ status: 'cancelled' }]
+    });
+    await expect(session.complete()).rejects.toThrow('not completable');
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('abcd');
+    session.close();
+    session.close();
+    expect(session.getSnapshot().state).toBe('closed');
+
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('rejects every pending dependent segment when merged candidate constraints fail', async () => {
+    const fixture = await openTaskDatabase({
+      constrained: true,
+      initialTitle: 'Allowe',
+      allowedTitles: ['Allowe', 'Allowed']
+    });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') {
+      throw new Error('Expected ready database');
+    }
+    const opened = await fixture.database.openTextIntent({ observedBasis: observed.current.basis });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const session = opened.value;
+    session.append({ kind: 'complete-allowed' }, (snapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 6, deleteCount: 0, insert: 'd' }
+    ));
+    fixture.handle.change((draft) => {
+      Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 6, 'Forbidde');
+    });
+
+    const receipt = await session.complete();
+    expect(receipt).toMatchObject({ outcome: 'rejected' });
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'rejected',
+      segments: [{ status: 'rejected' }]
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('Forbidde');
+
+    session.close();
     fixture.database.close();
     await fixture.repo.shutdown();
   });

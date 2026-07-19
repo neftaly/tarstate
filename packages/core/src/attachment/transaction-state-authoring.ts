@@ -39,6 +39,7 @@ export const authorAttachmentStateTransition = async (input: {
     const beforeByRelation = groupTransactionFields(input.before.rows);
     const snapshot = new ImmutableDatabaseTransactionSnapshot({
       owner: input.snapshotOwner,
+      lineage: Object.freeze({}),
       schemaView: input.schemaView,
       schema: input.preparation.schema,
       availableRelations: input.preparation.relations,

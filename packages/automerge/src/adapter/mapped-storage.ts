@@ -305,6 +305,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       existingKeys?.add(compoundKey(row.relationId, canonicalizeJson(row.key)));
     }
     const intents: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> }[] = [];
+    const plannedText = relevant.some(({ kind }) => kind === 'text-splice')
+      ? new Map<string, string>()
+      : undefined;
     for (const edit of relevant) {
       const compiled = this.#relations.get(edit.relationId) as MappedRelation;
       if (edit.kind === 'insert-generated-key') {
@@ -393,7 +396,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           continue;
         }
         const path = [...row.storagePath, ...fieldMapping.path] as AutomergePath;
-        const current = valueAtAutomergePath(snapshot.storage, path);
+        const pathIdentity = automergePathIdentity(path);
+        const current = plannedText?.get(pathIdentity)
+          ?? valueAtAutomergePath(snapshot.storage, path);
         if (typeof current !== 'string') {
           issues.push(bindingIssue('mapping.field_type_invalid', snapshot.sourceId, edit.relationId, path, {
             field: edit.field,
@@ -412,6 +417,12 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           }));
           continue;
         }
+        plannedText?.set(
+          pathIdentity,
+          current.slice(0, edit.index)
+            + edit.value
+            + current.slice(edit.index + edit.deleteCount)
+        );
         intents.push({
           footprint: automergePathFootprint([{ scope: 'exact', path }]),
           command: {
@@ -908,6 +919,16 @@ const compoundKey = (...parts: readonly string[]): string => {
   let key = '';
   for (const part of parts) key += part.length + ':' + part;
   return key;
+};
+
+const automergePathIdentity = (path: AutomergePath): string => {
+  let identity = '';
+  for (const part of path) {
+    identity += typeof part === 'number'
+      ? `n${part};`
+      : `s${part.length}:${part}`;
+  }
+  return identity;
 };
 
 function automergeLocatorIdentity(locator: AutomergeMappedStorageRow['locator']): string;

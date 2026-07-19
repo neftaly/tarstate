@@ -99,6 +99,30 @@ if (visible.state === 'open' && visible.current.readiness === 'ready') {
     ),
     { observedBasis: visible.current.basis }
   );
+
+  // Dependent offsets can be composed before one publication. The canonical
+  // document remains unchanged until complete(); concurrent Automerge changes
+  // are merged and the complete candidate is validated before publication.
+  const openedText = await opened.value.openTextIntent({
+    observedBasis: visible.current.basis
+  });
+  if (openedText.success) {
+    const text = openedText.value;
+    text.append({ kind: 'insert-prefix' }, (snapshot) => snapshot.spliceText(
+      tasks,
+      ['first'],
+      'title',
+      { index: 0, deleteCount: 0, insert: 'Draft: ' }
+    ));
+    text.append({ kind: 'edit-inserted-prefix' }, (snapshot) => snapshot.spliceText(
+      tasks,
+      ['first'],
+      'title',
+      { index: 0, deleteCount: 5, insert: 'Ready' }
+    ));
+    await text.complete();
+    text.close();
+  }
 }
 
 unsubscribe();
@@ -120,6 +144,14 @@ array or a record keyed by exact artifact ID. A keyed record rejects entries
 whose embedded `id` disagrees with its key. The standard constraint evaluator
 uses a deterministic work budget; exhausting it makes the constraint result
 indeterminate and prevents publication.
+
+`openTextIntent` is a bounded pre-publication composition, not a hidden editor
+or writer. Each `append` is synchronous and pure, updates only the session's
+optimistic snapshot, and produces pending or rejected segment evidence.
+`complete` is idempotent and publishes all accepted dependent splices as one
+ordinary captured transaction. A session cannot continue accepting edits after
+completion starts; retaining dependent intent across several publications is a
+separate optional source capability.
 
 A document whose root is one logical entity needs no artificial array or
 object-map wrapper. Its storage mapping uses an explicit singleton and literal

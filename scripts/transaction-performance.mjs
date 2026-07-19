@@ -28,7 +28,10 @@ const mapping = await sealStorageMapping({ id: 'urn:tarstate:transaction-benchma
     collection: { kind: 'object-map', path: ['tasks'], absent: 'creatable' },
     keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
     fields: {
-      title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
+      title: { path: ['title'], write: {
+        replace: builtInCapabilityRefs.fieldReplace,
+        textSplice: builtInCapabilityRefs.textSplice
+      } }
     }
   } }
 } });
@@ -59,12 +62,15 @@ const measure = async (changed) => {
 
 const noOp = await measure(false);
 const oneRow = await measure(true);
+const dependentText = await measureDependentText();
 const directAutomerge = await measureDirectAutomerge();
 const contracts = {
   independentRepeatedSamples: sampleCount >= 5,
   exactCommitSemantics: noOp.correctnessFailures.length === 0 && oneRow.correctnessFailures.length === 0,
+  dependentTextCompositionSemantics: dependentText.correctnessFailures.length === 0,
   noOp100RowsCeiling: noOp.milliseconds <= 20,
-  oneRow100RowsCeiling: oneRow.milliseconds <= 30
+  oneRow100RowsCeiling: oneRow.milliseconds <= 30,
+  dependentText16SegmentsCeiling: dependentText.milliseconds <= 60
 };
 const report = {
   benchmark: 'tarstate-public-automerge-database-transactions',
@@ -77,8 +83,13 @@ const report = {
     warmupIterations,
     noOpMillisecondsPerTransaction: noOp.milliseconds,
     oneRowMillisecondsPerTransaction: oneRow.milliseconds,
+    dependentText16SegmentsMillisecondsPerComposition: dependentText.milliseconds,
     directAutomergeOneRowMillisecondsPerChange: directAutomerge,
-    correctnessFailures: [...noOp.correctnessFailures, ...oneRow.correctnessFailures]
+    correctnessFailures: [
+      ...noOp.correctnessFailures,
+      ...oneRow.correctnessFailures,
+      ...dependentText.correctnessFailures
+    ]
   },
   node: process.version
 };
@@ -124,6 +135,35 @@ async function measureDirectAutomerge() {
   return Number(samples[Math.floor(samples.length / 2)].toFixed(3));
 }
 
+async function measureDependentText() {
+  const segments = 16;
+  const textIterations = 10;
+  const samples = [];
+  const correctnessFailures = [];
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const runtime = await openBenchmarkRuntime();
+    try {
+      await runtime.composeText(segments);
+      globalThis.gc();
+      const started = performance.now();
+      for (let index = 0; index < textIterations; index += 1) {
+        await runtime.composeText(segments);
+      }
+      samples.push((performance.now() - started) / textIterations);
+      if (!runtime.title()?.endsWith('x'.repeat(segments * (textIterations + 1)))) {
+        correctnessFailures.push('dependent-text-sample-' + sample);
+      }
+    } finally {
+      await runtime.close();
+    }
+  }
+  samples.sort((left, right) => left - right);
+  return {
+    milliseconds: Number(samples[Math.floor(samples.length / 2)].toFixed(3)),
+    correctnessFailures
+  };
+}
+
 async function openBenchmarkRuntime() {
   const repo = new Repo();
   const handle = repo.create({
@@ -165,6 +205,42 @@ async function openBenchmarkRuntime() {
       );
       if (receipt.outcome !== 'committed') {
         throw new Error('Transaction benchmark rejected: ' + receipt.issues.map(({ code }) => code).join(', '));
+      }
+    },
+    composeText: async (segmentCount) => {
+      const visible = database.getSnapshot();
+      if (visible.state !== 'open' || visible.current.readiness !== 'ready') {
+        throw new Error('Transaction benchmark database is not ready');
+      }
+      const openedText = await database.openTextIntent({
+        observedBasis: visible.current.basis
+      });
+      if (!openedText.success) {
+        throw new Error('Text benchmark session failed: ' + openedText.issues.map(({ code }) => code).join(', '));
+      }
+      const text = openedText.value;
+      const initialLength = handle.doc()?.tasks['task-0']?.title.length ?? 0;
+      for (let index = 0; index < segmentCount; index += 1) {
+        const segment = text.append(
+          { kind: 'append-text', index },
+          (snapshot) => snapshot.spliceText(
+            tasks,
+            ['task-0'],
+            'title',
+            { index: initialLength + index, deleteCount: 0, insert: 'x' }
+          )
+        );
+        if (segment.status !== 'pending') {
+          throw new Error('Text benchmark segment rejected: ' + segment.issues.map(({ code }) => code).join(', '));
+        }
+      }
+      try {
+        const receipt = await text.complete();
+        if (receipt.outcome !== 'committed') {
+          throw new Error('Text benchmark composition rejected: ' + receipt.issues.map(({ code }) => code).join(', '));
+        }
+      } finally {
+        text.close();
       }
     },
     sequence: () => sequence,

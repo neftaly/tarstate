@@ -210,8 +210,9 @@ const effectiveCapabilities = <Storage, Command>(
         ...(textSplice === undefined
           ? {}
           : { textSplice: Object.freeze({
-              indexUnit: textSplice.indexUnit,
-              concurrency: 'merge-captured-intent' as const
+            indexUnit: textSplice.indexUnit,
+              concurrency: 'merge-captured-intent' as const,
+              dependentComposition: 'bounded-before-publish' as const
             }) })
       });
     }

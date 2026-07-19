@@ -26,9 +26,15 @@ try {
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/declaration/index.js', 35_000, ['preparation', 'projection-selection', 'transaction-service']);
   // Includes strict declarations, effective write capabilities, captured-basis
-  // reconciliation, generated-key authoring, and field-bounded projection.
-  assertClosure('attachment/adapter/index.js', 329_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // reconciliation with one-stage text batching, generated-key authoring, and
+  // field-bounded projection.
+  assertClosure('attachment/adapter/index.js', 329_700, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('attachment/mapped-adapter/index.js', 95_000, ['transaction-executor', 'relation-delta-authoring', 'lifecycle-governance']);
+  assertClosure('attachment/text-intent-adapter/index.js', 74_300, [
+    'transaction-executor',
+    'commit-coordinator',
+    'lifecycle-governance'
+  ]);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);

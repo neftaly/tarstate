@@ -233,6 +233,45 @@ describe('Automerge shrinking model properties', () => {
     }
   ));
 
+  propertyTest('buffered dependent splices reconcile as one change after remote edits', fc.property(
+    unicodeText,
+    safeString,
+    fc.nat(),
+    unicodeText,
+    fc.nat(),
+    fc.nat(),
+    (initial, localText, localPosition, remoteText, remoteStart, remoteEnd) => {
+      type TextDocument = { text: string };
+      const boundaries = codePointBoundaries(initial);
+      const insertionBoundary = boundaries[localPosition % boundaries.length] ?? 0;
+      const localInsert = 'L' + localText + 'M';
+      const remote = normalizedSplice(boundaries, remoteStart, remoteEnd, 'R' + remoteText);
+      const base = Automerge.from<TextDocument>({ text: initial }, { actor: 'c'.repeat(64) });
+      const runtime = new AutomergeSourceRuntime({ sourceId: 'source:buffered-text-fuzz', doc: base });
+      const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:buffered-text-fuzz' });
+      const observed = source.snapshot();
+      runtime.merge(Automerge.change(
+        Automerge.clone(base, { actor: 'd'.repeat(64) }),
+        (draft) => {
+          Automerge.splice(draft, ['text'], remote.index, remote.deleteCount, remote.insert);
+        }
+      ));
+
+      const candidate = source.reconcile!(source.snapshot(), observed.basis, [{
+        apply: (draft: Parameters<Automerge.ChangeFn<TextDocument>>[0]) => {
+          Automerge.splice(draft, ['text'], insertionBoundary, 0, localInsert);
+          Automerge.splice(draft, ['text'], insertionBoundary + 1, 0, 'Z');
+        }
+      }]);
+
+      expect(candidate.issues).toEqual([]);
+      expect(candidate.storage.text).toContain('LZ' + localText + 'M');
+      expect(candidate.storage.text).toContain('R' + remoteText);
+      expect(Automerge.getChanges(base, candidate.storage)).toHaveLength(2);
+      source.close();
+    }
+  ));
+
   propertyTest('staged generated identities equal committed and replayed evidence', fc.asyncProperty(
     fc.array(safeString, { minLength: 1, maxLength: 8 }),
     async (values) => {

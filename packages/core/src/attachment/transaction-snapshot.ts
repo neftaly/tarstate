@@ -40,6 +40,7 @@ type AvailableRelation = DatabaseRelationCapabilities;
 
 type TransactionSnapshotContext = {
   readonly owner: object;
+  readonly lineage: object;
   readonly schemaView: { readonly id: string; readonly contentHash: ContentHash };
   readonly schema: PreparedSchema;
   readonly availableRelations: ReadonlyMap<string, AvailableRelation>;
@@ -52,6 +53,7 @@ type TransactionSnapshotContext = {
 };
 
 const emptyRows: LogicalRows = Object.freeze([]);
+const snapshotLineages = new WeakMap<object, object>();
 
 /** Immutable functional core value; lifecycle and replay stay in the service shell. */
 export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransactionSnapshot {
@@ -59,6 +61,7 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
 
   constructor(context: TransactionSnapshotContext) {
     this.#context = context;
+    snapshotLineages.set(this, context.lineage);
     Object.freeze(this);
   }
 
@@ -272,6 +275,11 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
   }
 
 }
+
+export const sameTransactionSnapshotLineage = (
+  left: ImmutableDatabaseTransactionSnapshot,
+  right: ImmutableDatabaseTransactionSnapshot
+): boolean => snapshotLineages.get(left) === snapshotLineages.get(right);
 
 const parseGeneratedFields = (
   context: TransactionSnapshotContext,

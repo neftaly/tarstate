@@ -28,6 +28,7 @@
       "@tarstate/core/attachment/declaration": ["./packages/core/src/attachment/declaration/index.ts"],
       "@tarstate/core/attachment/adapter": ["./packages/core/src/attachment/adapter/index.ts"],
       "@tarstate/core/attachment/mapped-adapter": ["./packages/core/src/attachment/mapped-adapter/index.ts"],
+      "@tarstate/core/attachment/text-intent-adapter": ["./packages/core/src/attachment/text-intent-adapter/index.ts"],
       "@tarstate/core/capabilities": ["./packages/core/src/capabilities/index.ts"],
       "@tarstate/core/database": ["./packages/core/src/database/index.ts"],
       "@tarstate/core/database/adapter": ["./packages/core/src/database/adapter/index.ts"],

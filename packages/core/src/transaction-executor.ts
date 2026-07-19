@@ -893,11 +893,13 @@ const evaluatePreparedExecution = <Storage, Command>(
   if (initialProjection.issues.some(isError)) {
     return rejectedEvaluation(beforeSnapshot, beforeBasis, logicalProjectionState(initialProjection), initialProjection.issues);
   }
+  const batchCapturedText = capturedBasisMergeable(prepared.transaction);
   let stagedSnapshot = beforeSnapshot;
   let stagedBasis = beforeBasis;
   let logicalProjection = initialProjection;
   const beforeState = logicalProjectionState(initialProjection);
   const commands: Command[] = [];
+  const capturedTextEdits: Extract<LogicalEdit, { readonly kind: 'text-splice' }>[] = [];
   const statementResults: StatementResult[] = [];
   const issues: Issue[] = [...initialProjection.issues];
   const touchedRelations = new Set<string>();
@@ -907,6 +909,21 @@ const evaluatePreparedExecution = <Storage, Command>(
     statementResults.push(evaluated.result);
     issues.push(...evaluated.result.issues);
     if (evaluated.result.issues.some(isError)) break;
+    if (batchCapturedText) {
+      const statementEdits = evaluated.editGroups.flat();
+      if (!statementEdits.every((edit): edit is Extract<LogicalEdit, { readonly kind: 'text-splice' }> =>
+        edit.kind === 'text-splice')) {
+        issues.push(transactionIssue('transaction.capability_unavailable', prepared.attempt, {
+          reason: 'captured_text_batch_contains_non_text_edit'
+        }));
+        break;
+      }
+      capturedTextEdits.push(...statementEdits);
+      logicalProjection = applyCapturedTextEdits(logicalProjection, statementEdits);
+      const relation = statementRelation(statement);
+      if (relation !== undefined) touchedRelations.add(relation.relationId);
+      continue;
+    }
     let statementRejected = false;
     const affectedRelations = new Set<string>();
     for (const editGroup of evaluated.editGroups) {
@@ -949,6 +966,35 @@ const evaluatePreparedExecution = <Storage, Command>(
     const relation = statementRelation(statement);
     if (relation !== undefined) touchedRelations.add(relation.relationId);
   }
+  if (batchCapturedText && !issues.some(isError) && capturedTextEdits.length > 0) {
+    const staged = stageSourceEdits({
+      source: context.source,
+      bindings: context.bindings,
+      snapshot: beforeSnapshot,
+      edits: capturedTextEdits
+    });
+    if (staged.outcome === 'rejected') {
+      issues.push(...staged.issues);
+    } else {
+      const derivedBasis = deriveStagedBasis(context, beforeSnapshot, staged.snapshot);
+      if ('issue' in derivedBasis) {
+        issues.push(derivedBasis.issue);
+      } else {
+        stagedBasis = derivedBasis.basis;
+        stagedSnapshot = { ...staged.snapshot, basis: stagedBasis };
+        commands.push(...staged.commands);
+        issues.push(...staged.issues);
+        const projected = projectLogicalState(
+          context.bindings,
+          stagedSnapshot,
+          initialProjection,
+          touchedRelations
+        );
+        issues.push(...projected.issues);
+        if (!projected.issues.some(isError)) logicalProjection = projected;
+      }
+    }
+  }
   const logicalState = logicalProjectionState(logicalProjection);
   let blockingIssues = issues.filter(isError);
   if (blockingIssues.length === 0) {
@@ -981,6 +1027,39 @@ const evaluatePreparedExecution = <Storage, Command>(
     ...(returning === undefined ? {} : { returning }),
     issues,
     blockingIssues
+  };
+};
+
+/** Pure optimistic transition used only before the single physical stage. */
+const applyCapturedTextEdits = (
+  projection: LogicalProjection,
+  edits: readonly Extract<LogicalEdit, { readonly kind: 'text-splice' }>[]
+): LogicalProjection => {
+  const rowsByRelation = new Map(projection.rowsByRelation);
+  for (const edit of edits) {
+    const previousRows = rowsByRelation.get(edit.relationId) ?? [];
+    const rowIndex = previousRows.findIndex((row) => samePortableJson(row.locator, edit.locator));
+    const row = previousRows[rowIndex];
+    const current = row?.fields[edit.field];
+    if (row === undefined || typeof current !== 'string') {
+      throw new TypeError('Evaluated captured text target disappeared from the logical projection');
+    }
+    const nextRows = [...previousRows];
+    nextRows[rowIndex] = Object.freeze({
+      ...row,
+      fields: Object.freeze({
+        ...row.fields,
+        [edit.field]: current.slice(0, edit.index)
+          + edit.value
+          + current.slice(edit.index + edit.deleteCount)
+      })
+    });
+    rowsByRelation.set(edit.relationId, Object.freeze(nextRows));
+  }
+  return {
+    byBinding: projection.byBinding,
+    rowsByRelation,
+    issues: projection.issues
   };
 };
 

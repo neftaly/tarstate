@@ -52,6 +52,10 @@
       "types": "./dist/attachment/mapped-adapter/index.d.ts",
       "import": "./dist/attachment/mapped-adapter/index.js"
     },
+    "./attachment/text-intent-adapter": {
+      "types": "./dist/attachment/text-intent-adapter/index.d.ts",
+      "import": "./dist/attachment/text-intent-adapter/index.js"
+    },
     "./capabilities": {
       "types": "./dist/capabilities/index.d.ts",
       "import": "./dist/capabilities/index.js"
