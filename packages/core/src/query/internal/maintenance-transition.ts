@@ -3,7 +3,7 @@ import { validateRelationInputs } from './input-validation.js';
 import { sameOptionalJson } from './equality.js';
 import {
   indexedRelationInputs,
-  relationInputKey,
+  relationInputIdentity,
   type IndexedRelationInput
 } from './relations.js';
 import { queryValueEqual } from './values.js';
@@ -33,11 +33,11 @@ export const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, 
     return rejectedMaintenanceUpdate('stale_update_basis');
   }
   let current: Map<string, IndexedRelationInput>;
-  try { current = new Map(indexedRelationInputs(previous.relations)); } catch { return rejectedMaintenanceUpdate('ambiguous_relation_input'); }
+  try { current = indexedRelationInputs(previous.relations); } catch { return rejectedMaintenanceUpdate('ambiguous_relation_input'); }
   const changedInputs = new Set<string>();
   for (const change of update.relations) {
     if (change.before === undefined && change.after === undefined) return rejectedMaintenanceUpdate('empty_relation_change', change.relation.relationId);
-    const identity = relationInputKey({ relation: change.relation, rows: [], completeness: 'exact', ...(change.sourceId === undefined ? {} : { sourceId: change.sourceId }), ...(change.attachmentId === undefined ? {} : { attachmentId: change.attachmentId }) });
+    const identity = relationInputIdentity(change.relation, change.attachmentId ?? change.sourceId);
     if (changedInputs.has(identity)) return rejectedMaintenanceUpdate('duplicate_relation_change', change.relation.relationId);
     changedInputs.add(identity);
     const existing = current.get(identity);

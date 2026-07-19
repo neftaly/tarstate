@@ -36,6 +36,7 @@ import {
   typedSourceOf,
   typedUnionAll,
   typedWhere,
+  typedWhereSourcePresent,
   type PreparedPlanParameters,
   type QueryParametersOf,
   type QueryResultRowOf,
@@ -459,6 +460,81 @@ describe('literal-schema and query type authoring', () => {
     expect(result.root).toMatchObject({ kind: 'select', input: { kind: 'order', input: { kind: 'where' } } });
     expectTypeOf<QueryParametersOf<typeof result>>().toEqualTypeOf<{ readonly minimum: number }>();
     expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source?: string }>();
+  });
+
+  it('filters missing source provenance before narrowing it to a required result field', async () => {
+    const sourced = typedWhereSourcePresent(author, 'author');
+    const piped = pipe(author, typedWhereSourcePresent('author'));
+    const sourcedJoin = typedWhereSourcePresent(joined, 'author');
+    const result = typedSelect(sourced, 'result', (aliases) => ({
+      name: aliases.author.row.name,
+      sourceId: typedSourceOf(aliases.author)
+    }));
+    const pipedResult = typedSelect(piped, 'result', (aliases) => ({
+      name: aliases.author.row.name,
+      sourceId: typedSourceOf(aliases.author)
+    }));
+    const union = typedUnionAll(result, pipedResult);
+    const prepared = await prepareTypedQuery(result, {
+      registryFingerprint: 'registry:source-present',
+      authorityFingerprint: 'authority:source-present',
+      datasetId: 'dataset:source-present'
+    });
+
+    expect(result.root).toMatchObject({
+      kind: 'select',
+      input: {
+        kind: 'where',
+        predicate: {
+          kind: 'boolean',
+          op: 'not',
+          arg: { kind: 'is-missing', value: { kind: 'source-of', alias: 'author' } }
+        }
+      }
+    });
+    expectTypeOf(typedSourceOf(sourced.aliases.author)).toEqualTypeOf<TypedExpression<string>>();
+    expectTypeOf(typedSourceOf(sourcedJoin.aliases.author)).toEqualTypeOf<TypedExpression<string>>();
+    expectTypeOf(typedSourceOf(sourcedJoin.aliases.manager)).toEqualTypeOf<TypedExpression<string | undefined>>();
+    expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly sourceId: string }>();
+    expectTypeOf<QueryResultRowOf<typeof union>>().toEqualTypeOf<{ readonly name: string; readonly sourceId: string }>();
+    expectTypeOf(prepared).toMatchTypeOf<TypedPreparedPlan<QueryNode, { readonly name: string; readonly sourceId: string }, {}>>();
+    const openRequiredSourceQuery = () => openDatabaseQuery({
+      sources: [],
+      plan: prepared,
+      queryAuthorityScope: 'scope:source-present'
+    });
+    type RequiredSourceResult = Awaited<ReturnType<Awaited<ReturnType<typeof openRequiredSourceQuery>>['whenSettled']>>;
+    expectTypeOf<RequiredSourceResult['rows']>().toEqualTypeOf<readonly {
+      readonly name: string;
+      readonly sourceId: string;
+    }[]>();
+
+    const rejectsMissingSourceAlias = (): void => {
+      // @ts-expect-error source narrowing requires an alias in the current query scope
+      typedWhereSourcePresent(author, 'missing');
+    };
+    expectTypeOf(rejectsMissingSourceAlias).toBeFunction();
+
+    const evaluated = evaluateQuery({
+      root: result.root,
+      relations: [
+        {
+          relation: people,
+          rows: [{ name: 'unmounted' }],
+          completeness: 'exact'
+        },
+        {
+          relation: people,
+          rows: [{ name: 'mounted' }],
+          completeness: 'exact',
+          sourceId: 'source:mounted'
+        }
+      ]
+    });
+    expect(evaluated).toMatchObject({
+      completeness: 'exact',
+      rows: [{ name: 'mounted', sourceId: 'source:mounted' }]
+    });
   });
 
   it('rejects conflicting declarations for a composed parameter name', () => {

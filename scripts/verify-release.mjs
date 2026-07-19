@@ -50,6 +50,7 @@ try {
     for (const required of ['package/package.json', 'package/README.md', 'package/LICENSE']) {
       if (!entries.includes(required)) fail(`${manifest.name}: tarball is missing ${required}`);
     }
+    verifyReadmeTarballVersions(manifest.name, tarball);
     for (const exported of Object.values(manifest.exports ?? {})) {
       for (const target of [exported.types, exported.import]) {
         const entry = 'package/' + String(target).replace(/^\.\//, '');
@@ -87,6 +88,15 @@ try {
 
 function internalRangeIncludesRelease(range) {
   return range === releaseVersion || range === `^${releaseVersion}` || range === `~${releaseVersion}`;
+}
+
+function verifyReadmeTarballVersions(packageName, tarball) {
+  const readme = execFileSync('tar', ['-xOf', tarball, 'package/README.md'], { encoding: 'utf8' });
+  for (const match of readme.matchAll(/tarstate-[a-z-]+-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.tgz/g)) {
+    if (match[1] !== releaseVersion) {
+      fail(`${packageName}: README references stale Tarstate tarball ${match[0]}`);
+    }
+  }
 }
 
 /** Pure package-manifest validation; packing and installation remain in the shell above. */

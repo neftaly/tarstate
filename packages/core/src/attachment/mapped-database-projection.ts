@@ -5,6 +5,7 @@ import type { Issue } from '../issues.js';
 import { samePortableJson } from '../internal-json-equality.js';
 import type { ProjectionResult, WritableLogicalRow, WritableLogicalState } from '../logical-edit.js';
 import type { RelationInput } from '../query/model.js';
+import { createQueryOccurrenceIds } from '../query/internal/occurrence-identity.js';
 import type { SourceBasis, SourceLifecycleState, SourceSnapshot } from '../source-state.js';
 import type { StorageBinding } from '../source-protocol.js';
 import type { JsonValue } from '../value.js';
@@ -184,7 +185,7 @@ const relationInputs = <Row extends WritableLogicalRow>(input: {
     return Object.freeze({
       relation: Object.freeze({ schemaView: input.schemaView, relationId }),
       rows: Object.freeze(relationRows.map(({ fields }) => fields)),
-      occurrenceIds: Object.freeze(relationRows.map(input.occurrenceId)),
+      occurrenceIds: createQueryOccurrenceIds(relationRows, input.occurrenceId),
       completeness: input.projection.completeness,
       sourceId: input.sourceId,
       attachmentId: input.attachmentId

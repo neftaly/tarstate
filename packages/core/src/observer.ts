@@ -509,7 +509,11 @@ class SharedObservation<Query, Row, Projection> {
     const readiness = captureEvidence.requiredInputInvalid || evaluationInvalid
       ? 'invalid'
       : completeness === 'exact' ? 'ready' : 'incomplete';
-    const dynamicIssues = deepFreezeObserverValue([...resultIdentityIssue, ...maintained.issues]) as readonly Issue[];
+    const dynamicIssues = trustedIncremental !== undefined
+      ? maintained.issues
+      : deepFreezeObserverValue([...resultIdentityIssue, ...maintained.issues]) as readonly Issue[];
+    // Result issue arrays are root-owned even when the shared capture evidence
+    // and maintained issue arrays are both empty.
     const issues = Object.freeze([...captureEvidence.issues, ...dynamicIssues]);
     const canReuseMaintained = trustedIncremental !== undefined && completeness !== 'unknown' && rows === maintained.rows && resultKeys === maintained.resultKeys;
     const result = Object.freeze({
@@ -689,13 +693,14 @@ const sameObserverSnapshot = <Row>(left: ObserverSnapshot<Row>, right: ObserverS
   const before = trustedObservedResults.get(left.current as object);
   const after = trustedObservedResults.get(right.current as object);
   if (before === undefined || after === undefined) return samePortableObserverValue(left, right);
+  const sharedResultViews = left.current.rows === right.current.rows && left.current.resultKeys === right.current.resultKeys;
+  if (sharedResultViews) return sameObservedResultMetadata(left.current, right.current);
   const consecutiveUnchanged = after.revision === before.revision + 1
     && after.resultDelta.addedResultKeys.length === 0
     && after.resultDelta.removedResultKeys.length === 0
     && after.resultDelta.updatedResultKeys.length === 0
     && sameStringArray(left.current.resultKeys, right.current.resultKeys);
-  const sharedResultViews = left.current.rows === right.current.rows && left.current.resultKeys === right.current.resultKeys;
-  return (consecutiveUnchanged || sharedResultViews) && sameObservedResultMetadata(left.current, right.current);
+  return consecutiveUnchanged && sameObservedResultMetadata(left.current, right.current);
 };
 
 const sameStringArray = (left: readonly string[], right: readonly string[]): boolean => {

@@ -289,15 +289,19 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     if (projection.completeness !== 'exact') {
       return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues };
     }
-    const rowsByLocator = new Map<string, AutomergeMappedStorageRow[]>();
+    const rowsByLocator = relevant.some(({ kind }) => kind !== 'insert' && kind !== 'insert-generated-key')
+      ? new Map<string, AutomergeMappedStorageRow[]>()
+      : undefined;
     const existingKeys = relevant.some(({ kind }) => kind === 'insert')
       ? new Set<string>()
       : undefined;
     for (const row of projection.rows) {
-      const key = compoundKey(row.relationId, canonicalizeJson(row.locator));
-      const bucket = rowsByLocator.get(key);
-      if (bucket === undefined) rowsByLocator.set(key, [row]);
-      else bucket.push(row);
+      if (rowsByLocator !== undefined) {
+        const key = compoundKey(row.relationId, automergeLocatorIdentity(row.locator));
+        const bucket = rowsByLocator.get(key);
+        if (bucket === undefined) rowsByLocator.set(key, [row]);
+        else bucket.push(row);
+      }
       existingKeys?.add(compoundKey(row.relationId, canonicalizeJson(row.key)));
     }
     const intents: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> }[] = [];
@@ -341,7 +345,10 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         }
         continue;
       }
-      const candidates = rowsByLocator.get(compoundKey(edit.relationId, canonicalizeJson(edit.locator))) ?? [];
+      const locatorIdentity = automergeLocatorIdentity(edit.locator);
+      const candidates = locatorIdentity === undefined
+        ? []
+        : rowsByLocator?.get(compoundKey(edit.relationId, locatorIdentity)) ?? [];
       if (candidates.length !== 1) {
         issues.push(bindingIssue(candidates.length === 0 ? 'mapping.locator_stale' : 'mapping.locator_invalid', snapshot.sourceId, edit.relationId));
         continue;
@@ -902,6 +909,18 @@ const compoundKey = (...parts: readonly string[]): string => {
   for (const part of parts) key += part.length + ':' + part;
   return key;
 };
+
+function automergeLocatorIdentity(locator: AutomergeMappedStorageRow['locator']): string;
+function automergeLocatorIdentity(locator: JsonValue): string | undefined;
+function automergeLocatorIdentity(locator: unknown): string | undefined {
+  if (!isRecord(locator)) return undefined;
+  const { namespace, token, rowIncarnation } = locator;
+  return typeof namespace === 'string'
+    && typeof token === 'string'
+    && typeof rowIncarnation === 'string'
+    ? compoundKey(namespace, token, rowIncarnation)
+    : undefined;
+}
 
 const projectionSelectionKey = (
   sourceId: string,

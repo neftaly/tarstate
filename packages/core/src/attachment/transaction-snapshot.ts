@@ -224,7 +224,7 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
         + (current as string).slice(splice.index + splice.deleteCount)
     });
     const rowsByRelation = new Map(this.#context.rowsByRelation);
-    rowsByRelation.set(relationId, nextRows);
+    rowsByRelation.set(relationId, Object.freeze(nextRows));
     return new ImmutableDatabaseTransactionSnapshot({
       ...this.#context,
       rowsByRelation,

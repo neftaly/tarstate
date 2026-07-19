@@ -20,11 +20,11 @@ import type {
   RelationInputChange,
   RelationRowChange
 } from '../incremental-model.js';
+import { adoptQueryOccurrenceIds } from './occurrence-identity.js';
 
 const ownedMaintenanceSnapshots = new WeakSet<object>();
 const ownedMaintenanceUpdates = new WeakSet<object>();
 const ownedQueryLogicalContainers = new WeakSet<object>();
-const ownedOccurrenceIdentities = new WeakSet<object>();
 
 /** Ownership evidence for values already detached at a query input boundary. */
 export const isOwnedQueryLogicalContainer = (value: object): boolean =>
@@ -155,60 +155,6 @@ export const adoptQueryRecord = (input: unknown, label = 'Query row'): QueryReco
 export const adoptExpressionScope = (scope: Readonly<Record<string, QueryRecord>>): Readonly<Record<string, QueryRecord>> => {
   const descriptors = inspectOwnedDataRecord(scope, 'Query expression scope', { allowSymbols: true });
   return Object.freeze(Object.fromEntries(Object.entries(descriptors).map(([alias, descriptor]) => [alias, adoptQueryRecord(descriptor.value, 'Query expression row')])));
-};
-
-const adoptStringArray = (input: readonly string[], label: string): readonly string[] => {
-  if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
-  try {
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(input, 'length');
-    const length = lengthDescriptor?.value;
-    if (typeof length !== 'number'
-      || !Number.isSafeInteger(length)
-      || length < 0) {
-      throw new TypeError(label + ' contains a hostile length');
-    }
-    const values: string[] = [];
-    values.length = length;
-    for (let index = 0; index < length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
-      if (descriptor === undefined
-        || !descriptor.enumerable
-        || !('value' in descriptor)
-        || typeof descriptor.value !== 'string') {
-        throw new TypeError(label + ' contains a hostile array descriptor');
-      }
-      values[index] = descriptor.value;
-    }
-    return Object.freeze(values);
-  } catch (error) {
-    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
-    throw new TypeError(label + ' could not be inspected', { cause: error });
-  }
-};
-
-/** Descriptor-safe ownership for capture-frame occurrence identity. */
-export const adoptQueryOccurrenceIds = (input: readonly string[]): readonly string[] => {
-  if (ownedOccurrenceIdentities.has(input)) return input;
-  const owned = adoptStringArray(input, 'Query occurrence identities');
-  ownedOccurrenceIdentities.add(owned);
-  return owned;
-};
-
-/** Builds trusted occurrence identity without re-inspecting an intermediate caller-owned array. */
-export const createQueryOccurrenceIds = <Row>(
-  rows: readonly Row[],
-  identity: (row: Row, index: number) => string
-): readonly string[] => {
-  const output: string[] = [];
-  output.length = rows.length;
-  for (let index = 0; index < rows.length; index += 1) {
-    const value = identity(rows[index] as Row, index);
-    if (typeof value !== 'string') throw new TypeError('Query occurrence identity must be a string');
-    output[index] = value;
-  }
-  Object.freeze(output);
-  ownedOccurrenceIdentities.add(output);
-  return output;
 };
 
 const adoptRelationInput = (input: RelationInput): RelationInput => {

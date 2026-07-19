@@ -3,10 +3,8 @@ import type {
   DatabaseQueryMaintenanceInput,
   QueryMaintenanceReuseDiagnostics
 } from './observer-maintenance-contracts.js';
-import {
-  adoptQueryOccurrenceIds,
-  sealOwnedQueryMaintenanceUpdate
-} from './query/internal/ownership.js';
+import { adoptQueryOccurrenceIds } from './query/internal/occurrence-identity.js';
+import { sealOwnedQueryMaintenanceUpdate } from './query/internal/ownership.js';
 import { deepFreezeObserverValue } from './internal-observer-values.js';
 import { diffQueryMaintenanceSnapshotValues } from './query/maintenance-diff.js';
 import type {

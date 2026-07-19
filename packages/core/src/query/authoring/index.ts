@@ -17,7 +17,8 @@ export {
   typedSelect,
   typedSourceOf,
   typedUnionAll,
-  typedWhere
+  typedWhere,
+  typedWhereSourcePresent
 } from '../authoring.js';
 export type {
   PreparedPlanParameters,

@@ -29,15 +29,16 @@ const emptyQueryMaintenanceOperatorDiagnostics = Object.freeze(Object.fromEntrie
 export const emptyOperatorDiagnostics = (): QueryMaintenanceOperatorDiagnostics => emptyQueryMaintenanceOperatorDiagnostics;
 
 export const summarizeOperatorEvents = (events: Iterable<QueryMaintenanceOperatorEvent>): QueryMaintenanceOperatorDiagnostics => {
-  const mutable = new Map<QueryMaintenanceOperator, {
+  let mutable: Map<QueryMaintenanceOperator, {
     selectiveNodeCount: number; fullNodeCount: number; fallbackNodeCount: number; affectedUnitCount: number; compactionCount: number;
     fallbackReasons: Partial<Record<QueryMaintenanceFallbackReason, number>>;
-  }>();
+  }> | undefined;
   for (const event of events) {
-    let summary = mutable.get(event.operator);
+    const summaries = mutable ??= new Map();
+    let summary = summaries.get(event.operator);
     if (summary === undefined) {
       summary = { selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0, affectedUnitCount: 0, compactionCount: 0, fallbackReasons: {} };
-      mutable.set(event.operator, summary);
+      summaries.set(event.operator, summary);
     }
     if (event.strategy === 'selective') summary.selectiveNodeCount += 1;
     else if (event.strategy === 'full') summary.fullNodeCount += 1;
@@ -46,6 +47,7 @@ export const summarizeOperatorEvents = (events: Iterable<QueryMaintenanceOperato
     summary.compactionCount += event.compactionCount ?? 0;
     if (event.reason !== undefined) summary.fallbackReasons[event.reason] = (summary.fallbackReasons[event.reason] ?? 0) + 1;
   }
+  if (mutable === undefined) return emptyQueryMaintenanceOperatorDiagnostics;
   return Object.freeze(Object.fromEntries(operatorKinds.map((operator) => {
     const summary = mutable.get(operator);
     return [operator, summary === undefined

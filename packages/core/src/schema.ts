@@ -1,7 +1,7 @@
-import { canonicalizeJson } from './canonical-json.js';
 import { parseScalarValue, type ScalarDeclaration } from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { canonicalizeOwnedJsonValue } from './internal-canonical-json.js';
+import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
 import { assertPreparedRelation, assertPreparedSchema, sealPreparedRelation, sealPreparedSchema } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
@@ -73,6 +73,11 @@ export type ParsedCandidate = {
   readonly row: RelationRow;
   readonly key: LogicalKey;
 };
+
+const ownedParsedCandidates = new WeakMap<
+  object,
+  WeakMap<PreparedRelation, Map<CapabilityRegistry | undefined, ParsedCandidate>>
+>();
 
 export type RelationCandidate = {
   readonly value: unknown;
@@ -186,6 +191,10 @@ const parseRelationCandidateFields = (
   if (typeof relation !== 'string') assertPreparedRelation(relation);
   const prepared = typeof relation === 'string' ? schema.relationsById.get(relation) ?? schema.relationsByName.get(relation) : relation;
   if (prepared === undefined) return schemaFailure('schema.relation_missing', context.path ?? [], { relation });
+  const cached = projectedFields === undefined && input !== null && typeof input === 'object'
+    ? ownedParsedCandidates.get(input)?.get(prepared)?.get(registry)
+    : undefined;
+  if (cached !== undefined) return { success: true, value: cached, issues: [] };
   const basePath = context.path ?? [];
   if (!isSafeCandidateRecord(input)) return contextualFailure('schema.candidate_invalid', prepared.declaration.relationId, context, basePath, { reason: 'record_required' });
   const row: Record<string, PortableValue> = {};
@@ -212,11 +221,30 @@ const parseRelationCandidateFields = (
     else issues.push(...parsed.issues.map((issue) => addCandidateContext(issue, prepared.declaration.relationId, context)));
   }
   if (issues.length > 0) return { success: false, issues };
-  const ownedRow = detachAndFreezeJsonValue(row);
-  if (!ownedRow.success) return ownedRow;
-  const frozenRow = ownedRow.value as RelationRow;
+  const frozenRow = freezeOwnedJsonValue(row as JsonValue) as RelationRow;
   const key = Object.freeze(prepared.declaration.key.map((field) => frozenRow[field])) as unknown as LogicalKey;
-  return { success: true, value: Object.freeze({ row: frozenRow, key }), issues: [] };
+  const parsed = Object.freeze({ row: frozenRow, key });
+  if (projectedFields === undefined) rememberOwnedParsedCandidate(frozenRow, prepared, registry, parsed);
+  return { success: true, value: parsed, issues: [] };
+};
+
+const rememberOwnedParsedCandidate = (
+  row: RelationRow,
+  relation: PreparedRelation,
+  registry: CapabilityRegistry | undefined,
+  parsed: ParsedCandidate
+): void => {
+  let byRelation = ownedParsedCandidates.get(row);
+  if (byRelation === undefined) {
+    byRelation = new WeakMap();
+    ownedParsedCandidates.set(row, byRelation);
+  }
+  let byRegistry = byRelation.get(relation);
+  if (byRegistry === undefined) {
+    byRegistry = new Map();
+    byRelation.set(relation, byRegistry);
+  }
+  byRegistry.set(registry, parsed);
 };
 
 export const parseRelationCandidates = (
@@ -279,7 +307,7 @@ const parseRelationCandidateFieldsBatch = (
   });
   const byKey = new Map<string, typeof rows>();
   for (const row of rows) {
-    const fingerprint = canonicalizeJson(row.key as unknown as JsonValue);
+    const fingerprint = canonicalizeOwnedJsonValue(row.key as unknown as JsonValue);
     const group = byKey.get(fingerprint) ?? [];
     group.push(row);
     byKey.set(fingerprint, group);
@@ -313,8 +341,11 @@ export const parseLogicalKey = (
     else issues.push(...parsed.issues);
   });
   if (issues.length > 0) return { success: false, issues };
-  const owned = detachAndFreezeJsonValue(values);
-  return owned.success ? { success: true, value: owned.value as unknown as LogicalKey, issues: [] } : owned;
+  return {
+    success: true,
+    value: freezeOwnedJsonValue(values as JsonValue) as unknown as LogicalKey,
+    issues: []
+  };
 };
 
 export const parseScalarValueForField = (
@@ -334,8 +365,11 @@ export const parseScalarValueForField = (
     refFields: (relationId) => schema.relationsById.get(relationId)?.keyFields.map((keyField) => keyField.type)
   });
   if (!parsed.success) return parsed;
-  const owned = detachAndFreezeJsonValue(parsed.value);
-  return owned.success ? { success: true, value: owned.value as PortableValue, issues: [] } : owned;
+  return {
+    success: true,
+    value: freezeOwnedJsonValue(parsed.value as JsonValue) as PortableValue,
+    issues: []
+  };
 };
 
 const isSchemaBody = (value: unknown): value is SchemaBody => isRecord(value)

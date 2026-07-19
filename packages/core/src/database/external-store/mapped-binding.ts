@@ -189,7 +189,7 @@ export const createExternalStoreMappedBinding = <State extends object>(input: {
       : undefined;
     for (const row of projected.rows) {
       if (rowsByLocator !== undefined) {
-        const locatorKey = compoundKey(row.relationId, canonicalizeJson(row.locator));
+        const locatorKey = compoundKey(row.relationId, externalLocatorIdentity(row.locator));
         const bucket = rowsByLocator.get(locatorKey);
         if (bucket === undefined) rowsByLocator.set(locatorKey, [row]);
         else bucket.push(row);
@@ -240,9 +240,10 @@ export const createExternalStoreMappedBinding = <State extends object>(input: {
         }
         continue;
       }
-      const candidates = rowsByLocator?.get(
-        compoundKey(edit.relationId, canonicalizeJson(edit.locator))
-      ) ?? [];
+      const locatorIdentity = externalLocatorIdentity(edit.locator);
+      const candidates = locatorIdentity === undefined
+        ? []
+        : rowsByLocator?.get(compoundKey(edit.relationId, locatorIdentity)) ?? [];
       if (candidates.length !== 1) {
         issues.push(bindingIssue(
           candidates.length === 0 ? 'mapping.locator_stale' : 'mapping.locator_invalid',
@@ -675,6 +676,31 @@ const locatorOccurrenceId = (locator: MappingLocator): string => {
   if (locator.kind === 'array-position') return 'array:' + locator.index;
   return 'object:' + locator.key.length + ':' + locator.key;
 };
+
+function externalLocatorIdentity(locator: ExternalStoreMappedRow['locator']): string;
+function externalLocatorIdentity(locator: JsonValue): string | undefined;
+function externalLocatorIdentity(locator: unknown): string | undefined {
+  if (!isRecord(locator)) return undefined;
+  const { namespace, token, rowIncarnation } = locator;
+  if (typeof namespace !== 'string'
+    || typeof rowIncarnation !== 'string'
+    || !isRecord(token)) {
+    return undefined;
+  }
+  const tokenIdentity: string | undefined = token.kind === 'singleton'
+    ? 'singleton'
+    : token.kind === 'array-position'
+      && typeof token.index === 'number'
+      && Number.isSafeInteger(token.index)
+      && token.durable === false
+      ? 'array:' + token.index
+      : token.kind === 'object-map-key' && typeof token.key === 'string'
+        ? 'object:' + token.key.length + ':' + token.key
+        : undefined;
+  return tokenIdentity === undefined
+    ? undefined
+    : compoundKey(namespace, tokenIdentity, rowIncarnation);
+}
 
 const withEvidence = (
   issue: Issue,

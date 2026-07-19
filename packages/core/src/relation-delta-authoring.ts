@@ -110,6 +110,18 @@ export const prepareExactKeyedRelationRows = (
   return { success: true, value: prepared, issues: Object.freeze([]) };
 };
 
+/** @internal Adopts rows already owned by Tarstate without crossing the public parse boundary again. */
+export const prepareOwnedExactKeyedRelationRows = (
+  rows: readonly Readonly<Record<string, JsonValue>>[]
+): PreparedExactKeyedRelationRows => {
+  const prepared = Object.freeze({
+    completeness: 'exact' as const,
+    rows
+  }) as PreparedExactKeyedRelationRows;
+  preparedExactRows.add(prepared);
+  return prepared;
+};
+
 const adoptDeltaInput = (input: unknown): ParseResult<ExactKeyedRelationDeltaInput> => {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return deltaFailure({ reason: 'input_shape' });
   let descriptors: PropertyDescriptorMap;

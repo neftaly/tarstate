@@ -4,7 +4,7 @@ import type { FieldDeclaration, SchemaBody } from './schema.js';
 import type { CapabilityRef, Issue, IssuePhase, IssueSeverity } from './issues.js';
 import type { SourceBasis } from './source-state.js';
 import type { QueryRecord, RelationInput } from './query/model.js';
-import { createQueryOccurrenceIds } from './query/internal/ownership.js';
+import { createQueryOccurrenceIds } from './query/internal/occurrence-identity.js';
 import { executePresence, type PresenceReceipt, type SetPresenceCommand } from './receipts.js';
 import type { JsonValue } from './value.js';
 

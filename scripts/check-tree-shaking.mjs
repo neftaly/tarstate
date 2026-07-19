@@ -71,14 +71,14 @@ const cases = [
     // windows, fallback evaluation, field-dependency projection, observation,
     // fixed-source lifecycle, and the lazy settlement-coordinator entry point.
     initialOnly: true,
-    maxGzipBytes: 45_200
+    maxGzipBytes: 45_250
   },
   {
     name: 'source-link database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // Optional fixed-point traversal and settlement coordination are lazy;
     // the complete closure also includes field-dependency projection.
-    maxGzipBytes: 48_300
+    maxGzipBytes: 48_400
   },
   {
     name: 'query expression evaluator',

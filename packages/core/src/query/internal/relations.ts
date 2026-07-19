@@ -6,8 +6,11 @@ export type IndexedRelationInput = { readonly input: RelationInput; readonly ind
 export const relationKey = (relation: RelationUse): string =>
   stringTupleKey(relation.schemaView.id, relation.schemaView.contentHash, relation.relationId);
 
+export const relationInputIdentity = (relation: RelationUse, namespace = ''): string =>
+  stringTupleKey(relationKey(relation), namespace);
+
 export const relationInputKey = (input: RelationInput): string =>
-  stringTupleKey(relationKey(input.relation), input.attachmentId ?? input.sourceId ?? '');
+  relationInputIdentity(input.relation, input.attachmentId ?? input.sourceId);
 
 const groupedRelationInputs = new WeakMap<readonly RelationInput[], ReadonlyMap<string, readonly RelationInput[]>>();
 
@@ -31,7 +34,7 @@ export const relationOccurrence = (input: RelationInput, index: number): string 
   return namespace === undefined ? occurrence : namespace.length + ':' + namespace + occurrence.length + ':' + occurrence;
 };
 
-export const indexedRelationInputs = (relations: readonly RelationInput[]): ReadonlyMap<string, IndexedRelationInput> => {
+export const indexedRelationInputs = (relations: readonly RelationInput[]): Map<string, IndexedRelationInput> => {
   const output = new Map<string, IndexedRelationInput>();
   relations.forEach((input, index) => {
     const identity = relationInputKey(input);

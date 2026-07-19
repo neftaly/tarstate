@@ -18,8 +18,8 @@ try {
   assertClosure('artifacts/query/index.js', 165_000, ['query-incremental', 'observer-maintenance', 'semantic-transaction', 'semantic-storage-mapping', 'semantic-schema-lens', 'semantic-constraint']);
   assertClosure('artifacts/transaction/index.js', 80_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'constraint-']);
   assertClosure('artifacts/constraint-set/index.js', 85_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'transaction-']);
-  // Includes canonical field-bounded candidate parsing without a second parser implementation.
-  assertClosure('artifacts/storage-mapping/index.js', 90_500, ['query-', 'lens-', 'constraint-', 'transaction-']);
+  // Includes canonical field-bounded parsing and owned-row reuse without a second parser.
+  assertClosure('artifacts/storage-mapping/index.js', 90_700, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
   assertClosure('values/index.js', 25_000, ['query', 'schema', 'transaction', 'database', 'memory-source']);

@@ -23,6 +23,7 @@ declare const expressionParameters: unique symbol;
 declare const queryResultRow: unique symbol;
 declare const preparedPlanRow: unique symbol;
 declare const preparedPlanParameters: unique symbol;
+declare const aliasSource: unique symbol;
 export type TypedExpression<Value, Parameters extends Readonly<Record<string, ValueDeclaration>> = {}> = {
   readonly expression: Expr;
   readonly parameterDeclarations: Parameters;
@@ -36,9 +37,10 @@ type AnyTypedExpression = TypedExpression<unknown, Readonly<Record<string, Value
 type ParameterRecord<Value> = Value extends Readonly<Record<string, ValueDeclaration>> ? Value : never;
 type ParametersOfExpressions<Expressions extends readonly AnyTypedExpression[]> = ParameterRecord<Simplify<UnionToIntersection<ExpressionParameters<Expressions[number]>>>>;
 
-export type TypedAlias<Name extends string, Row> = {
+export type TypedAlias<Name extends string, Row, Source extends string | undefined = string | undefined> = {
   readonly name: Name;
   readonly row: { readonly [Field in keyof Row]-?: TypedExpression<Row[Field]> };
+  readonly [aliasSource]?: Source;
 };
 export type TypedAliases = Readonly<Record<string, TypedAlias<string, unknown>>>;
 
@@ -115,7 +117,7 @@ export const typedOr = <const Expressions extends readonly [BooleanExpression, .
 export const typedNot = <Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<boolean, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'boolean', op: 'not', arg: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
 export const typedIsNull = <Value, Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<Value, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'is-null', value: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
 export const typedIsMissing = <Value, Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<Value, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'is-missing', value: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
-export const typedSourceOf = <Name extends string, Row>(alias: TypedAlias<Name, Row>): TypedExpression<string | undefined> => ({ expression: { kind: 'source-of', alias: alias.name }, parameterDeclarations: {} });
+export const typedSourceOf = <Name extends string, Row, Source extends string | undefined>(alias: TypedAlias<Name, Row, Source>): TypedExpression<Source> => ({ expression: { kind: 'source-of', alias: alias.name }, parameterDeclarations: {} });
 
 const applyTypedWhere = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   query: TypedQuery<Aliases, QueryParameters, Row>,
@@ -159,6 +161,73 @@ export function typedWhere(
     return applyTypedWhere(queryOrPredicate, predicate(queryOrPredicate.aliases));
   }
   return (query: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>) => applyTypedWhere(query, queryOrPredicate);
+}
+
+type SourcePresentAliases<Aliases extends TypedAliases, Alias extends keyof Aliases> = Simplify<{
+  readonly [Name in keyof Aliases]: Name extends Alias
+    ? Aliases[Name] extends TypedAlias<infer AliasName, infer Row, string | undefined>
+      ? TypedAlias<AliasName, Row, string>
+      : never
+    : Aliases[Name];
+}>;
+
+const applyTypedWhereSourcePresent = <
+  Aliases extends TypedAliases,
+  QueryParameters extends Readonly<Record<string, ValueDeclaration>>,
+  Row,
+  Alias extends StringKey<Aliases>
+>(
+  query: TypedQuery<Aliases, QueryParameters, Row>,
+  alias: Alias
+): TypedQuery<SourcePresentAliases<Aliases, Alias>, QueryParameters, Row> => {
+  assertTypedQueryInput(query);
+  if (!Object.hasOwn(query.aliases, alias)) throw new TypeError('typedWhereSourcePresent alias is not in the query scope');
+  return {
+    ...query,
+    root: {
+      kind: 'where',
+      input: query.root,
+      predicate: {
+        kind: 'boolean',
+        op: 'not',
+        arg: { kind: 'is-missing', value: { kind: 'source-of', alias } }
+      }
+    },
+    aliases: query.aliases as SourcePresentAliases<Aliases, Alias>
+  };
+};
+
+interface TypedWhereSourcePresentPipe<Alias extends string> extends PipeType {
+  readonly accepts: this['input'] extends TypedQuery<infer Aliases, Readonly<Record<string, ValueDeclaration>>, unknown>
+    ? Alias extends keyof Aliases ? true : false
+    : false;
+  readonly output: this['input'] extends TypedQuery<infer Aliases, infer QueryParameters, infer Row>
+    ? Alias extends keyof Aliases
+      ? TypedQuery<SourcePresentAliases<Aliases, Alias>, QueryParameters, Row>
+      : never
+    : never;
+}
+
+/** Filters rows without source provenance and narrows the selected alias to a required source ID. */
+export function typedWhereSourcePresent<const Alias extends string>(
+  alias: Alias
+): (<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row>(
+  query: Alias extends keyof Aliases ? TypedQuery<Aliases, QueryParameters, Row> : never
+) => TypedQuery<SourcePresentAliases<Aliases, Extract<Alias, keyof Aliases>>, QueryParameters, Row>) & PipeOperator<TypedWhereSourcePresentPipe<Alias>>;
+export function typedWhereSourcePresent<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, const Alias extends StringKey<Aliases>>(
+  query: TypedQuery<Aliases, QueryParameters, Row>,
+  alias: Alias
+): TypedQuery<SourcePresentAliases<Aliases, Alias>, QueryParameters, Row>;
+export function typedWhereSourcePresent(
+  queryOrAlias: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> | string,
+  alias?: string
+): unknown {
+  if (typeof queryOrAlias === 'string') {
+    return (query: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>) =>
+      applyTypedWhereSourcePresent(query, queryOrAlias);
+  }
+  if (alias === undefined) throw new TypeError('typedWhereSourcePresent alias is required in direct-call form');
+  return applyTypedWhereSourcePresent(queryOrAlias, alias);
 }
 
 export type TypedOrderTerm<Parameters extends Readonly<Record<string, ValueDeclaration>> = Readonly<Record<string, ValueDeclaration>>> = {

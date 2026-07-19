@@ -4,7 +4,10 @@ import type { DatabaseRelationCapabilities } from '../database/transaction.js';
 import type { DatabaseTransactionTransform } from '../database/transaction.js';
 import type { Issue } from '../issues.js';
 import type { WritableLogicalState } from '../logical-edit.js';
-import { authorExactKeyedRelationDelta } from '../relation-delta-authoring.js';
+import {
+  authorExactKeyedRelationDelta,
+  prepareOwnedExactKeyedRelationRows
+} from '../relation-delta-authoring.js';
 import type { CapabilityRegistry } from '../registry.js';
 import type { PreparedSchema } from '../schema.js';
 import {
@@ -66,14 +69,12 @@ export const authorAttachmentStateTransition = async (input: {
         replaceableFields: Object.entries(relation.fields)
           .filter(([, capabilities]) => capabilities.replace !== undefined)
           .map(([field]) => field),
-        before: {
-          completeness: 'exact',
-          rows: beforeByRelation.get(relationId) ?? emptyTransactionFields
-        },
-        after: {
-          completeness: 'exact',
-          rows: afterByRelation.get(relationId) ?? emptyTransactionFields
-        }
+        before: prepareOwnedExactKeyedRelationRows(
+          beforeByRelation.get(relationId) ?? emptyTransactionFields
+        ),
+        after: prepareOwnedExactKeyedRelationRows(
+          afterByRelation.get(relationId) ?? emptyTransactionFields
+        )
       });
       if (!authored.success) authoringIssues.push(...authored.issues);
       else statements.push(...authored.value);

@@ -171,6 +171,12 @@ describe('production schemas and codecs', () => {
     expect(Object.isFrozen(parsed.value.row.data)).toBe(true);
     expect(Object.isFrozen((parsed.value.row.data as { readonly nested: readonly unknown[] }).nested)).toBe(true);
     expect(Object.isFrozen(parsed.value.key)).toBe(true);
+    const reused = parseRelationCandidate(prepared.value, 'test.value', parsed.value.row);
+    if (!reused.success) throw new Error('owned candidate reuse failed');
+    expect(reused.value).toBe(parsed.value);
+    const copied = parseRelationCandidate(prepared.value, 'test.value', { ...parsed.value.row });
+    if (!copied.success) throw new Error('copied candidate failed');
+    expect(copied.value).not.toBe(parsed.value);
 
     const relation = prepared.value.relationsById.get('test.value');
     if (relation === undefined) throw new Error('relation missing');

@@ -78,23 +78,34 @@ const timedOperation = (iterations, operation) => {
 
 const allocationHotspots = (profile, limit = 8) => {
   const nodesById = new Map();
-  const visit = (node) => {
+  const parentById = new Map();
+  const visit = (node, parent) => {
     nodesById.set(node.id, node);
-    for (const child of node.children ?? []) visit(child);
+    if (parent !== undefined) parentById.set(node.id, parent.id);
+    for (const child of node.children ?? []) visit(child, node);
   };
   visit(profile.head);
   const bytesByFrame = new Map();
+  const stackByFrame = new Map();
   for (const sample of profile.samples) {
     const frame = nodesById.get(sample.nodeId)?.callFrame;
     const key = frame === undefined
       ? 'unknown'
       : `${frame.functionName || '(anonymous)'} ${frame.url}:${frame.lineNumber + 1}`;
     bytesByFrame.set(key, (bytesByFrame.get(key) ?? 0) + sample.size);
+    if (!stackByFrame.has(key)) {
+      const stack = [];
+      for (let nodeId = sample.nodeId; nodeId !== undefined && stack.length < 5; nodeId = parentById.get(nodeId)) {
+        const call = nodesById.get(nodeId)?.callFrame;
+        if (call !== undefined) stack.push(`${call.functionName || '(anonymous)'} ${call.url}:${call.lineNumber + 1}`);
+      }
+      stackByFrame.set(key, stack);
+    }
   }
   return [...bytesByFrame]
     .sort(([, left], [, right]) => right - left)
     .slice(0, limit)
-    .map(([frame, bytes]) => ({ frame, bytes }));
+    .map(([frame, bytes]) => ({ frame, bytes, stack: stackByFrame.get(frame) }));
 };
 
 const pooledEnvironment = (runtimeIdentity) => ({
@@ -820,6 +831,7 @@ process.stdout.write(JSON.stringify({
     workload: '100 one-row updates to a field ignored by 100 pooled roots over 1,000 input rows',
     sampledBytes: pooledSampledAllocationBytes,
     sampledBytesPerUpdate: pooledBytesPerUpdate,
+    hotspots: allocationHotspots(pooledAllocationProfile),
     boundaryNote: 'The changed field is ignored by every root, so public row views should be reused and fanout costs expose internal bookkeeping.'
   },
   node: process.version,

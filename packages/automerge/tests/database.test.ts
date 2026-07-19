@@ -176,12 +176,16 @@ describe('standard Automerge database', () => {
       draft.tasks.first!.unknownPhysicalField = 'preserved';
     });
 
-    const transform = (snapshot: DatabaseTransactionSnapshot) => snapshot.spliceText(
-      fixture.tasks,
-      ['first'],
-      'title',
-      { index: 0, deleteCount: 0, insert: 'New ' }
-    );
+    const transform = (snapshot: DatabaseTransactionSnapshot) => {
+      const spliced = snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 0, deleteCount: 0, insert: 'New ' }
+      );
+      expect(Object.isFrozen(spliced.rows(fixture.tasks))).toBe(true);
+      return spliced;
+    };
     const simulation = await fixture.database.simulate(
       { kind: 'prefix-title' },
       transform,

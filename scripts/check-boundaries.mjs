@@ -111,6 +111,7 @@ assignArchitectureGroup('query-batch', [
   'query/internal/graph.ts',
   'query/internal/input-validation.ts',
   'query/internal/ordering.ts',
+  'query/internal/occurrence-identity.ts',
   'query/internal/ownership.ts',
   'query/internal/relations.ts',
   'query/internal/values.ts',

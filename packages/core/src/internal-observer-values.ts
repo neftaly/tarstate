@@ -10,15 +10,17 @@ export const deepFreezeObserverValue = <Value>(value: Value, seen = new WeakMap<
   const prior = seen.get(value);
   if (prior !== undefined) return prior as Value;
   if (Array.isArray(value)) {
-    const output: unknown[] = [];
+    const output: unknown[] = Array(value.length);
     seen.set(value, output);
-    for (const item of value) output.push(deepFreezeObserverValue(item, seen));
+    for (let index = 0; index < value.length; index += 1) {
+      output[index] = deepFreezeObserverValue(value[index], seen);
+    }
     return Object.freeze(output) as Value;
   }
   const output: Record<string, unknown> = {};
   seen.set(value, output);
-  for (const [key, item] of Object.entries(value)) {
-    const owned = deepFreezeObserverValue(item, seen);
+  for (const key of Object.keys(value)) {
+    const owned = deepFreezeObserverValue((value as Record<string, unknown>)[key], seen);
     if (key === '__proto__') {
       Object.defineProperty(output, key, {
         value: owned,

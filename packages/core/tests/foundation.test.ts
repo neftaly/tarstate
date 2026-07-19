@@ -30,6 +30,10 @@ import {
 import { canonicalizeJsonWithCache } from '../src/internal-canonical-json.js';
 import { sameStructuralJson } from '../src/internal-structural-json-equality.js';
 import { deepFreezeObserverValue } from '../src/internal-observer-values.js';
+import {
+  adoptQueryOccurrenceIds,
+  createQueryOccurrenceIds
+} from '../src/query/internal/occurrence-identity.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 
@@ -74,6 +78,8 @@ describe('production foundation', () => {
   it('canonicalizes JSON deterministically and normalizes negative zero', () => {
     expect(canonicalizeJson({ z: -0, a: ['x', { b: true, a: null }] })).toBe('{"a":["x",{"a":null,"b":true}],"z":0}');
     expect(() => canonicalizeJson('\ud800')).toThrow(/Lone surrogate/);
+    expect(() => canonicalizeJson(undefined as never)).toThrow(TypeError);
+    expect(() => canonicalizeJson(Symbol('invalid') as never)).toThrow(TypeError);
   });
 
   it('compares portable values structurally without depending on key order', () => {
@@ -98,6 +104,15 @@ describe('production foundation', () => {
     expect(detached.__proto__).toEqual({ polluted: true });
     expect(Object.isFrozen(detached)).toBe(true);
     expect(Object.isFrozen(detached.value)).toBe(true);
+  });
+
+  it('reuses internally constructed occurrence identity without inspecting it twice', () => {
+    const rows = [{ id: 'one' }, { id: 'two' }];
+    const occurrenceIds = createQueryOccurrenceIds(rows, ({ id }) => 'row:' + id);
+
+    expect(adoptQueryOccurrenceIds(occurrenceIds)).toBe(occurrenceIds);
+    expect(occurrenceIds).toEqual(['row:one', 'row:two']);
+    expect(Object.isFrozen(occurrenceIds)).toBe(true);
   });
 
   it('memoizes canonical subtrees only inside an explicit owned-graph context', () => {

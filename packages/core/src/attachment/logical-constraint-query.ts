@@ -3,6 +3,7 @@ import { canonicalizeJson } from '../canonical-json.js';
 import { capabilityRefKey, createIssue, type CapabilityRef, type Issue } from '../issues.js';
 import type { WritableLogicalState } from '../logical-edit.js';
 import { evaluateQuery } from '../query/evaluate.js';
+import { createQueryOccurrenceIds } from '../query/internal/occurrence-identity.js';
 import type { FunctionRegistry, QueryNode, QueryRecord, RelationInput } from '../query/model.js';
 import type { CapabilityRegistry } from '../registry.js';
 import type { SourceBasis } from '../source-state.js';
@@ -98,7 +99,7 @@ const logicalRelationInputs = (
     return Object.freeze({
       relation: Object.freeze({ schemaView, relationId }),
       rows: Object.freeze(relationRows.map(({ fields }) => fields as QueryRecord)),
-      occurrenceIds: Object.freeze(relationRows.map(({ locator }) => canonicalizeJson([relationId, locator]))),
+      occurrenceIds: createQueryOccurrenceIds(relationRows, ({ locator }) => canonicalizeJson([relationId, locator])),
       completeness: 'exact',
       sourceId,
       attachmentId,

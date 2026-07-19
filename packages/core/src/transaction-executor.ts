@@ -4,6 +4,7 @@ import { stageSourceEdits } from './commit-coordinator.js';
 import { builtInCapabilityRefs } from './builtins.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
+import { canonicalizeOwnedJsonValue } from './internal-canonical-json.js';
 import {
   SourceOperationLedger,
   type OperationLedgerEntry,
@@ -1001,11 +1002,11 @@ const reconcileStatementResult = (
   let logicallyChanged = 0;
   const projectedByLocator = new Map<string, WritableLogicalRow>();
   for (const candidate of after.rowsByRelation.get(relationId) ?? []) {
-    const locator = canonicalizeJson(candidate.locator);
+    const locator = canonicalizeOwnedJsonValue(candidate.locator);
     if (!projectedByLocator.has(locator)) projectedByLocator.set(locator, candidate);
   }
   for (const row of selected.value) {
-    const projected = projectedByLocator.get(canonicalizeJson(row.locator));
+    const projected = projectedByLocator.get(canonicalizeOwnedJsonValue(row.locator));
     if (projected === undefined || !samePortableJson(projected.fields, row.fields)) logicallyChanged += 1;
   }
   return logicallyChanged === result.logicallyChanged ? result : { ...result, logicallyChanged };
@@ -1144,7 +1145,7 @@ const evaluateKeyedDelta = (
 ): EvaluatedStatement => {
   const existing = new Map<string, WritableLogicalRow[]>();
   for (const row of rows) {
-    const fingerprint = canonicalizeJson(row.key);
+    const fingerprint = canonicalizeOwnedJsonValue(row.key);
     const bucket = existing.get(fingerprint);
     if (bucket === undefined) existing.set(fingerprint, [row]);
     else bucket.push(row);
@@ -1229,7 +1230,7 @@ const evaluateUpsert = (
   }
   const existing = new Map<string, WritableLogicalRow[]>();
   for (const row of rows) {
-    const fingerprint = canonicalizeJson(row.key);
+    const fingerprint = canonicalizeOwnedJsonValue(row.key);
     const group = existing.get(fingerprint) ?? [];
     group.push(row);
     existing.set(fingerprint, group);
@@ -1548,11 +1549,11 @@ const replacementMatchesRows = (
   if (rows.length !== candidates.length) return false;
   const counts = new Map<string, number>();
   for (const { fields } of rows) {
-    const fingerprint = canonicalizeJson(fields as JsonValue);
+    const fingerprint = canonicalizeOwnedJsonValue(fields as JsonValue);
     counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
   }
   for (const fields of candidates) {
-    const fingerprint = canonicalizeJson(fields as JsonValue);
+    const fingerprint = canonicalizeOwnedJsonValue(fields as JsonValue);
     const count = counts.get(fingerprint);
     if (count === undefined) return false;
     if (count === 1) counts.delete(fingerprint);
@@ -1682,11 +1683,11 @@ const adoptAttempt = (input: TransactionAttempt): TransactionAttempt => {
 };
 
 const isProjectedRow = (value: unknown): value is WritableLogicalRow => {
-  if (!isRecord(value) || typeof value.relationId !== 'string' || !isJsonRecord(value.fields)) return false;
+  if (!isRecord(value) || typeof value.relationId !== 'string' || !isRecord(value.fields)) return false;
   try {
-    canonicalizeJson(value.key as JsonValue);
-    canonicalizeJson(value.locator as JsonValue);
-    canonicalizeJson(value.fields as JsonValue);
+    canonicalizeOwnedJsonValue(value.key as JsonValue);
+    canonicalizeOwnedJsonValue(value.locator as JsonValue);
+    canonicalizeOwnedJsonValue(value.fields as JsonValue);
     return true;
   } catch {
     return false;

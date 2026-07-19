@@ -1,12 +1,19 @@
 import type { JsonValue } from './value.js';
 
 export type CanonicalJsonCache = WeakMap<object, string>;
+const ownedCanonicalJson = new WeakMap<object, string>();
 
 /** Canonicalizes an arbitrary JSON value without retaining identity-derived state. */
 export const canonicalizeJsonValue = (value: JsonValue): string => canonicalize(value);
 
 /** Canonicalizes immutable owned JSON while memoizing every container subtree. */
 export const canonicalizeJsonWithCache = (value: JsonValue, cache: CanonicalJsonCache): string => canonicalize(value, cache);
+
+/** Reuses canonical text only for containers already owned as immutable values. */
+export const canonicalizeOwnedJsonValue = (value: JsonValue): string =>
+  value !== null && typeof value === 'object' && Object.isFrozen(value)
+    ? canonicalize(value, ownedCanonicalJson)
+    : canonicalize(value);
 
 const canonicalize = (value: JsonValue, cache?: CanonicalJsonCache): string => {
   if (value === null || typeof value !== 'object') {
@@ -24,7 +31,9 @@ const canonicalize = (value: JsonValue, cache?: CanonicalJsonCache): string => {
 const canonicalizePrimitive = (value: null | string | number | boolean): string => {
   if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError('Canonical JSON requires a finite number');
   if (typeof value === 'string') assertUnicodeScalarString(value);
-  return JSON.stringify(Object.is(value, -0) ? 0 : value);
+  const canonical = JSON.stringify(Object.is(value, -0) ? 0 : value);
+  if (canonical === undefined) throw new TypeError('Canonical JSON requires a JSON value');
+  return canonical;
 };
 
 /** Pure container rendering; cache ownership remains in `canonicalize`. */
