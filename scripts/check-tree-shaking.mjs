@@ -124,7 +124,7 @@ const cases = [
     // Automerge itself remains external. This covers Tarstate's complete
     // conflict-aware attachment, retained causal publication, transaction,
     // and observation closure.
-    maxGzipBytes: 69_500
+    maxGzipBytes: 69_650
   }
 ];
 

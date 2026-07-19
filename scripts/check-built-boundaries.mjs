@@ -26,20 +26,21 @@ try {
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/declaration/index.js', 35_000, ['preparation', 'projection-selection', 'transaction-service']);
   // Includes strict declarations, effective write capabilities, captured-basis
-  // reconciliation with retained-candidate validation, one-stage text
-  // batching, generated-key authoring, and field-bounded projection.
-  assertClosure('attachment/adapter/index.js', 331_700, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // reconciliation with retained-candidate validation, lazy text-target
+  // indexing, one-stage text batching, generated-key authoring, and
+  // field-bounded projection.
+  assertClosure('attachment/adapter/index.js', 332_100, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('attachment/mapped-adapter/index.js', 95_000, ['transaction-executor', 'relation-delta-authoring', 'lifecycle-governance']);
   // Includes bounded queued-prefix lifecycle, evidence rolling, and replay
   // validation without source-specific reconciliation or commit machinery.
-  assertClosure('attachment/text-intent-adapter/index.js', 78_700, [
+  assertClosure('attachment/text-intent-adapter/index.js', 79_150, [
     'transaction-executor',
     'commit-coordinator',
     'lifecycle-governance'
   ]);
   // Opt-in source-native candidate retention and final publication validation;
   // ordinary attachment and text-session topics remain separate.
-  assertClosure('attachment/retained-text-adapter/index.js', 206_800, [
+  assertClosure('attachment/retained-text-adapter/index.js', 207_150, [
     'query-incremental',
     'observer-maintenance'
   ]);

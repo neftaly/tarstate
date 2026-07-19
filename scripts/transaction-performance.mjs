@@ -64,6 +64,7 @@ const noOp = await measure(false);
 const oneRow = await measure(true);
 const dependentText = await measureDependentText();
 const continuedText = await measureContinuedText();
+const largeTextAuthoring = await measureTextAuthoring(2_000, 16);
 const directAutomerge = await measureDirectAutomerge();
 const contracts = {
   independentRepeatedSamples: sampleCount >= 5,
@@ -73,7 +74,8 @@ const contracts = {
   noOp100RowsCeiling: noOp.milliseconds <= 20,
   oneRow100RowsCeiling: oneRow.milliseconds <= 30,
   dependentText16SegmentsCeiling: dependentText.milliseconds <= 60,
-  continuedText8Segments2PublicationsCeiling: continuedText.milliseconds <= 100
+  continuedText8Segments2PublicationsCeiling: continuedText.milliseconds <= 100,
+  textAuthoring16Segments2kRowsCeiling: largeTextAuthoring.milliseconds <= 20
 };
 const report = {
   benchmark: 'tarstate-public-automerge-database-transactions',
@@ -88,6 +90,7 @@ const report = {
     oneRowMillisecondsPerTransaction: oneRow.milliseconds,
     dependentText16SegmentsMillisecondsPerComposition: dependentText.milliseconds,
     continuedText8Segments2PublicationsMillisecondsPerComposition: continuedText.milliseconds,
+    textAuthoring16Segments2kRowsMilliseconds: largeTextAuthoring.milliseconds,
     directAutomergeOneRowMillisecondsPerChange: directAutomerge,
     correctnessFailures: [
       ...noOp.correctnessFailures,
@@ -198,10 +201,25 @@ async function measureContinuedText() {
   };
 }
 
-async function openBenchmarkRuntime() {
+async function measureTextAuthoring(inputRows, segments) {
+  const samples = [];
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    const runtime = await openBenchmarkRuntime(inputRows);
+    try {
+      await runtime.authorText(segments);
+      samples.push(await runtime.authorText(segments));
+    } finally {
+      await runtime.close();
+    }
+  }
+  samples.sort((left, right) => left - right);
+  return { milliseconds: Number(samples[Math.floor(samples.length / 2)].toFixed(3)) };
+}
+
+async function openBenchmarkRuntime(inputRows = rowCount) {
   const repo = new Repo();
   const handle = repo.create({
-    tasks: Object.fromEntries(Array.from({ length: rowCount }, (_, index) => [
+    tasks: Object.fromEntries(Array.from({ length: inputRows }, (_, index) => [
       'task-' + index,
       { id: 'task-' + index, title: 'Title ' + index }
     ]))
@@ -316,6 +334,37 @@ async function openBenchmarkRuntime() {
       } finally {
         text.close();
       }
+    },
+    authorText: async (segmentCount) => {
+      const visible = database.getSnapshot();
+      if (visible.state !== 'open' || visible.current.readiness !== 'ready') {
+        throw new Error('Transaction benchmark database is not ready');
+      }
+      const openedText = await database.openTextIntent({ observedBasis: visible.current.basis });
+      if (!openedText.success) {
+        throw new Error('Text benchmark session failed: ' + openedText.issues.map(({ code }) => code).join(', '));
+      }
+      const text = openedText.value;
+      const initialLength = handle.doc()?.tasks['task-0']?.title.length ?? 0;
+      const started = performance.now();
+      for (let index = 0; index < segmentCount; index += 1) {
+        const segment = text.append(
+          { kind: 'author-text', index },
+          (snapshot) => snapshot.spliceText(
+            tasks,
+            ['task-0'],
+            'title',
+            { index: initialLength + index, deleteCount: 0, insert: 'x' }
+          )
+        );
+        if (segment.status !== 'pending') {
+          throw new Error('Text benchmark segment rejected: ' + segment.issues.map(({ code }) => code).join(', '));
+        }
+      }
+      const milliseconds = performance.now() - started;
+      text.cancel();
+      text.close();
+      return milliseconds;
     },
     sequence: () => sequence,
     title: () => handle.doc()?.tasks['task-0']?.title,

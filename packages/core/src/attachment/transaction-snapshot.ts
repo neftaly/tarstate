@@ -1,4 +1,4 @@
-import type { ContentHash } from '../canonical-json.js';
+import { canonicalizeJson, type ContentHash } from '../canonical-json.js';
 import { createIssue, type Issue } from '../issues.js';
 import type { CapabilityRegistry } from '../registry.js';
 import {
@@ -14,7 +14,6 @@ import type {
   GeneratedKeyInsertFields,
   RelationKey
 } from '../database/transaction.js';
-import { samePortableJson } from '../internal-json-equality.js';
 import { isValidUtf16TextSplice } from '../internal-text-splice.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
 import type { JsonValue } from '../value.js';
@@ -58,6 +57,8 @@ const emptyGeneratedKeyInserts: readonly GeneratedKeyInsert[] = Object.freeze([]
 const emptyTextSplices: readonly AuthoredTextSplice[] = Object.freeze([]);
 const emptyAuthoringIssues: readonly Issue[] = Object.freeze([]);
 const snapshotLineages = new WeakMap<object, object>();
+// Owned non-empty row arrays are relation-local; the shared empty array always has an empty index.
+const textTargetIndexes = new WeakMap<LogicalRows, ReadonlyMap<string, number>>();
 
 /** Immutable functional core value; lifecycle and replay stay in the service shell. */
 export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransactionSnapshot {
@@ -183,17 +184,15 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
         : ownedEdit.issues));
     }
     const relationRows = this.#context.rowsByRelation.get(relationId) ?? emptyRows;
-    let matchIndex = -1;
-    let matchCount = 0;
-    if (keyValue !== undefined) {
-      for (let index = 0; index < relationRows.length; index += 1) {
-        const row = relationRows[index];
-        if (row !== undefined && rowMatchesKey(row, available.keyFields, keyValue)) {
-          matchIndex = index;
-          matchCount += 1;
-        }
-      }
-    }
+    const indexedMatch = keyValue === undefined
+      ? undefined
+      : textTargetIndex(relationRows, available).get(canonicalizeJson(keyValue));
+    const matchIndex = indexedMatch === undefined || indexedMatch === ambiguousTextTarget
+      ? -1
+      : indexedMatch;
+    const matchCount = indexedMatch === undefined
+      ? 0
+      : indexedMatch === ambiguousTextTarget ? 2 : 1;
     const matchedRow = matchCount === 1 ? relationRows[matchIndex] : undefined;
     const current = matchedRow?.[field];
     if (keyValue !== undefined && matchCount !== 1) {
@@ -232,6 +231,9 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
     });
     const rowsByRelation = new Map(this.#context.rowsByRelation);
     rowsByRelation.set(relationId, Object.freeze(nextRows));
+    if (!available.keyFields.includes(field)) {
+      retainTextTargetIndex(relationRows, nextRows);
+    }
     return new ImmutableDatabaseTransactionSnapshot({
       ...this.#context,
       rowsByRelation,
@@ -363,8 +365,40 @@ const isRecord = (value: JsonValue): value is Readonly<Record<string, JsonValue>
 const isNonNegativeSafeInteger = (value: JsonValue | undefined): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-const rowMatchesKey = (
-  row: Readonly<Record<string, JsonValue>>,
-  keyFields: readonly string[],
-  key: readonly JsonValue[]
-): boolean => keyFields.every((field, index) => samePortableJson(row[field], key[index]));
+const ambiguousTextTarget = -1;
+
+const textTargetIndex = (
+  rows: LogicalRows,
+  available: AvailableRelation
+): ReadonlyMap<string, number> => {
+  const cached = textTargetIndexes.get(rows);
+  if (cached !== undefined) return cached;
+  const index = new Map<string, number>();
+  for (let position = 0; position < rows.length; position += 1) {
+    const row = rows[position] as Readonly<Record<string, JsonValue>>;
+    const key: JsonValue[] = [];
+    let complete = true;
+    for (const field of available.keyFields) {
+      const value = row[field];
+      if (value === undefined) {
+        complete = false;
+        break;
+      }
+      key.push(value);
+    }
+    if (!complete) continue;
+    const canonical = canonicalizeJson(key);
+    index.set(canonical, index.has(canonical) ? ambiguousTextTarget : position);
+  }
+  textTargetIndexes.set(rows, index);
+  return index;
+};
+
+const retainTextTargetIndex = (
+  before: LogicalRows,
+  after: LogicalRows
+): void => {
+  const index = textTargetIndexes.get(before);
+  if (index === undefined) return;
+  textTargetIndexes.set(after, index);
+};
