@@ -5,6 +5,7 @@ import {
   createAttachmentTransactionService
 } from '../src/attachment/transaction-service.js';
 import type { DatabaseTransactionSnapshot } from '../src/database/transaction.js';
+import { createIssue, type Issue } from '../src/issues.js';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
 import { sealSchema } from '../src/schema.js';
 import { relationLiteral } from '../src/schema-authoring.js';
@@ -254,6 +255,74 @@ describe('attachment transaction service', () => {
       storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 4 }] }
     });
 
+    const expectedConflict = createIssue({
+      code: 'test.expected_conflict',
+      phase: 'plan',
+      severity: 'error',
+      retry: 'after_input',
+      details: { key: 'one' }
+    });
+    await expect(service.simulate(
+      { kind: 'expected-conflict-preview' },
+      (snapshot) => snapshot.reject(expectedConflict)
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [expectedConflict]
+    });
+
+    vi.spyOn(source, 'commit').mockImplementationOnce(async (input) => {
+      await commitDirect({
+        operationEpoch: input.operationEpoch,
+        operationId: 'operation:concurrent-before-expected-rejection',
+        intentHash: `sha256:${'6'.repeat(64)}`,
+        expectedBasis: input.expectedBasis,
+        commands: [{
+          description: 'make operation expectation false',
+          apply: (state) => Object.freeze({
+            ...state,
+            'test.item': Object.freeze([Object.freeze({
+              id: 'one',
+              title: 'Count:2',
+              count: 5
+            })])
+          })
+        }]
+      });
+      return commitDirect(input);
+    });
+    const expectedTransform = vi.fn((snapshot: DatabaseTransactionSnapshot) => {
+      const [row] = snapshot.rows(items);
+      return row?.count === 5
+        ? snapshot.reject(expectedConflict)
+        : snapshot.withRows(items, [{ ...row!, title: 'Expected first attempt' }]);
+    });
+    await expect(service.transact(
+      { kind: 'reject-after-replay' },
+      expectedTransform
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [expectedConflict]
+    });
+    expect(expectedTransform).toHaveBeenCalledTimes(2);
+    expect(source.snapshot()).toMatchObject({
+      storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 5 }] }
+    });
+
+    const warning = createIssue({
+      code: 'test.warning_only',
+      phase: 'plan',
+      severity: 'warning',
+      retry: 'after_input'
+    });
+    await expect(service.simulate(
+      { kind: 'malformed-empty-rejection' },
+      (snapshot) => (snapshot.reject as (...issues: readonly Issue[]) => DatabaseTransactionSnapshot)()
+    )).rejects.toThrow('at least one error issue');
+    await expect(service.simulate(
+      { kind: 'malformed-warning-rejection' },
+      (snapshot) => snapshot.reject(warning)
+    )).rejects.toThrow('at least one error issue');
+
     await expect(service.transact(
       { kind: 'initial-author-failure' },
       () => { throw new Error('initial author failure'); }
@@ -276,8 +345,45 @@ describe('attachment transaction service', () => {
       outcome: 'rejected',
       issues: [{ details: { reason: 'source_generated_key_unavailable' } }]
     });
+
+    const exactInsert = (title: string) => (snapshot: DatabaseTransactionSnapshot) => {
+      const intended = { id: 'stable', title, count: 1 };
+      const current = snapshot.rows(items);
+      const existing = current.find(({ id }) => id === intended.id);
+      if (existing === undefined) return snapshot.withRows(items, [...current, intended]);
+      return existing.title === intended.title && existing.count === intended.count
+        ? snapshot
+        : snapshot.reject(createIssue({
+          code: 'test.idempotency_key_occupied',
+          phase: 'plan',
+          severity: 'error',
+          retry: 'after_input',
+          key: [intended.id]
+        }));
+    };
+    await expect(service.transact(
+      { kind: 'exact-insert', key: 'stable', title: 'Created' },
+      exactInsert('Created')
+    )).resolves.toMatchObject({ outcome: 'committed', statementResults: [{ inserted: 1 }] });
+    await expect(service.transact(
+      { kind: 'exact-insert-retry', key: 'stable', title: 'Created' },
+      exactInsert('Created')
+    )).resolves.toMatchObject({ outcome: 'committed', statementResults: [] });
+    const occupied = await service.transact(
+      { kind: 'exact-insert-conflict', key: 'stable', title: 'Different' },
+      exactInsert('Different')
+    );
+    expect(occupied).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'test.idempotency_key_occupied', key: ['stable'] }]
+    });
+    expect(occupied).not.toHaveProperty('afterBasis');
+    expect(occupied).not.toHaveProperty('durability');
     expect(source.snapshot()).toMatchObject({
-      storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 4 }] }
+      storage: { 'test.item': [
+        { id: 'one', title: 'Count:2', count: 5 },
+        { id: 'stable', title: 'Created', count: 1 }
+      ] }
     });
   });
 });

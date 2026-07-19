@@ -1,6 +1,8 @@
 /** Transaction authoring, commit coordination, receipts, and lifecycle governance. */
 export * from '../commit-coordinator.js';
 export * from '../lifecycle-governance.js';
+export type * from '../non-atomic-batch-model.js';
+export * from '../non-atomic-batch.js';
 export type {
   Footprint,
   FootprintRelation,

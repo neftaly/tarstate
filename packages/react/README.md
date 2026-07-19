@@ -9,8 +9,8 @@ Install both Tarstate tarballs and your supported React version:
 
 ```sh
 npm install \
-  ./tarstate-core-0.6.6.tgz \
-  ./tarstate-react-0.6.6.tgz \
+  ./tarstate-core-0.6.7.tgz \
+  ./tarstate-react-0.6.7.tgz \
   react
 ```
 

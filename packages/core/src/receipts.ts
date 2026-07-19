@@ -4,7 +4,8 @@ import { safeParseJsonText, type ArtifactParseBudget } from './artifacts.js';
 import { isContentHash, type ContentHash } from './canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import type { SourceBasis } from './source-state.js';
-import type { CommitReceipt, NonAtomicBatchReceipt } from './transaction.js';
+import type { NonAtomicBatchReceipt } from './non-atomic-batch-model.js';
+import type { CommitReceipt } from './transaction.js';
 
 export type SourceLifecycleCommand = {
   readonly lifecycleCoordinatorId: string;

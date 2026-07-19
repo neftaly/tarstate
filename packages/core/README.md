@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.6.6.tgz
+npm install ./tarstate-core-0.6.7.tgz
 ```
 
 ## Choose the application path
@@ -143,8 +143,19 @@ failures resolve to a receipt; an uncertain handoff resolves with
 A replay callback may run after its operation has been reserved. If that replay
 throws, the operation resolves to a rejected receipt with
 `transaction.unexpected_failure` so the reservation reaches a final state.
-Callbacks must therefore be pure, replayable, and use returned logical rows—not
-exceptions—for ordinary product behavior.
+Callbacks must therefore be pure and replayable. Use `snapshot.reject(issue)`
+for an expected data-dependent refusal such as an occupied idempotency key;
+the rejection is reevaluated on replay and produces an ordinary rejected
+receipt without mutation. Exceptions remain programmer or unexpected-failure
+evidence.
+
+Independent databases cannot share an atomic transaction. When partial
+completion is intentional, `executeDatabaseNonAtomicBatch` from
+`@tarstate/core/transactions` runs ordinary database transaction callbacks in
+sequence and retains each exact nested receipt. Its `stop | continue` policy
+controls only future callbacks: it promises no rollback, workflow persistence,
+or cross-source retry. Portable transaction attempts continue to use
+`executeNonAtomicBatch`; both paths share the same outcome semantics.
 
 ## Atomic external-store database
 

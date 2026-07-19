@@ -87,6 +87,8 @@ describe('topic-focused core surface', () => {
     expect('prepareWritableExecutionContext' in transactions).toBe(false);
     expect('executePreparedTransaction' in transactions).toBe(false);
     expect('simulatePreparedTransaction' in transactions).toBe(false);
+    expect(transactions.executeDatabaseNonAtomicBatch).toBeTypeOf('function');
+    expect(transactions.executeNonAtomicBatch).toBeTypeOf('function');
     expect(transactionAuthoring.sealTransaction).toBe(transactions.sealTransaction);
     expect(values.safeMaterializePortableBytes).toBeTypeOf('function');
     expect(values.toPortableBytes).toBeTypeOf('function');
@@ -102,6 +104,7 @@ describe('topic-focused core surface', () => {
     expect('openIncrementalQueryMaintenance' in queryEvaluate).toBe(false);
     expect('evaluateQuery' in queryIncremental).toBe(false);
     expect('executeNonAtomicBatch' in transactionAuthoring).toBe(false);
+    expect('executeDatabaseNonAtomicBatch' in transactionAuthoring).toBe(false);
     expect('createIncrementalDatabaseQueryMaintenance' in databaseObserver).toBe(false);
     expectTypeOf<ObserverDiagnosticReporter>().toMatchTypeOf<import('../src/observer-diagnostics.js').ObserverDiagnosticReporter>();
     expectTypeOf<PreparedPlan>().toMatchTypeOf<import('../src/maintenance.js').PreparedPlan>();

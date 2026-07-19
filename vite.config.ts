@@ -63,7 +63,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       },
       rollupOptions: {
         ...sharedBuildOptions.rollupOptions,
-        external: [/^@tarstate\/core(?:\/.*)?$/, '@automerge/automerge']
+        external: [/^@tarstate\/core(?:\/.*)?$/, /^@automerge\/(?:automerge|automerge-repo)(?:\/.*)?$/]
       }
     }
   },

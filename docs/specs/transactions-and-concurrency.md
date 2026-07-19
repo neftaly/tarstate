@@ -28,6 +28,12 @@ token-to-key association.
 in UTF-16 code units. It requires the exact basis observed by the user and a
 source/binding capable of captured-basis reconciliation.
 
+`reject(issue)` returns an expected data-dependent refusal as the same immutable
+snapshot type. It is for operation intent such as an occupied idempotency key,
+not schema or constraint validation. The issue is adopted once, an error is
+required, and replay may legitimately change between staged and rejected as
+the source changes. Exceptions remain programmer or unexpected failures.
+
 ## General replay loop
 
 For ordinary exact-state operations, the semantic loop is:
@@ -155,6 +161,18 @@ immediately afterward.
 Simulation must not allocate durable source-generated identity or mutate an
 operation ledger in a way that changes later commit semantics.
 
+## Deliberately non-atomic batches
+
+Cross-source work is not an atomic transaction. `executeDatabaseNonAtomicBatch`
+runs host-local ordinary transaction callbacks sequentially; the portable
+artifact path uses `executeNonAtomicBatch`. One shared functional core derives
+step and aggregate outcomes for both paths. Exact nested receipts are retained,
+identity disagreement fails closed as unknown, and cancellation prevents only
+callbacks that have not started.
+
+The batch receipt exposes partial completion. It does not claim rollback,
+durable workflow identity, source discovery, or automatic product retries.
+
 ## Receipts
 
 Receipts are portable evidence. They distinguish committed, rejected, unknown,
@@ -183,3 +201,5 @@ Attack the following:
 - dependent local text splices silently reinterpreted after a rejected or
   unknown predecessor;
 - composite-key order changing between authoring and lowering.
+- receipt source/attachment identity disagreeing with its scheduled batch step;
+- cancellation or stop policy accidentally discarding completed batch evidence.

@@ -141,6 +141,7 @@ assignArchitectureGroup('transaction-model', [
   'database/transaction.ts',
   'internal-text-splice.ts',
   'internal-transaction-expression.ts',
+  'non-atomic-batch-model.ts',
   'receipts.ts',
   'relation-delta-authoring.ts',
   'transaction-authoring.ts',
@@ -166,6 +167,7 @@ assignArchitectureGroup('transaction-runtime', [
   'internal-captured-target-validation.ts',
   'internal-coordinator-outcome.ts',
   'lifecycle-governance.ts',
+  'non-atomic-batch.ts',
   'transaction-executor.ts'
 ]);
 assignArchitectureGroup('attachment-runtime', [

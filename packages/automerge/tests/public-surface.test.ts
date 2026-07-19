@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as automerge from '../src/index.js';
+import * as repoLifecycle from '../src/repo-lifecycle/index.js';
 import * as automergeView from '../src/view/index.js';
 
 describe('production Automerge surface', () => {
@@ -12,5 +13,11 @@ describe('production Automerge surface', () => {
   it('keeps exact-basis materialization in its focused topic', () => {
     expect(Object.keys(automergeView)).toEqual(['viewAutomergeDocumentAtBasis']);
     expect(automergeView.viewAutomergeDocumentAtBasis).toBeTypeOf('function');
+  });
+
+  it('keeps Repo source creation in its focused optional topic', () => {
+    expect(Object.keys(repoLifecycle)).toEqual(['createAutomergeRepoLifecycleAdapter']);
+    expect(repoLifecycle.createAutomergeRepoLifecycleAdapter).toBeTypeOf('function');
+    expect('createAutomergeRepoLifecycleAdapter' in automerge).toBe(false);
   });
 });

@@ -114,6 +114,14 @@ const cases = [
     maxGzipBytes: 5_200
   },
   {
+    name: 'Automerge Repo lifecycle creation',
+    source: selectedExport(
+      'packages/automerge/dist/repo-lifecycle/index.js',
+      'createAutomergeRepoLifecycleAdapter'
+    ),
+    maxGzipBytes: 4_800
+  },
+  {
     name: 'Automerge mapped relation row selector',
     source: selectedExport('packages/automerge/dist/index.js', 'mappedRelationRows'),
     maxGzipBytes: 800
@@ -129,7 +137,10 @@ const cases = [
     // Automerge itself remains external. This covers Tarstate's complete
     // conflict-aware attachment, retained causal publication, transaction,
     // strict exact-basis adoption and text positions, and observation closure.
-    maxGzipBytes: 71_900
+    // Optional sibling entries can perturb shared chunk names and compression
+    // without changing this closure. Keep a raw bound as the code-growth ratchet.
+    maxBytes: 286_500,
+    maxGzipBytes: 72_000
   }
 ];
 
@@ -194,6 +205,12 @@ const bundleSize = async ({ name, source, initialOnly = false }) => {
 for (const entry of cases) {
   const size = await bundleSize(entry);
   console.log(`${entry.name}: ${size.gzipBytes} gzip bytes (${size.bytes} raw)`);
+  if (entry.maxBytes !== undefined && size.bytes > entry.maxBytes) {
+    throw new Error(
+      `${entry.name} exceeded its ${entry.maxBytes}-byte raw budget by `
+      + `${size.bytes - entry.maxBytes} bytes`
+    );
+  }
   if (size.gzipBytes > entry.maxGzipBytes) {
     throw new Error(
       `${entry.name} exceeded its ${entry.maxGzipBytes}-byte gzip budget by `

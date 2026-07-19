@@ -8,15 +8,17 @@ projection and conflict guarantees through portable receipts and capabilities.
 The package root exposes one standard database API. Low-level Automerge value
 adoption is available without loading the adapter runtime from
 `@tarstate/automerge/values`. Exact-basis document materialization is available
-from the equally focused `@tarstate/automerge/view` topic.
+from the equally focused `@tarstate/automerge/view` topic. Source creation with
+Automerge Repo lifecycle receipts is an optional
+`@tarstate/automerge/repo-lifecycle` topic.
 
 Install both Tarstate tarballs and the Automerge package imported by application
 code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.6.6.tgz \
-  ./tarstate-automerge-0.6.6.tgz \
+  ./tarstate-core-0.6.7.tgz \
+  ./tarstate-automerge-0.6.7.tgz \
   @automerge/automerge
 ```
 
@@ -333,13 +335,44 @@ pending.
 
 ## Automerge Repo compatibility
 
-The Repo integration consumes a small structural handle interface; this package
-does not depend on or re-export `@automerge/automerge-repo`. Applications may
-therefore use either the stable Repo release or its latest `next` prerelease
-without installing a second Repo copy. The adapter accepts compatible Automerge
-3.x releases so Repo and Tarstate can share one Automerge installation. CI runs
-the integration suite against the locked stable release and a separate `next`
-compatibility lane.
+The ordinary database integration consumes a small structural handle interface
+and does not load or re-export `@automerge/automerge-repo`. Applications may
+therefore keep their existing compatible Repo installation.
+
+Hosts that create documents through Tarstate can opt into the Repo lifecycle
+topic:
+
+```ts
+import * as Automerge from '@automerge/automerge';
+import { SourceLifecycleCoordinator } from '@tarstate/core/transactions';
+import { toPortableBytes } from '@tarstate/core/values';
+import { createAutomergeRepoLifecycleAdapter } from '@tarstate/automerge/repo-lifecycle';
+
+const lifecycle = new SourceLifecycleCoordinator({
+  lifecycleCoordinatorId: 'workspace-documents',
+  operationEpoch,
+  authorityViewFingerprint,
+  authorize,
+  adapter: createAutomergeRepoLifecycleAdapter({ repo, sourceCapability })
+});
+
+const receipt = await lifecycle.execute({
+  lifecycleCoordinatorId: 'workspace-documents',
+  operationEpoch,
+  operationId,
+  request: {
+    action: 'create',
+    sourceCapability,
+    input: toPortableBytes(Automerge.save(detachedDocument))
+  }
+});
+```
+
+The topic requires compatible `@automerge/automerge-repo` 2.5.6–2.x APIs. It
+preallocates an Automerge URL without Repo mutation, imports exact history under
+that ID, returns no raw handle, and truthfully claims only process-memory
+durability. Repeating the same known lifecycle operation returns its original
+receipt. Deletion and experimental Repo persistence APIs remain unsupported.
 
 System-relation events record observations without inferring stronger network
 facts. In particular, `remote-heads-observed` produces sync state `observed`,

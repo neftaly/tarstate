@@ -22,6 +22,12 @@ import {
 } from '../src/index.js';
 import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 import { sameStructuralJson } from '../src/internal-structural-json-equality.js';
+import {
+  executeDatabaseNonAtomicBatch,
+  executeNonAtomicBatch,
+  type CommitReceipt,
+  type TransactionAttempt
+} from '../src/transactions/index.js';
 import { propertyTest } from './support/property-test.js';
 
 const portableJson = fc.jsonValue({ maxDepth: 5 }).filter((value) => safeParseJsonValue(value).success);
@@ -77,6 +83,44 @@ const globalQueries: readonly QueryNode[] = [
 ];
 
 describe('shrinking property laws', () => {
+  propertyTest('non-atomic-batch-shells-share-outcome-semantics', fc.asyncProperty(
+    fc.array(fc.constantFrom<CommitReceipt['outcome']>('committed', 'rejected', 'unknown'), {
+      maxLength: 12
+    }),
+    fc.constantFrom('stop' as const, 'continue' as const),
+    async (outcomes, failurePolicy) => {
+      const receipts = outcomes.map(batchCommitReceipt);
+      const database = await executeDatabaseNonAtomicBatch({
+        batchId: 'batch:property',
+        failurePolicy,
+        steps: receipts.map((receipt, index) => ({
+          stepId: String(index),
+          attachmentId: receipt.attachmentId,
+          sourceId: receipt.sourceId,
+          transact: async () => receipt
+        }))
+      });
+      const byAttachment = new Map(receipts.map((receipt) => [receipt.attachmentId, receipt]));
+      const attempts = receipts.map((receipt, index) => ({
+        stepId: String(index),
+        attempt: batchAttempt(receipt.attachmentId, String(index))
+      }));
+      const portable = await executeNonAtomicBatch({
+        batchId: 'batch:property',
+        failurePolicy,
+        steps: attempts
+      }, {
+        sourceIdFor: (attempt) => byAttachment.get(attempt.attachmentId)!.sourceId,
+        commit: async (attempt) => byAttachment.get(attempt.attachmentId)!
+      });
+
+      expect(portable).toEqual(database);
+      portable.steps.forEach((step, index) => {
+        if (step.receipt !== undefined) expect(step.receipt).toBe(receipts[index]);
+      });
+    }
+  ));
+
   propertyTest('portable-bytes-round-trip', fc.property(
     fc.uint8Array({ maxLength: 16_384 }),
     (bytes) => {
@@ -308,6 +352,45 @@ describe('shrinking property laws', () => {
 });
 
 const field = (alias: string, name: string) => ({ kind: 'field', alias, name } as const);
+
+const batchAttempt = (attachmentId: string, operationId: string): TransactionAttempt => ({
+  operationEpoch: 'epoch:batch-property',
+  operationId,
+  attachmentId,
+  transaction: { id: 'urn:test:batch-property', contentHash: hash(1) }
+});
+
+const batchCommitReceipt = (
+  outcome: CommitReceipt['outcome'],
+  index: number
+): CommitReceipt => {
+  const evidence = {
+    kind: 'commit' as const,
+    receiptVersion: 1 as const,
+    operationEpoch: 'epoch:batch-property',
+    operationId: 'operation:' + index,
+    transactionHash: hash(2),
+    intentHash: hash(3),
+    attachmentId: 'attachment:' + index,
+    attachmentFingerprint: hash(4),
+    sourceId: 'source:' + index,
+    statementResults: [],
+    issues: []
+  };
+  if (outcome === 'committed') {
+    return {
+      ...evidence,
+      outcome,
+      beforeBasis: { revision: 1 },
+      afterBasis: { revision: 2 },
+      durability: 'memory'
+    };
+  }
+  return outcome === 'rejected'
+    ? { ...evidence, outcome, beforeBasis: { revision: 1 } }
+    : { ...evidence, outcome, beforeBasis: { revision: 1 }, durability: 'unknown' };
+};
+
 const relationUse = (relationId: string) => ({ schemaView, relationId } as const);
 const propertyPlan = (id: string, root: QueryNode) => sealPreparedPlan({ planId: id, rootNodeId: id + ':root', query: root, registryFingerprint: 'registry', authorityFingerprint: 'authority', datasetId: 'dataset' });
 

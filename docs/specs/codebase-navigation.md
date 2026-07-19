@@ -31,7 +31,7 @@ The exact file membership and allowed directions live in
 | Query model/batch | `query/model.ts`, `query/prepare.ts`, `query/internal/evaluator.ts` | reference query semantics |
 | Query incremental | `query/incremental.ts`, `query/internal/maintenance-engine.ts` | retained operator maintenance |
 | Transaction model | `database/transaction.ts`, `transaction.ts`, `relation-delta-authoring.ts` | public operation surface and portable writes |
-| Transaction runtime | `transaction-executor.ts`, `commit-coordinator.ts`, `lifecycle-governance.ts` | stage, reconcile, validate, publish, ledger |
+| Transaction runtime | `transaction-executor.ts`, `commit-coordinator.ts`, `lifecycle-governance.ts`, `non-atomic-batch.ts` | stage, reconcile, validate, publish, ledger, deliberate cross-source sequencing |
 | Attachment runtime | `attachment/preparation.ts`, `attachment/transaction-service.ts` | prepared logical facts plus live transaction bridge |
 | Observer | `observer.ts`, `database.ts`, `external-store.ts` | snapshots, catalogs, generic observation |
 | Database session | `database/query-session.ts`, `database/source-link-graph.ts` | mounts, discovery, settlement, owned close |

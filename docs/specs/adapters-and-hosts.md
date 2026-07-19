@@ -62,6 +62,14 @@ attachment. Live metadata governance would require an explicit authority,
 compatibility, migration, in-flight transaction, and reattachment protocol; it
 must not be added as silent hot reload.
 
+The optional `@tarstate/automerge/repo-lifecycle` topic adapts stable Repo URL
+allocation and exact-ID import to core lifecycle creation receipts. It accepts
+canonical portable bytes, validates the detached Automerge document before the
+mutation boundary, verifies exact imported heads afterward, and claims only
+memory durability. It is creation-only: local eviction and global replicated
+deletion are different semantics, and experimental Repo flush/create APIs are
+not capability evidence. The ordinary database entry does not import Repo.
+
 ## Atomic external-store adapter
 
 The external-store path adapts immutable host snapshots behind synchronous

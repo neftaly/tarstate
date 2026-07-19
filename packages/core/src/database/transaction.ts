@@ -62,6 +62,8 @@ export type DatabaseTransactionSnapshot = {
       readonly insert: string;
     }
   ) => DatabaseTransactionSnapshot;
+  /** Returns an expected, data-dependent rejection without throwing from the transform. */
+  readonly reject: (...issues: readonly [Issue, ...Issue[]]) => DatabaseTransactionSnapshot;
 };
 
 export type DatabaseTransactionTransform = (

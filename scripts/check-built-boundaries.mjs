@@ -75,6 +75,14 @@ try {
     'projection',
     'source-runtime'
   ], automergeDist);
+  assertClosure('repo-lifecycle/index.js', 15_000, [
+    'artifact-resource',
+    'database',
+    'mapped-storage',
+    'metadata',
+    'projection',
+    'source-runtime'
+  ], automergeDist);
   assertClosure('artifact-bundle/index.js', 45_000, [
     'bindings',
     'database-description',

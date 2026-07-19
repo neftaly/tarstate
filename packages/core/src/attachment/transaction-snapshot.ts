@@ -241,6 +241,13 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
     });
   }
 
+  reject(...issues: readonly [Issue, ...Issue[]]): DatabaseTransactionSnapshot {
+    if (!issues.some(({ severity }) => severity === 'error')) {
+      throw new TypeError('Expected transaction rejection requires at least one error issue');
+    }
+    return rejectedSnapshot(this.#context, issues.map(createIssue));
+  }
+
   belongsTo(owner: object): boolean {
     return this.#context.owner === owner;
   }

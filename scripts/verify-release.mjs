@@ -147,6 +147,7 @@ async function verifyPackedRuntime(packages) {
   const dependencies = Object.fromEntries(packages.map(({ manifest, tarball }) => [manifest.name, `file:${tarball}`]));
   dependencies.react = '19.2.7';
   dependencies.zustand = '5.0.14';
+  dependencies['@automerge/automerge-repo'] = '2.5.6';
   writeFileSync(path.join(installation, 'package.json'), JSON.stringify({
     name: 'tarstate-release-consumer',
     private: true,
