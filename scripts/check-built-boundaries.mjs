@@ -67,6 +67,14 @@ try {
     'source-',
     'storage-binding'
   ], automergeDist);
+  assertClosure('view/index.js', 2_200, [
+    'artifact-resource',
+    'database',
+    'mapped-storage',
+    'metadata',
+    'projection',
+    'source-runtime'
+  ], automergeDist);
   assertClosure('artifact-bundle/index.js', 45_000, [
     'bindings',
     'database-description',

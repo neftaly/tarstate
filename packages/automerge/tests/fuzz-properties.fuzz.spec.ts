@@ -2,11 +2,13 @@ import * as Automerge from '@automerge/automerge';
 import fc from 'fast-check';
 import { describe, expect, vi } from 'vitest';
 import { isValidUtf16TextSplice } from '@tarstate/core/transactions';
+import { viewAutomergeDocumentAtBasis } from '../src/view/index.js';
 import {
   AutomergeAtomicSource,
 } from '../src/adapter/atomic-source.js';
 import {
   AutomergeSourceRuntime,
+  automergeBasis,
   exactAutomergeBasisEqual,
   type AutomergeSourceCommitResult
 } from '../src/source/runtime.js';
@@ -558,6 +560,31 @@ describe('Automerge shrinking model properties', () => {
       });
       expect(afterLoad).toMatchObject({ outcome: 'committed', changed: true });
       recreated.close();
+    }
+  ));
+
+  propertyTest('every retained historical head set materializes exactly', fc.property(
+    fc.array(safeString, { maxLength: 16 }),
+    fc.nat(),
+    (values, requestedIndex) => {
+      let current = Automerge.from({ values: [] as string[] }, { actor: '9'.repeat(64) });
+      const history = [current];
+      for (const value of values) {
+        current = Automerge.change(current, (draft) => { draft.values.push(value); });
+        history.push(current);
+      }
+      const requested = history[requestedIndex % history.length]!;
+      const basis = automergeBasis(requested);
+
+      const viewed = viewAutomergeDocumentAtBasis(current, {
+        kind: basis.kind,
+        heads: [...basis.heads].reverse()
+      });
+
+      expect(viewed.success).toBe(true);
+      if (!viewed.success) return;
+      expect(exactAutomergeBasisEqual(automergeBasis(viewed.value), basis)).toBe(true);
+      expect([...viewed.value.values]).toEqual([...requested.values]);
     }
   ));
 });

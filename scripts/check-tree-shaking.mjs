@@ -119,12 +119,17 @@ const cases = [
     maxGzipBytes: 800
   },
   {
+    name: 'Automerge exact-basis document view',
+    source: selectedExport('packages/automerge/dist/view/index.js', 'viewAutomergeDocumentAtBasis'),
+    maxGzipBytes: 2_000
+  },
+  {
     name: 'Automerge database',
     source: selectedExport('packages/automerge/dist/index.js', 'openAutomergeDatabase'),
     // Automerge itself remains external. This covers Tarstate's complete
     // conflict-aware attachment, retained causal publication, transaction,
-    // exact-basis text positions, and observation closure.
-    maxGzipBytes: 71_850
+    // strict exact-basis adoption and text positions, and observation closure.
+    maxGzipBytes: 71_900
   }
 ];
 

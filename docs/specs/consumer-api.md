@@ -126,6 +126,13 @@ resolved result includes a detached UTF-16 offset and the receipt's exact
 `afterBasis`; consumers may then create their own presence cursor at that
 projection boundary.
 
+An Automerge host materializes that projection boundary with the package's
+pure `viewAutomergeDocumentAtBasis(document, basis)` helper. It validates
+portable basis evidence and either returns the exact immutable historical view
+or explicit invalid, unsupported, document-unavailable, or
+basis-unavailable evidence. It performs no fetch, merge, write, subscription,
+or ownership transfer.
+
 `simulate` and `transact` accept the same intent and transform. Simulation
 cannot publish or allocate durable source identity.
 

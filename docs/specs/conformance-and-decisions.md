@@ -19,6 +19,7 @@ changelog.
 | Captured Automerge text reconciliation | conforms for eligible pure splice transactions | real branch/head integration and rejection tests |
 | Cross-publication dependent text | conforms for retained-branch Automerge sources | publication-race integration, unknown suspension, and fuzzed branch ancestry |
 | Text-intent result positions | conforms for mapped Automerge text | exact-basis integration, deletion evidence, bounded capture, and delivery-order fuzzing |
+| Public exact-basis Automerge views | conforms | strict basis adoption, unreachable-history evidence, immutable historical views, and history fuzzing |
 | Candidate validation before reconciled publication | conforms | executor ordering and integration failure cases |
 | Official adapter one-path DX | conforms | `openAutomergeDatabase`, `openExternalStoreDatabase`, package recipes |
 | Topic entrypoints and acyclic core direction | conforms | source and built boundary scripts |

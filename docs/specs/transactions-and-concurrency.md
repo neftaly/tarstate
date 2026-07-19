@@ -112,11 +112,19 @@ unanchored start and end sentinels may coincide at an empty boundary. Presence,
 editor rendering, input methods, undo policy, and transport remain product
 concerns.
 
+The Automerge package exposes one pure historical-view bridge so a host can
+apply a resolved offset to the receipt's exact basis even if its live handle has
+already advanced. The helper accepts a caller-owned immutable document and
+portable basis evidence. Missing history fails closed; the helper never
+substitutes the current document or fetches history.
+
 ## Multiplayer Automerge
 
 Remote users may change the document between any two local async steps. A
 successful local evaluation therefore never implies publication authority.
-Exact head sets provide basis evidence; they are private adapter details.
+Exact head sets provide portable basis evidence. Their validation and native
+historical materialization belong to the Automerge adapter; consumers do not
+parse head representations themselves.
 
 Automerge's ability to merge changes does not remove transaction validation,
 idempotency evidence, or unknown outcomes. CRDT merge resolves data structure

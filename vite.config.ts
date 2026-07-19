@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, type UserConfig } from 'vite';
 import {
+  automergePublicEntryNames,
   coreInternalEntryNames,
   corePublicEntryNames,
   schemaToolsPublicEntryNames,
@@ -52,7 +53,10 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
         entry: {
           index: 'src/index.ts',
           'internal-benchmark': 'src/internal-benchmark.ts',
-          'values/index': 'src/values/index.ts'
+          ...Object.fromEntries(automergePublicEntryNames.map((entryName) => [
+            entryName + '/index',
+            'src/' + entryName + '/index.ts'
+          ]))
         },
         formats: ['es'],
         fileName: (_format, entryName) => entryName + '.js'

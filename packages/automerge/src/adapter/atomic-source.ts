@@ -30,6 +30,7 @@ import {
   runAutomergeCleanups,
   type AutomergeSourceDiagnosticReporter
 } from '../source/diagnostics.js';
+import { adoptAutomergeBasis } from '../shared/basis-adoption.js';
 import {
   findAutomergeFootprintOverlap,
   relateAutomergeFootprints
@@ -390,10 +391,8 @@ const sourceClosedIssue = (sourceId: string): Issue => createIssue({
 });
 
 const parseAutomergeBasis = (value: unknown): AutomergeBasis | undefined => {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const candidate = value as { readonly kind?: unknown; readonly heads?: unknown };
-  if (candidate.kind !== 'automerge-heads' || !Array.isArray(candidate.heads) || candidate.heads.some((head) => typeof head !== 'string')) return undefined;
-  return { kind: 'automerge-heads', heads: [...new Set(candidate.heads as string[])].sort() };
+  const adopted = adoptAutomergeBasis(value);
+  return adopted.success ? adopted.value : undefined;
 };
 
 const noIssues: readonly Issue[] = Object.freeze([]);

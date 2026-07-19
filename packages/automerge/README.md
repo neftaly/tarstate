@@ -7,15 +7,16 @@ projection and conflict guarantees through portable receipts and capabilities.
 
 The package root exposes one standard database API. Low-level Automerge value
 adoption is available without loading the adapter runtime from
-`@tarstate/automerge/values`.
+`@tarstate/automerge/values`. Exact-basis document materialization is available
+from the equally focused `@tarstate/automerge/view` topic.
 
 Install both Tarstate tarballs and the Automerge package imported by application
 code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.6.5.tgz \
-  ./tarstate-automerge-0.6.5.tgz \
+  ./tarstate-core-0.6.6.tgz \
+  ./tarstate-automerge-0.6.6.tgz \
   @automerge/automerge
 ```
 
@@ -26,7 +27,11 @@ prepared, owned, staged, or fast variants; the database optimizes and replays
 this one operation API internally.
 
 ```ts
-import { mappedRelationRows, openAutomergeDatabase } from '@tarstate/automerge';
+import {
+  mappedRelationRows,
+  openAutomergeDatabase
+} from '@tarstate/automerge';
+import { viewAutomergeDocumentAtBasis } from '@tarstate/automerge/view';
 import { relationLiteral, sealSchema } from '@tarstate/core/schema';
 
 type TaskDoc = {
@@ -138,8 +143,14 @@ if (visible.state === 'open' && visible.current.readiness === 'ready') {
     const suffix = await text.publish({ textPositions: [focus] });
     const resolvedFocus = suffix.textPositions[0];
     if (resolvedFocus?.state === 'resolved') {
-      // Feed the detached offset and exact basis into product-owned presence.
-      void { index: resolvedFocus.index, basis: resolvedFocus.basis };
+      const viewed = viewAutomergeDocumentAtBasis(
+        handle.doc(),
+        resolvedFocus.basis
+      );
+      if (viewed.success) {
+        // Create product-owned native presence against this exact document.
+        void { document: viewed.value, index: resolvedFocus.index };
+      }
     }
     text.close();
   }
@@ -182,6 +193,14 @@ cursors remain adapter-private. Results expose detached UTF-16 offsets at the
 receipt's exact committed basis, or explicit non-resolution evidence. Affinity
 controls movement after referenced-character deletion; start/end sentinel
 positions can coincide at an empty string boundary.
+
+`viewAutomergeDocumentAtBasis(document, basis)` is the pure host-side bridge
+from detached exact-basis evidence back to an immutable Automerge view. It
+strictly adopts canonical unique heads and fails explicitly when the document
+is unavailable or no longer contains the requested history. It never writes,
+fetches, merges, subscribes, or transfers handle ownership. Native documents
+and cursors remain host-local and must not cross portable application
+boundaries.
 
 A document whose root is one logical entity needs no artificial array or
 object-map wrapper. Its storage mapping uses an explicit singleton and literal

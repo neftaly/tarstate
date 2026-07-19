@@ -38,7 +38,7 @@ export const corePublicEntryNames = [
 ] as const;
 
 /** Narrow public Automerge entries in addition to the package root. */
-export const automergePublicEntryNames = ['values'] as const;
+export const automergePublicEntryNames = ['values', 'view'] as const;
 
 /** Runtime-safe schema-tools entries that exclude offline compilation. */
 export const schemaToolsPublicEntryNames = ['artifact-bundle'] as const;
@@ -56,7 +56,11 @@ export const sourceAliasesFor = (repoRoot: string) => [
   )),
   sourceAlias(repoRoot, '@tarstate/schema-tools', 'packages/schema-tools/src/index.ts'),
   sourceAlias(repoRoot, '@tarstate/react', 'packages/react/src/index.ts'),
-  sourceAlias(repoRoot, '@tarstate/automerge/values', 'packages/automerge/src/values/index.ts'),
+  ...automergePublicEntryNames.map((entryName) => sourceAlias(
+    repoRoot,
+    '@tarstate/automerge/' + entryName,
+    'packages/automerge/src/' + entryName + '/index.ts'
+  )),
   sourceAlias(repoRoot, '@tarstate/automerge', 'packages/automerge/src/index.ts'),
   sourceAlias(repoRoot, '@tarstate/zustand', 'packages/zustand/src/index.ts'),
   ...[...corePublicEntryNames]

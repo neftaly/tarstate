@@ -26,6 +26,7 @@ import {
   exactAutomergeBasisEqual,
   type AutomergeBasis
 } from '../source/runtime.js';
+import { adoptAutomergeBasis } from '../shared/basis-adoption.js';
 
 export { automergeMetadataProperty, isAutomergeReservedRootProperty } from './reserved-properties.js';
 
@@ -409,8 +410,8 @@ const metadataIssue = (code: `automerge.${string}`, sourceId?: string, details?:
 };
 
 const parseAutomergeBasis = (value: unknown): AutomergeBasis | undefined => {
-  if (!isRecord(value) || value.kind !== 'automerge-heads' || !Array.isArray(value.heads) || value.heads.some((head) => typeof head !== 'string')) return undefined;
-  return { kind: 'automerge-heads', heads: [...new Set(value.heads as string[])].sort() };
+  const adopted = adoptAutomergeBasis(value);
+  return adopted.success ? adopted.value : undefined;
 };
 
 const samePortableSet = (left: readonly GovernanceSection[], right: readonly GovernanceSection[]): boolean => {

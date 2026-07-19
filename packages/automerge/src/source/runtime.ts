@@ -7,13 +7,18 @@ import {
   runAutomergeCleanups,
   type AutomergeSourceDiagnosticReporter
 } from './diagnostics.js';
+import {
+  automergeBasis,
+  exactAutomergeBasisEqual,
+  type AutomergeBasis
+} from './basis.js';
+export {
+  automergeBasis,
+  exactAutomergeBasisEqual,
+  exactAutomergeHeadsEqual,
+  type AutomergeBasis
+} from './basis.js';
 export type { AutomergeSourceDiagnostic, AutomergeSourceDiagnosticReporter } from './diagnostics.js';
-
-/** Exact, order-insensitive Automerge head set used for optimistic concurrency. */
-export type AutomergeBasis = {
-  readonly kind: 'automerge-heads';
-  readonly heads: readonly string[];
-};
 
 export type AutomergeSnapshot<T extends object> = {
   readonly sourceId: string;
@@ -96,40 +101,8 @@ type AutomergeReconciledCommitInput<T extends object> = {
   readonly candidate: Automerge.Doc<T>;
 };
 
-/** Captures the document's current exact-head basis. */
-export const automergeBasis = (doc: Automerge.Doc<unknown>): AutomergeBasis => Object.freeze({
-  kind: 'automerge-heads',
-  heads: Object.freeze([...Automerge.getHeads(doc)].sort())
-});
-
 const automergeSnapshot = <T extends object>(sourceId: string, basis: AutomergeBasis, storage: Automerge.Doc<T>): AutomergeSnapshot<T> =>
   Object.freeze({ sourceId, basis, storage });
-
-export const exactAutomergeHeadsEqual = (left: readonly string[], right: readonly string[]): boolean => {
-  if (left.length !== right.length) return false;
-  if (isSorted(left) && isSorted(right)) {
-    for (let index = 0; index < left.length; index += 1) {
-      if (left[index] !== right[index]) return false;
-    }
-    return true;
-  }
-  const sortedLeft = [...left].sort();
-  const sortedRight = [...right].sort();
-  for (let index = 0; index < sortedLeft.length; index += 1) {
-    if (sortedLeft[index] !== sortedRight[index]) return false;
-  }
-  return true;
-};
-
-const isSorted = (values: readonly string[]): boolean => {
-  for (let index = 1; index < values.length; index += 1) {
-    if ((values[index - 1] as string) > (values[index] as string)) return false;
-  }
-  return true;
-};
-
-export const exactAutomergeBasisEqual = (left: AutomergeBasis, right: AutomergeBasis): boolean =>
-  left.kind === 'automerge-heads' && right.kind === 'automerge-heads' && exactAutomergeHeadsEqual(left.heads, right.heads);
 
 /** Minimal Automerge Repo handle surface consumed by the source runtime. */
 export type AutomergeRepoHandle<T extends object, Heads = unknown> = {
