@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/core",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "private": true,
   "description": "Portable relational semantics and source protocols for Tarstate",
   "license": "MIT",
