@@ -5,6 +5,10 @@ architectural boundaries. Package READMEs remain recipes. Types, tests, and
 fitness scripts remain executable evidence. Point-in-time findings and
 proposals are not specifications.
 
+Non-normative investigations live separately under
+[`docs/research`](../research/README.md). They may inform a future contract but
+do not change the behavior specified here.
+
 Tarstate turns portable relational descriptions and host-owned state into
 typed queries, incremental observations, and replayable logical mutations. It
 does not own application operations, product policy, persistence, transport,
