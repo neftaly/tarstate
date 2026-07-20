@@ -124,6 +124,10 @@ Read:
 - document metadata/value modules for boundary changes
 - Automerge database, source-runtime, mapping, and fuzz tests
 
+For normalized Repo/network observations, start instead at
+`system-relations.ts` for deterministic state and `system-database/open.ts` for
+the read-only mount/query lifecycle. Repo event wiring remains outside both.
+
 Use actual Automerge branches/heads for concurrency evidence. Do not infer CRDT
 behavior from an immutable-memory adapter.
 

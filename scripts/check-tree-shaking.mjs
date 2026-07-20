@@ -122,6 +122,14 @@ const cases = [
     maxGzipBytes: 4_800
   },
   {
+    name: 'Automerge system database',
+    source: selectedExport(
+      'packages/automerge/dist/system-database/index.js',
+      'openAutomergeSystemDatabase'
+    ),
+    maxGzipBytes: 13_000
+  },
+  {
     name: 'Automerge mapped relation row selector',
     source: selectedExport('packages/automerge/dist/index.js', 'mappedRelationRows'),
     maxGzipBytes: 800

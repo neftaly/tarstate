@@ -70,6 +70,14 @@ memory durability. It is creation-only: local eviction and global replicated
 deletion are different semantics, and experimental Repo flush/create APIs are
 not capability evidence. The ordinary database entry does not import Repo.
 
+The independent `@tarstate/automerge/system-database` topic adopts typed
+host-supplied peer, connection, relative-sync, conflict, and presence facts. It
+normalizes them into a read-only mountable database without owning Repo or
+inferring global online/synchronized state. Equal-time fact delivery is
+deterministic; remote heads alone remain `observed`. Authority applies to the
+whole attachment, so hosts needing different visibility scopes create separate
+system databases and feed each only authorized facts.
+
 ## Atomic external-store adapter
 
 The external-store path adapts immutable host snapshots behind synchronous

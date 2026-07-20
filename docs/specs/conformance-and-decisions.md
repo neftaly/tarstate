@@ -157,6 +157,7 @@ profiles rather than threshold tuning.
 | Route non-Automerge sources through Automerge | rejected: dependency and false semantics; share the source-neutral protocol instead |
 | Remove transaction/idempotency evidence because Automerge merges | rejected: merge does not prove targets, constraints, authority, or outcome |
 | Expose Automerge heads/changes/staging | rejected for ordinary consumers |
+| Emulate Automerge object move through private ordering metadata | rejected: neither a physical identity-preserving move nor representation-free logical ordering |
 | Generic universal adapter or state-machine framework | rejected: optional capability and authority coupling |
 | Custom public array wrappers for O(1) slicing | rejected without demonstrated end-to-end need |
 | Automatic live metadata hot reload | rejected until governance semantics exist |

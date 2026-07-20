@@ -10,15 +10,17 @@ adoption is available without loading the adapter runtime from
 `@tarstate/automerge/values`. Exact-basis document materialization is available
 from the equally focused `@tarstate/automerge/view` topic. Source creation with
 Automerge Repo lifecycle receipts is an optional
-`@tarstate/automerge/repo-lifecycle` topic.
+`@tarstate/automerge/repo-lifecycle` topic. Normalized host observations such
+as relative synchronization and presence are an independent, read-only
+`@tarstate/automerge/system-database` topic.
 
 Install both Tarstate tarballs and the Automerge package imported by application
 code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.6.9.tgz \
-  ./tarstate-automerge-0.6.9.tgz \
+  ./tarstate-core-0.7.0.tgz \
+  ./tarstate-automerge-0.7.0.tgz \
   @automerge/automerge
 ```
 
@@ -380,8 +382,64 @@ receipt. Deletion and experimental Repo persistence APIs remain unsupported.
 System-relation events record observations without inferring stronger network
 facts. In particular, `remote-heads-observed` produces sync state `observed`,
 not `synced`; the host must supply an explicit `sync-state` event for lifecycle
-claims. Contradictory facts with the same `observedAt` are rejected rather than
-resolved by arrival order.
+claims. Equal-time facts normalize deterministically rather than allowing
+arrival order to choose the public state.
+`conflicts-replaced` is deliberately different: it replaces one host-observed
+conflict snapshot and must be supplied in the source's observation order.
+
+The optional system database turns those normalized facts into an ordinary
+mountable Tarstate source without taking ownership of Automerge Repo:
+
+```ts
+import { openAutomergeSystemDatabase } from '@tarstate/automerge/system-database';
+import { openDatabaseQuery } from '@tarstate/core/database/session';
+import {
+  prepareTypedQuery,
+  typedFrom,
+  typedSelect
+} from '@tarstate/core/query';
+
+const system = await openAutomergeSystemDatabase({
+  attachmentId: 'workspace-system',
+  authorityScope: 'workspace'
+});
+const syncQuery = typedFrom(system.relations.sync, 'sync');
+const syncPlan = await prepareTypedQuery(
+  typedSelect(syncQuery, 'result', ({ sync }) => ({
+    documentId: sync.row.documentId,
+    state: sync.row.state
+  })),
+  {
+    registryFingerprint,
+    authorityFingerprint,
+    datasetId
+  }
+);
+const syncSession = await openDatabaseQuery({
+  sources: [{ source: system }],
+  plan: syncPlan,
+  queryAuthorityScope: 'workspace'
+});
+
+// Repo/network adapters remain host-owned and report only facts they observe.
+system.observe({
+  kind: 'sync-state',
+  documentId,
+  storageId,
+  state: 'syncing',
+  observedAt: Date.now()
+});
+
+syncSession.close();
+system.close();
+```
+
+`observe` is a typed host port, not an arbitrary JSON ingestion API. Its values
+are nevertheless bounded, copied, and validated at runtime before entering the
+normalizer. Query projection materializes only demanded system relations and
+fields. Authority remains attached to the whole system database; hosts that
+need different visibility scopes open separate databases and feed each only
+the facts authorized for that scope.
 
 ## Replaying fuzz failures
 

@@ -38,7 +38,12 @@ export const corePublicEntryNames = [
 ] as const;
 
 /** Narrow public Automerge entries in addition to the package root. */
-export const automergePublicEntryNames = ['repo-lifecycle', 'values', 'view'] as const;
+export const automergePublicEntryNames = [
+  'repo-lifecycle',
+  'system-database',
+  'values',
+  'view'
+] as const;
 
 /** Runtime-safe schema-tools entries that exclude offline compilation. */
 export const schemaToolsPublicEntryNames = ['artifact-bundle'] as const;

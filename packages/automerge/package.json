@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/automerge",
-  "version": "0.6.9",
+  "version": "0.7.0",
   "private": true,
   "description": "Automerge source and storage bindings for Tarstate",
   "license": "MIT",
@@ -19,6 +19,10 @@
     "./repo-lifecycle": {
       "types": "./dist/repo-lifecycle/index.d.ts",
       "import": "./dist/repo-lifecycle/index.js"
+    },
+    "./system-database": {
+      "types": "./dist/system-database/index.d.ts",
+      "import": "./dist/system-database/index.js"
     },
     "./view": {
       "types": "./dist/view/index.d.ts",
