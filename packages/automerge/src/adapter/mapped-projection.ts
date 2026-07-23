@@ -13,7 +13,9 @@ export const mappedReadEntries = (
   valuePaths: readonly AutomergePath[]
 ): readonly AutomergePathFootprintEntry[] => {
   const collectionPath = mapping.collection.path as AutomergePath;
-  if (mapping.collection.kind === 'object-map' || mapping.collection.kind === 'array') {
+  if (mapping.collection.kind === 'object-map'
+    || mapping.collection.kind === 'array'
+    || mapping.collection.kind === 'recursive-array') {
     return Object.freeze([{ scope: 'subtree', path: collectionPath }]);
   }
   const entries: AutomergePathFootprintEntry[] = [{ scope: 'exact', path: collectionPath }];
@@ -30,7 +32,9 @@ export const mappedReadEntries = (
 export const mappedWriteEntries = (
   mapping: RelationStorageMapping
 ): readonly AutomergePathFootprintEntry[] => {
-  if (mapping.collection.kind === 'object-map' || mapping.collection.kind === 'array') {
+  if (mapping.collection.kind === 'object-map'
+    || mapping.collection.kind === 'array'
+    || mapping.collection.kind === 'recursive-array') {
     return [{ scope: 'subtree', path: mapping.collection.path as AutomergePath }];
   }
   return Object.values(mapping.fields).flatMap((field) => field.kind !== 'absent'
@@ -73,6 +77,15 @@ export const locateProjectedCandidate = (
       candidate: collection[locator.index],
       path: [...collectionPath, locator.index] as AutomergePath
     };
+  }
+  if (mapping.collection.kind === 'recursive-array') {
+    if (locator.kind !== 'recursive-array-position') {
+      return { issue: 'mapping.locator_invalid' };
+    }
+    const path = [...locator.collectionPath, locator.index] as AutomergePath;
+    const candidate = valueAtAutomergePath(doc, path);
+    if (candidate === undefined) return { issue: 'mapping.locator_invalid' };
+    return { candidate, path };
   }
   if (mapping.collection.kind !== 'object-map' || locator.kind !== 'object-map-key') {
     return { issue: 'mapping.locator_invalid' };

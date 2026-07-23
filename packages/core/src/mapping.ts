@@ -4,6 +4,12 @@ import { createIssue, type CapabilityRef, type Issue, type ParseResult } from '.
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { samePortableJson } from './internal-json-equality.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
+import {
+  inspectDataArray,
+  readDataPath,
+  traverseRecursiveArray,
+  type RecursiveArrayProblem
+} from './internal-recursive-array.js';
 import { assertCompiledStorageMapping, assertPreparedSchema, sealCompiledStorageMapping } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
@@ -11,10 +17,21 @@ import { parseProjectedRelationCandidates, parseRelationCandidates, parseScalarV
 import type { PortableValue } from './value.js';
 
 export type StoragePath = readonly (string | number)[];
+export type RecursiveArrayCollectionMapping = {
+  readonly kind: 'recursive-array';
+  readonly path: StoragePath;
+  readonly descendants: StoragePath;
+  readonly absent: 'empty' | 'invalid';
+  /** Root elements have depth zero. */
+  readonly maxDepth: number;
+  readonly maxRows: number;
+  readonly maxTraversalSteps: number;
+};
 export type CollectionMapping =
   | { readonly kind: 'object-map'; readonly path: StoragePath; readonly absent: 'empty' | 'creatable' | 'invalid' }
   | { readonly kind: 'array'; readonly path: StoragePath; readonly absent: 'empty' | 'creatable' | 'invalid' }
-  | { readonly kind: 'singleton'; readonly path: StoragePath; readonly absent: 'empty' | 'invalid' };
+  | { readonly kind: 'singleton'; readonly path: StoragePath; readonly absent: 'empty' | 'invalid' }
+  | RecursiveArrayCollectionMapping;
 export type KeyMapping =
   | { readonly kind: 'map-key'; readonly mirrorPath?: StoragePath; readonly onMismatch: 'reject' }
   | { readonly kind: 'field'; readonly path: StoragePath }
@@ -22,7 +39,10 @@ export type KeyMapping =
   | { readonly kind: 'literal'; readonly value: PortableValue };
 export type SourceMetadataMapping = {
   readonly kind: 'source-metadata';
-  readonly value: 'collection-position' | 'collection-element-identity';
+  readonly value:
+    | 'collection-position'
+    | 'collection-element-identity'
+    | 'recursive-parent-element-identity';
 };
 export type StoredFieldWriteMapping = {
   readonly replace?: CapabilityRef;
@@ -70,6 +90,13 @@ export type CompiledStorageMapping = {
 export type MappingLocator =
   | { readonly kind: 'object-map-key'; readonly key: string }
   | { readonly kind: 'array-position'; readonly index: number; readonly durable: false }
+  | {
+      readonly kind: 'recursive-array-position';
+      readonly collectionPath: StoragePath;
+      readonly index: number;
+      readonly depth: number;
+      readonly durable: false;
+    }
   | { readonly kind: 'singleton' };
 
 export type BoundRow = ParsedCandidate & { readonly locator: MappingLocator };
@@ -98,8 +125,11 @@ export type StorageScalarCodecInput = {
 export type StorageScalarDecoder = (input: StorageScalarCodecInput) => ParseResult<unknown>;
 
 export type SourceMetadataResolverInput = {
-  readonly value: 'collection-element-identity';
+  readonly value:
+    | 'collection-element-identity'
+    | 'recursive-parent-element-identity';
   readonly candidate: unknown;
+  readonly parentCandidate?: unknown;
   readonly locator: MappingLocator;
   readonly relationId: RelationId;
   readonly field: string;
@@ -169,7 +199,7 @@ export const compileStorageMapping = (
         || (keyMapping.kind === 'map-key' && mapping.collection.kind !== 'object-map')
         || (keyMapping.kind === 'literal' && mapping.collection.kind !== 'singleton')
         || (keyMapping.kind === 'source-metadata'
-          && keyMapping.value === 'collection-position')) {
+          && keyMapping.value !== 'collection-element-identity')) {
         issues.push(mappingIssue('mapping.key_invalid', [...path, 'keys', field]));
       }
     }
@@ -184,10 +214,21 @@ export const compileStorageMapping = (
         }));
       } else if (fieldMapping.kind === 'source-metadata'
         && fieldMapping.value === 'collection-position'
-        && mapping.collection.kind !== 'array') {
+        && mapping.collection.kind !== 'array'
+        && mapping.collection.kind !== 'recursive-array') {
         issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field], {
           field,
           reason: 'collection_position_requires_array'
+        }));
+      } else if (fieldMapping.kind === 'source-metadata'
+        && fieldMapping.value === 'recursive-parent-element-identity'
+        && (mapping.collection.kind !== 'recursive-array'
+          || declaration.nullable !== true)) {
+        issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field], {
+          field,
+          reason: mapping.collection.kind !== 'recursive-array'
+            ? 'recursive_parent_requires_recursive_array'
+            : 'recursive_parent_requires_nullable_field'
         }));
       } else if (fieldMapping.kind !== 'absent'
         && fieldMapping.kind !== 'source-metadata'
@@ -382,10 +423,16 @@ const planStorageIntentDetails = (
   };
 };
 
-type ExtractedCandidate = { readonly candidate: unknown; readonly locator: MappingLocator; readonly storageKey?: string; readonly absolutePath: StoragePath };
+type ExtractedCandidate = {
+  readonly candidate: unknown;
+  readonly parentCandidate?: unknown;
+  readonly locator: MappingLocator;
+  readonly storageKey?: string;
+  readonly absolutePath: StoragePath;
+};
 
 const extractCandidates = (snapshot: unknown, collection: CollectionMapping, relationId: RelationId, sourceId?: string): { candidates: readonly ExtractedCandidate[]; issues: readonly Issue[]; complete: boolean } => {
-  const resolved = readPath(snapshot, collection.path);
+  const resolved = readDataPath(snapshot, collection.path);
   if (!resolved.present) {
     if (resolved.reason === 'inspection_failed') return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: resolved.reason, error: resolved.error }, undefined, sourceId, relationId)], complete: false };
     if (collection.absent === 'empty' || collection.absent === 'creatable') return { candidates: [], issues: [], complete: true };
@@ -400,22 +447,52 @@ const extractCandidates = (snapshot: unknown, collection: CollectionMapping, rel
   }
   if (collection.kind === 'array') {
     if (!Array.isArray(resolved.value)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { expected: 'array' }, undefined, sourceId, relationId)], complete: false };
-    try {
-      const descriptors = Object.getOwnPropertyDescriptors(resolved.value);
-      const length = (descriptors as unknown as Record<string, PropertyDescriptor>).length?.value;
-      if (!Number.isSafeInteger(length) || (length as number) < 0) {
-        return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: 'length' }, undefined, sourceId, relationId)], complete: false };
-      }
-      const candidates: ExtractedCandidate[] = [];
-      for (let index = 0; index < (length as number); index += 1) {
-        const descriptor = descriptors[index];
-        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', [...collection.path, index], { reason: 'descriptor' }, undefined, sourceId, relationId)], complete: false };
-        candidates.push({ candidate: descriptor.value, locator: { kind: 'array-position', index, durable: false }, absolutePath: [...collection.path, index] });
-      }
-      return { candidates, issues: [], complete: true };
-    } catch (error) {
-      return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: 'inspection_threw', error: error instanceof Error ? error.name : typeof error }, undefined, sourceId, relationId)], complete: false };
+    const inspected = inspectDataArray(resolved.value, collection.path);
+    if (!inspected.success) {
+      return {
+        candidates: [],
+        issues: [mappingIssue(
+          'mapping.collection_invalid',
+          inspected.path,
+          inspected.details,
+          undefined,
+          sourceId,
+          relationId
+        )],
+        complete: false
+      };
     }
+    return {
+      candidates: inspected.values.map((candidate, index) => ({
+        candidate,
+        locator: { kind: 'array-position', index, durable: false },
+        absolutePath: [...collection.path, index]
+      })),
+      issues: [],
+      complete: true
+    };
+  }
+  if (collection.kind === 'recursive-array') {
+    if (!Array.isArray(resolved.value)) {
+      return {
+        candidates: [],
+        issues: [mappingIssue(
+          'mapping.collection_invalid',
+          collection.path,
+          { expected: 'array' },
+          undefined,
+          sourceId,
+          relationId
+        )],
+        complete: false
+      };
+    }
+    return extractRecursiveArrayCandidates(
+      resolved.value,
+      collection,
+      relationId,
+      sourceId
+    );
   }
   if (!isRecord(resolved.value)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { expected: 'object-map' }, undefined, sourceId, relationId)], complete: false };
   try {
@@ -432,6 +509,79 @@ const extractCandidates = (snapshot: unknown, collection: CollectionMapping, rel
   }
 };
 
+const extractRecursiveArrayCandidates = (
+  root: readonly unknown[],
+  collection: RecursiveArrayCollectionMapping,
+  relationId: RelationId,
+  sourceId?: string
+): {
+  readonly candidates: readonly ExtractedCandidate[];
+  readonly issues: readonly Issue[];
+  readonly complete: boolean;
+} => {
+  const traversed = traverseRecursiveArray(root, collection);
+  return {
+    candidates: traversed.occurrences,
+    issues: traversed.problems.map((problem) => mappingIssue(
+      recursiveProblemCode(problem),
+      problem.path,
+      problem.code === 'collection-absent'
+        ? { ...problem.details, relationId }
+        : problem.details,
+      undefined,
+      sourceId,
+      relationId
+    )),
+    complete: traversed.complete
+  };
+};
+
+const recursiveProblemCode = (problem: RecursiveArrayProblem): string => {
+  switch (problem.code) {
+    case 'collection-absent':
+      return 'mapping.collection_absent';
+    case 'collection-invalid':
+      return 'mapping.collection_invalid';
+    case 'recursive-limit-exceeded':
+      return 'mapping.recursive_limit_exceeded';
+    case 'recursive-not-tree':
+      return 'mapping.recursive_not_tree';
+  }
+};
+
+const isRecursiveLocatorFor = (
+  collection: RecursiveArrayCollectionMapping,
+  locator: Extract<MappingLocator, {
+    readonly kind: 'recursive-array-position';
+  }>
+): boolean => {
+  if (!isStoragePath(locator.collectionPath)
+    || !Number.isSafeInteger(locator.index)
+    || locator.index < 0
+    || !Number.isSafeInteger(locator.depth)
+    || locator.depth < 0
+    || locator.depth > collection.maxDepth
+    || locator.collectionPath.length
+      !== collection.path.length
+        + locator.depth * (collection.descendants.length + 1)) {
+    return false;
+  }
+  for (let index = 0; index < collection.path.length; index += 1) {
+    if (locator.collectionPath[index] !== collection.path[index]) return false;
+  }
+  let offset = collection.path.length;
+  for (let depth = 0; depth < locator.depth; depth += 1) {
+    const parentIndex = locator.collectionPath[offset];
+    if (typeof parentIndex !== 'number') return false;
+    offset += 1;
+    for (const part of collection.descendants) {
+      if (locator.collectionPath[offset] !== part) return false;
+      offset += 1;
+    }
+  }
+  return true;
+};
+
 const projectCandidate = (
   candidate: ExtractedCandidate,
   compiled: { readonly relation: PreparedRelation; readonly mapping: RelationStorageMapping },
@@ -446,7 +596,7 @@ const projectCandidate = (
     if (keyMapping.kind === 'map-key') {
       const storageKey = candidate.storageKey as string;
       if (keyMapping.mirrorPath !== undefined) {
-        const mirror = readPath(candidate.candidate, keyMapping.mirrorPath);
+        const mirror = readDataPath(candidate.candidate, keyMapping.mirrorPath);
         if (!mirror.present && mirror.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.mirrorPath], { reason: mirror.reason, error: mirror.error, locator: candidate.locator }, options.sourceId, relationId);
         if (!mirror.present || !samePortableJson(mirror.value, storageKey)) return mappingFailure('mapping.map_key_mismatch', [...candidate.absolutePath, ...keyMapping.mirrorPath], { field, mapKey: storageKey, mirror: mirror.present ? mirror.value : 'missing', locator: candidate.locator }, options.sourceId, relationId, 'manual_repair');
       }
@@ -458,7 +608,7 @@ const projectCandidate = (
       if (!projected.success) return projected;
       output[field] = projected.value as PortableValue;
     } else {
-      const value = readPath(candidate.candidate, keyMapping.path);
+      const value = readDataPath(candidate.candidate, keyMapping.path);
       const path = [...candidate.absolutePath, ...keyMapping.path];
       if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', path, { reason: value.reason, error: value.error, locator: candidate.locator }, options.sourceId, relationId);
       if (value.present) {
@@ -477,7 +627,7 @@ const projectCandidate = (
       output[field] = projected.value as PortableValue;
       continue;
     }
-    const value = readPath(candidate.candidate, fieldMapping.path);
+    const value = readDataPath(candidate.candidate, fieldMapping.path);
     const path = [...candidate.absolutePath, ...fieldMapping.path];
     if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', path, { reason: value.reason, error: value.error, locator: candidate.locator }, options.sourceId, relationId);
     if (value.present) {
@@ -499,13 +649,17 @@ const projectSourceMetadata = (
 ): ParseResult<unknown> => {
   let value: unknown;
   if (mapping.value === 'collection-position') {
-    if (candidate.locator.kind !== 'array-position') {
+    if (candidate.locator.kind !== 'array-position'
+      && candidate.locator.kind !== 'recursive-array-position') {
       return mappingFailure('mapping.source_metadata_unavailable', candidate.absolutePath, {
         field,
         value: mapping.value
       }, options.sourceId, relationId);
     }
     value = candidate.locator.index;
+  } else if (mapping.value === 'recursive-parent-element-identity'
+    && candidate.parentCandidate === undefined) {
+    value = null;
   } else {
     if (options.sourceMetadata === undefined) {
       return mappingFailure('mapping.source_metadata_unavailable', candidate.absolutePath, {
@@ -517,6 +671,9 @@ const projectSourceMetadata = (
       value = options.sourceMetadata({
         value: mapping.value,
         candidate: candidate.candidate,
+        ...(candidate.parentCandidate === undefined
+          ? {}
+          : { parentCandidate: candidate.parentCandidate }),
         locator: candidate.locator,
         relationId,
         field,
@@ -550,20 +707,44 @@ const projectSourceMetadata = (
 const locateCandidate = (snapshot: unknown, collection: CollectionMapping, locator: MappingLocator): ParseResult<{ candidate: unknown; absolutePath: StoragePath }> => {
   if (collection.kind === 'singleton') {
     if (locator.kind !== 'singleton') return mappingFailure('mapping.locator_invalid', collection.path);
-    const found = readPath(snapshot, collection.path);
+    const found = readDataPath(snapshot, collection.path);
     if (found.present) return { success: true, value: { candidate: found.value, absolutePath: collection.path }, issues: [] };
     return found.reason === 'inspection_failed'
       ? mappingFailure('mapping.locator_invalid', collection.path, { reason: found.reason, error: found.error })
       : mappingFailure('mapping.locator_stale', collection.path);
   }
+  if (collection.kind === 'recursive-array') {
+    if (locator.kind !== 'recursive-array-position'
+      || !isRecursiveLocatorFor(collection, locator)) {
+      return mappingFailure('mapping.locator_invalid', collection.path);
+    }
+    const absolutePath = [...locator.collectionPath, locator.index];
+    const found = readDataPath(snapshot, absolutePath);
+    if (found.present) {
+      return {
+        success: true,
+        value: { candidate: found.value, absolutePath },
+        issues: []
+      };
+    }
+    return found.reason === 'inspection_failed'
+      ? mappingFailure('mapping.locator_invalid', absolutePath, {
+          reason: found.reason,
+          error: found.error
+        })
+      : mappingFailure('mapping.locator_stale', absolutePath);
+  }
   if ((collection.kind === 'object-map' && locator.kind !== 'object-map-key')
     || (collection.kind === 'array' && locator.kind !== 'array-position')) {
     return mappingFailure('mapping.locator_invalid', collection.path);
   }
-  if (locator.kind === 'singleton') return mappingFailure('mapping.locator_invalid', collection.path);
+  if (locator.kind === 'singleton'
+    || locator.kind === 'recursive-array-position') {
+    return mappingFailure('mapping.locator_invalid', collection.path);
+  }
   const member = locator.kind === 'object-map-key' ? locator.key : locator.index;
   const absolutePath = [...collection.path, member];
-  const found = readPath(snapshot, absolutePath);
+  const found = readDataPath(snapshot, absolutePath);
   if (found.present) return { success: true, value: { candidate: found.value, absolutePath }, issues: [] };
   return found.reason === 'inspection_failed'
     ? mappingFailure('mapping.locator_invalid', absolutePath, { reason: found.reason, error: found.error })
@@ -614,26 +795,6 @@ const mappedValuePaths = (mapping: RelationStorageMapping): readonly StoragePath
     if (isFieldMapping(field) && field.kind !== 'absent' && field.kind !== 'source-metadata') paths.push(field.path);
   }
   return Object.freeze(paths);
-};
-
-type PathRead =
-  | { readonly present: true; readonly value: unknown }
-  | { readonly present: false; readonly reason: 'absent' }
-  | { readonly present: false; readonly reason: 'inspection_failed'; readonly error: string };
-
-const readPath = (root: unknown, path: StoragePath): PathRead => {
-  let value = root;
-  try {
-    for (const member of path) {
-      if ((typeof member === 'number' && !Array.isArray(value)) || (typeof member === 'string' && !isRecord(value)) || !Object.hasOwn(value as object, member)) return { present: false, reason: 'absent' };
-      const descriptor = Object.getOwnPropertyDescriptor(value as object, member);
-      if (descriptor === undefined || !('value' in descriptor)) return { present: false, reason: 'absent' };
-      value = descriptor.value;
-    }
-    return { present: true, value };
-  } catch (error) {
-    return { present: false, reason: 'inspection_failed', error: error instanceof Error ? error.name : typeof error };
-  }
 };
 
 const setPath = (root: unknown, path: StoragePath, value: unknown): ParseResult<unknown> => {
@@ -696,12 +857,30 @@ const sameRef = (value: unknown, expected: ArtifactRef): boolean => isRecord(val
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
 const isRelationMapping = (value: unknown): value is RelationStorageMapping => isRecord(value) && hasOnlyKeys(value, ['collection', 'keys', 'fields']) && isCollectionMapping(value.collection) && isRecord(value.keys) && isRecord(value.fields);
 const isCollectionMapping = (value: unknown): value is CollectionMapping => isRecord(value)
-  && hasOnlyKeys(value, ['kind', 'path', 'absent'])
   && isStoragePath(value.path)
-  && (value.kind === 'singleton'
-    ? value.absent === 'empty' || value.absent === 'invalid'
-    : (value.kind === 'object-map' || value.kind === 'array')
-      && (value.absent === 'empty' || value.absent === 'creatable' || value.absent === 'invalid'));
+  && (value.kind === 'recursive-array'
+    ? hasOnlyKeys(value, [
+        'kind',
+        'path',
+        'descendants',
+        'absent',
+        'maxDepth',
+        'maxRows',
+        'maxTraversalSteps'
+      ])
+      && isStoragePath(value.descendants)
+      && value.descendants.length > 0
+      && (value.absent === 'empty' || value.absent === 'invalid')
+      && isNonNegativeSafeInteger(value.maxDepth)
+      && isPositiveSafeInteger(value.maxRows)
+      && isPositiveSafeInteger(value.maxTraversalSteps)
+    : hasOnlyKeys(value, ['kind', 'path', 'absent'])
+      && (value.kind === 'singleton'
+        ? value.absent === 'empty' || value.absent === 'invalid'
+        : (value.kind === 'object-map' || value.kind === 'array')
+          && (value.absent === 'empty'
+            || value.absent === 'creatable'
+            || value.absent === 'invalid')));
 const isKeyMapping = (value: unknown): value is KeyMapping => isRecord(value) && (
   (value.kind === 'map-key' && hasOnlyKeys(value, ['kind', 'mirrorPath', 'onMismatch']) && (value.mirrorPath === undefined || isStoragePath(value.mirrorPath)) && value.onMismatch === 'reject')
   || (value.kind === 'field' && hasOnlyKeys(value, ['kind', 'path']) && isStoragePath(value.path))
@@ -722,8 +901,14 @@ const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value
 const isSourceMetadataMapping = (value: Readonly<Record<string, unknown>>): value is SourceMetadataMapping =>
   value.kind === 'source-metadata'
   && hasOnlyKeys(value, ['kind', 'value'])
-  && (value.value === 'collection-position' || value.value === 'collection-element-identity');
+  && (value.value === 'collection-position'
+    || value.value === 'collection-element-identity'
+    || value.value === 'recursive-parent-element-identity');
 const isStoragePath = (value: unknown): value is StoragePath => Array.isArray(value) && value.every((member) => (typeof member === 'string' && member.length > 0) || (typeof member === 'number' && Number.isSafeInteger(member) && member >= 0));
+const isNonNegativeSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const isPositiveSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && isContentHash(value.contractHash);
 const hasOnlyKeys = (value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean => Object.keys(value).every((key) => allowed.includes(key));
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);

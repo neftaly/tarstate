@@ -87,6 +87,7 @@ assignArchitectureGroup('source-contract', [
 assignArchitectureGroup('schema', [
   'codec.ts',
   'constraints.ts',
+  'internal-recursive-array.ts',
   'internal-semantic-provenance.ts',
   'lens.ts',
   'mapping.ts',

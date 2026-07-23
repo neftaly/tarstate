@@ -58,7 +58,8 @@ identity.
 
 Read:
 
-- `schema.ts`, `schema-authoring.ts`, `mapping.ts`
+- `schema.ts`, `schema-authoring.ts`, `mapping.ts`,
+  `internal-recursive-array.ts`
 - the relevant semantic artifact parser
 - `attachment/preparation.ts`
 - `attachment/mapped-database-projection.ts`

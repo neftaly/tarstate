@@ -46,9 +46,19 @@ retain exact string literals and tuple order without changing runtime behavior.
 ## Mappings
 
 A storage mapping declares how a source shape projects to logical relations.
-It may use singleton, array, or object-map collections; stored, literal,
-map-key, or source-metadata key fields; stored, absent, or source-metadata
-fields; and explicit write capabilities.
+It may use singleton, array, object-map, or bounded recursive-array
+collections; stored, literal, map-key, or source-metadata key fields; stored,
+absent, or source-metadata fields; and explicit write capabilities.
+
+A recursive-array collection repeats through one declared descendant path.
+Its artifact supplies depth, row, and traversal-step limits. Projection is
+iterative, rejects repeated objects or collections rather than treating a
+graph as a tree, and exposes sibling position plus optional adapter-provided
+element and parent-element identity. Root parent identity is `null`; therefore
+a field mapped from `recursive-parent-element-identity` must be nullable.
+One traversal step enters an array or visits one candidate.
+Recursive mappings do not imply identity-preserving move or arbitrary child
+insertion.
 
 Projection is pure with respect to the supplied source snapshot. It must report
 completeness and issues rather than fabricate unavailable identity. Collection

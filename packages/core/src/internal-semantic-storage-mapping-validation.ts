@@ -72,8 +72,50 @@ const validateCollectionMapping = (
   input: JsonValue | undefined,
   path: readonly unknown[]
 ): void => {
+  if (!isSemanticRecord(input)) {
+    semanticInvalid(context, path, 'collection_mapping_shape');
+    return;
+  }
+  if (input.kind === 'recursive-array') {
+    if (!semanticShape(
+      context,
+      input,
+      [
+        'kind',
+        'path',
+        'descendants',
+        'absent',
+        'maxDepth',
+        'maxRows',
+        'maxTraversalSteps'
+      ],
+      [],
+      path
+    )) return;
+    validateStoragePath(context, input.path, [...path, 'path']);
+    validateStoragePath(context, input.descendants, [...path, 'descendants']);
+    if (Array.isArray(input.descendants) && input.descendants.length === 0) {
+      semanticInvalid(context, [...path, 'descendants'], 'empty_storage_path');
+    }
+    semanticEnumValue(context, input.absent, ['empty', 'invalid'], [
+      ...path,
+      'absent'
+    ]);
+    validateBound(context, input.maxDepth, [...path, 'maxDepth'], true);
+    validateBound(context, input.maxRows, [...path, 'maxRows'], false);
+    validateBound(
+      context,
+      input.maxTraversalSteps,
+      [...path, 'maxTraversalSteps'],
+      false
+    );
+    return;
+  }
   if (!semanticShape(context, input, ['kind', 'path', 'absent'], [], path)) return;
-  semanticEnumValue(context, input.kind, ['object-map', 'array', 'singleton'], [...path, 'kind']);
+  semanticEnumValue(context, input.kind, ['object-map', 'array', 'singleton'], [
+    ...path,
+    'kind'
+  ]);
   validateStoragePath(context, input.path, [...path, 'path']);
   semanticEnumValue(
     context,
@@ -155,9 +197,28 @@ const validateSourceMetadataMapping = (
   semanticEnumValue(
     context,
     input.value,
-    ['collection-position', 'collection-element-identity'],
+    [
+      'collection-position',
+      'collection-element-identity',
+      'recursive-parent-element-identity'
+    ],
     [...path, 'value']
   );
+};
+
+const validateBound = (
+  context: SemanticValidationContext,
+  input: JsonValue | undefined,
+  path: readonly unknown[],
+  allowZero: boolean
+): void => {
+  if (!Number.isSafeInteger(input)
+    || typeof input !== 'number'
+    || (allowZero ? input < 0 : input <= 0)) {
+    semanticInvalid(context, path, allowZero
+      ? 'non_negative_safe_integer_required'
+      : 'positive_safe_integer_required');
+  }
 };
 
 const validateStoragePath = (
@@ -171,5 +232,5 @@ const validateStoragePath = (
 };
 
 const isStoragePathPart = (value: JsonValue): boolean =>
-  typeof value === 'string'
+  (typeof value === 'string' && value.length > 0)
   || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);

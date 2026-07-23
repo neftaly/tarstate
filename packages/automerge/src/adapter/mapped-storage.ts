@@ -214,6 +214,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     const issues: Issue[] = affected === undefined || previous === undefined
       ? []
       : previous.result.issues.filter((issue) => issue.relationId === undefined || !affected.has(issue.relationId));
+    const previousRows = previous === undefined
+      ? undefined
+      : indexPreviousRows(previous.result.rows, projectedRelations);
     let incomplete = false;
     for (const [relationId, compiled] of this.#relations) {
       if (!projectedRelations.has(relationId)) continue;
@@ -262,14 +265,45 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           issues.push(bindingIssue('automerge.row_identity_unavailable', snapshot.sourceId, relationId, path));
           continue;
         }
-        rows.push(Object.freeze({
+        const previousRow = previousRows?.get(compoundKey(
+          relationId,
+          compoundKey(this.#locatorNamespace, objectId, objectId)
+        ));
+        rows.push(previousRow !== undefined
+          && sameProjectedRow(
+            previousRow,
+            projected.key,
+            projected.row as Readonly<Record<string, JsonValue>>,
+            path
+          )
+          ? previousRow
+          : Object.freeze({
           relationId,
           key: projected.key,
           fields: projected.row as Readonly<Record<string, JsonValue>>,
           locator: Object.freeze({ namespace: this.#locatorNamespace, token: objectId, rowIncarnation: objectId }),
           storagePath: Object.freeze(path)
-        }));
+          }));
       }
+    }
+    if (previous !== undefined
+      && incomplete === (previous.result.completeness !== 'exact')
+      && issues.length === 0
+      && previous.result.issues.length === 0
+      && rows.length === previous.result.rows.length
+      && rows.every((row, index) => row === previous.result.rows[index])) {
+      rememberProjection(
+        this.#projections,
+        snapshot.storage,
+        cacheKey,
+        previous.result
+      );
+      this.#rememberPreviousProjection(cacheKey, {
+        sourceId: snapshot.sourceId,
+        heads: Automerge.getHeads(snapshot.storage),
+        result: previous.result
+      });
+      return previous.result;
     }
     const result = Object.freeze({
       rows: Object.freeze(rows),
@@ -687,7 +721,8 @@ const planMappedInsert = <T extends object>(
   scalarCodec: ReturnType<typeof createAutomergeStorageScalarCodec>
 ): { readonly intent: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> } } | { readonly issues: readonly Issue[] } => {
   const collectionMapping = compiled.mapping.collection;
-  if (collectionMapping.kind === 'singleton') {
+  if (collectionMapping.kind === 'singleton'
+    || collectionMapping.kind === 'recursive-array') {
     return { issues: [bindingIssue('transaction.capability_unavailable', snapshot.sourceId, relationId, compiled.mapping.collection.path, { edit: 'insert', collection: compiled.mapping.collection.kind })] };
   }
   const keyValues = Array.isArray(key) ? key : [];
@@ -1070,6 +1105,31 @@ const automergePathIdentity = (path: AutomergePath): string => {
   return identity;
 };
 
+const sameProjectedRow = (
+  previous: AutomergeMappedStorageRow,
+  key: readonly [JsonValue, ...JsonValue[]],
+  fields: Readonly<Record<string, JsonValue>>,
+  storagePath: AutomergePath
+): boolean => samePortableJson(previous.key, key)
+  && samePortableJson(previous.fields, fields)
+  && previous.storagePath.length === storagePath.length
+  && previous.storagePath.every((part, index) => part === storagePath[index]);
+
+const indexPreviousRows = (
+  rows: readonly AutomergeMappedStorageRow[],
+  relationIds: ReadonlySet<string>
+): ReadonlyMap<string, AutomergeMappedStorageRow> => {
+  const indexed = new Map<string, AutomergeMappedStorageRow>();
+  for (const row of rows) {
+    if (!relationIds.has(row.relationId)) continue;
+    indexed.set(
+      compoundKey(row.relationId, automergeLocatorIdentity(row.locator)),
+      row
+    );
+  }
+  return indexed;
+};
+
 function automergeLocatorIdentity(locator: AutomergeMappedStorageRow['locator']): string;
 function automergeLocatorIdentity(locator: JsonValue): string | undefined;
 function automergeLocatorIdentity(locator: unknown): string | undefined {
@@ -1148,9 +1208,16 @@ const copyStorageValue = (value: unknown): unknown => {
   return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, copyStorageValue(child)]));
 };
 
-const automergeSourceMetadata: SourceMetadataResolver = ({ candidate }) => {
-  const objectId = candidate !== null && typeof candidate === 'object'
-    ? Automerge.getObjectId(candidate)
+const automergeSourceMetadata: SourceMetadataResolver = ({
+  value,
+  candidate,
+  parentCandidate
+}) => {
+  const target = value === 'recursive-parent-element-identity'
+    ? parentCandidate
+    : candidate;
+  const objectId = target !== null && typeof target === 'object'
+    ? Automerge.getObjectId(target)
     : null;
   return typeof objectId === 'string' ? objectId : undefined;
 };
@@ -1174,6 +1241,14 @@ const rebaseProjectionIssue = (issue: Issue, collectionPath: readonly (string | 
   }
   if (locator?.kind === 'array-position' && typeof locator.index === 'number') {
     return createIssue({ ...issue, path: [...collectionPath, locator.index, ...relative] });
+  }
+  if (locator?.kind === 'recursive-array-position'
+    && Array.isArray(locator.collectionPath)
+    && typeof locator.index === 'number') {
+    return createIssue({
+      ...issue,
+      path: [...locator.collectionPath, locator.index, ...relative]
+    });
   }
   if (locator?.kind !== 'object-map-key' || typeof locator.key !== 'string') return issue;
   return createIssue({ ...issue, path: [...collectionPath, locator.key, ...relative] });

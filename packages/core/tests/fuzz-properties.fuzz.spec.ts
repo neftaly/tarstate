@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   diffQueryMaintenanceSnapshots,
   evaluateQuery,
+  compileStorageMapping,
   openIncrementalQueryMaintenance,
+  prepareSchema,
+  projectStorage,
   resolveLensPath,
   safeParseReceipt,
   validateLens,
@@ -13,7 +16,8 @@ import {
   type QueryMaintenanceSnapshot,
   type QueryNode,
   type QueryRecord,
-  type RelationInput
+  type RelationInput,
+  type StorageMappingBody
 } from '../src/index.js';
 import { createPooledIncrementalQueryRuntime, type PooledIncrementalQueryRoot } from '../src/query.js';
 import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
@@ -41,6 +45,48 @@ const query: QueryNode = {
   }
 };
 const plan = sealPreparedPlan({ planId: 'fuzz', rootNodeId: 'fuzz:root', query, registryFingerprint: 'registry', authorityFingerprint: 'authority', datasetId: 'dataset' });
+const recursiveSchema = prepareSchema({
+  relations: {
+    nodes: {
+      relationId: 'fuzz.recursive-nodes',
+      key: ['id'],
+      fields: {
+        id: { type: { kind: 'string' } },
+        order: { type: { kind: 'integer' } },
+        name: { type: { kind: 'string' } }
+      }
+    }
+  }
+});
+if (!recursiveSchema.success) throw new Error('recursive fuzz schema failed');
+const recursiveMappingBody: StorageMappingBody = {
+  schema: schemaView,
+  model: 'json-tree-v1',
+  relations: {
+    'fuzz.recursive-nodes': {
+      collection: {
+        kind: 'recursive-array',
+        path: ['children'],
+        descendants: ['children'],
+        absent: 'invalid',
+        maxDepth: 6,
+        maxRows: 128,
+        maxTraversalSteps: 512
+      },
+      keys: { id: { kind: 'field', path: ['id'] } },
+      fields: {
+        order: { kind: 'source-metadata', value: 'collection-position' },
+        name: { path: ['name'], write: {} }
+      }
+    }
+  }
+};
+const recursiveMapping = compileStorageMapping(
+  recursiveMappingBody,
+  schemaView,
+  recursiveSchema.value
+);
+if (!recursiveMapping.success) throw new Error('recursive fuzz mapping failed');
 
 type FuzzRow = { readonly occurrenceId: string; readonly row: QueryRecord };
 type FuzzSource = { readonly sourceId: string; readonly attachmentId?: string; revision: number; nextId: number; rows: FuzzRow[] };
@@ -59,6 +105,63 @@ const deterministicFuzzTest = (name: string, test: () => void, timeout?: number)
 };
 
 describe('deterministic fuzz properties', () => {
+  deterministicFuzzTest('recursive collection projection matches a pre-order tree oracle', () => {
+    type Node = {
+      readonly id: string;
+      readonly name: string;
+      readonly children: Node[];
+    };
+    for (let run = 0; run < runs; run += 1) {
+      let nextId = 0;
+      let remaining = 1 + integer(80);
+      const createLevel = (depth: number): Node[] => {
+        if (remaining === 0) return [];
+        const count = Math.min(remaining, integer(5));
+        const nodes: Node[] = [];
+        for (let index = 0; index < count; index += 1) {
+          if (remaining === 0) break;
+          const id = 'node:' + nextId++;
+          remaining -= 1;
+          nodes.push({
+            id,
+            name: 'name:' + integer(1_000),
+            children: depth >= 6 ? [] : createLevel(depth + 1)
+          });
+        }
+        return nodes;
+      };
+      const children = createLevel(0);
+      const expected: QueryRecord[] = [];
+      const pending = children.map((node, order) => ({ node, order })).reverse();
+      while (pending.length > 0) {
+        const { node, order } = pending.pop() as {
+          readonly node: Node;
+          readonly order: number;
+        };
+        expected.push({ id: node.id, order, name: node.name });
+        for (let index = node.children.length - 1; index >= 0; index -= 1) {
+          pending.push({
+            node: node.children[index] as Node,
+            order: index
+          });
+        }
+      }
+      const projection = projectStorage(
+        recursiveMapping.value,
+        { children }
+      );
+      expect(projection, 'run ' + run).toMatchObject({
+        completeness: 'exact',
+        issues: []
+      });
+      expect(
+        projection.relations.get('fuzz.recursive-nodes')?.rows.map(({ row }) =>
+          row),
+        'run ' + run
+      ).toEqual(expected);
+    }
+  });
+
   deterministicFuzzTest('field-bounded projection stays oracle-equivalent to full relation rows', () => {
     const fieldNames = ['alpha', 'beta', 'gamma'] as const;
     for (let run = 0; run < runs; run += 1) {

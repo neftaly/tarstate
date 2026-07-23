@@ -54,6 +54,15 @@ type LinkDoc = {
   links: { id?: string; name: string }[];
 };
 
+type TreePiece = {
+  name: string;
+  children: TreePiece[];
+};
+
+type TreeDoc = {
+  children: TreePiece[];
+};
+
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
 
 const fixture = async (doc: TaskDoc = {
@@ -270,11 +279,229 @@ const arrayFixture = async (identity: 'source' | 'field') => {
   return { runtime, source, binding };
 };
 
+const recursiveArrayFixture = async () => {
+  const registry = new CapabilityRegistry('registry:recursive-array');
+  await registerBuiltInCapabilities(registry);
+  registry.registerImplementation({
+    ref: builtInCapabilityRefs.fieldReplace,
+    integrity: 'builtin:test',
+    implementation: Object.freeze({ kind: 'field-replace' })
+  });
+  const schemaArtifact = await sealSchema({
+    id: 'urn:test:recursive-array-schema',
+    body: {
+      relations: {
+        pieces: {
+          relationId: 'relation:pieces',
+          key: ['occurrenceId'],
+          fields: {
+            occurrenceId: { type: { kind: 'string' } },
+            parentOccurrenceId: {
+              type: { kind: 'string' },
+              nullable: true
+            },
+            order: { type: { kind: 'integer' } },
+            name: { type: { kind: 'string' } }
+          }
+        }
+      }
+    }
+  });
+  const schemaRef = {
+    id: schemaArtifact.id,
+    contentHash: schemaArtifact.contentHash
+  };
+  const schema = prepareSchema(schemaArtifact.body, registry);
+  if (!schema.success) throw new Error('recursive array schema fixture failed');
+  const body: StorageMappingBody = {
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: {
+      'relation:pieces': {
+        collection: {
+          kind: 'recursive-array',
+          path: ['children'],
+          descendants: ['children'],
+          absent: 'invalid',
+          maxDepth: 8,
+          maxRows: 64,
+          maxTraversalSteps: 256
+        },
+        keys: {
+          occurrenceId: {
+            kind: 'source-metadata',
+            value: 'collection-element-identity'
+          }
+        },
+        fields: {
+          parentOccurrenceId: {
+            kind: 'source-metadata',
+            value: 'recursive-parent-element-identity'
+          },
+          order: { kind: 'source-metadata', value: 'collection-position' },
+          name: {
+            path: ['name'],
+            write: { replace: builtInCapabilityRefs.fieldReplace }
+          }
+        }
+      }
+    }
+  };
+  const compiled = compileStorageMapping(
+    body,
+    schemaRef,
+    schema.value,
+    registry
+  );
+  if (!compiled.success) throw new Error('recursive array mapping failed');
+  const runtime = new AutomergeSourceRuntime<TreeDoc>({
+    sourceId: 'source:recursive-array',
+    doc: Automerge.from<TreeDoc>({
+      children: [{
+        name: 'Root',
+        children: [{
+          name: 'Child',
+          children: [{ name: 'Grandchild', children: [] }]
+        }]
+      }, {
+        name: 'Sibling',
+        children: []
+      }]
+    })
+  });
+  const source = new AutomergeAtomicSource({
+    runtime,
+    operationEpoch: 'epoch:mapped'
+  });
+  const binding = new AutomergeMappedStorageBinding<TreeDoc>({
+    id: 'binding:recursive-array',
+    mapping: compiled.value,
+    registry
+  });
+  return { runtime, source, binding };
+};
+
 const commit = (basis: JsonValue, operationId: string, digit: string) => ({
   operationEpoch: 'epoch:mapped', operationId, expectedBasis: basis, intentHash: hash(digit)
 });
 
 describe('compiled-mapping-backed Automerge storage binding', () => {
+  it('projects and edits recursive rows through stable Automerge identities', async () => {
+    const { runtime, source, binding } = await recursiveArrayFixture();
+    const initial = binding.project(source.snapshot());
+    expect(initial).toMatchObject({
+      completeness: 'exact',
+      issues: [],
+      rows: [
+        {
+          fields: {
+            parentOccurrenceId: null,
+            order: 0,
+            name: 'Root'
+          },
+          storagePath: ['children', 0]
+        },
+        {
+          fields: {
+            order: 0,
+            name: 'Child'
+          },
+          storagePath: ['children', 0, 'children', 0]
+        },
+        {
+          fields: {
+            order: 0,
+            name: 'Grandchild'
+          },
+          storagePath: [
+            'children',
+            0,
+            'children',
+            0,
+            'children',
+            0
+          ]
+        },
+        {
+          fields: {
+            parentOccurrenceId: null,
+            order: 1,
+            name: 'Sibling'
+          },
+          storagePath: ['children', 1]
+        }
+      ]
+    });
+    const root = initial.rows[0]!;
+    const child = initial.rows[1]!;
+    const grandchild = initial.rows[2]!;
+    expect(child.fields.parentOccurrenceId).toBe(root.fields.occurrenceId);
+    expect(grandchild.fields.parentOccurrenceId)
+      .toBe(child.fields.occurrenceId);
+
+    runtime.replace(Automerge.change(
+      runtime.snapshot().storage,
+      { time: 0 },
+      (draft) => {
+        draft.children.unshift({ name: 'Before', children: [] });
+      }
+    ));
+    const beforeEdit = binding.project(source.snapshot());
+    const stableRoot = beforeEdit.rows.find(({ fields }) =>
+      fields.name === 'Root');
+    const previousGrandchild = beforeEdit.rows.find(({ fields }) =>
+      fields.name === 'Grandchild');
+    if (stableRoot === undefined || previousGrandchild === undefined) {
+      throw new Error('recursive rows missing before edit');
+    }
+    const replaced = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'replace-fields',
+        relationId: grandchild.relationId,
+        key: grandchild.key as JsonValue,
+        locator: grandchild.locator as unknown as JsonValue,
+        fields: { name: 'Changed' }
+      }],
+      commit: commit(
+        source.snapshot().basis as JsonValue,
+        'operation:recursive-array-edit',
+        'a'
+      )
+    });
+    expect(replaced.outcome).toBe('committed');
+    expect(runtime.snapshot().storage.children[1]?.children[0]?.children[0]?.name)
+      .toBe('Changed');
+
+    const shifted = binding.project(source.snapshot());
+    expect(shifted.rows.find(({ key }) => key[0] === stableRoot.key[0]))
+      .toBe(stableRoot);
+    expect(shifted.rows.find(({ key }) =>
+      key[0] === previousGrandchild.key[0])).not.toBe(previousGrandchild);
+    const currentChild = shifted.rows.find(({ key }) =>
+      key[0] === child.key[0]);
+    if (currentChild === undefined) throw new Error('shifted child missing');
+    const deleted = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'delete',
+        relationId: currentChild.relationId,
+        key: currentChild.key as JsonValue,
+        locator: currentChild.locator as unknown as JsonValue
+      }],
+      commit: commit(
+        source.snapshot().basis as JsonValue,
+        'operation:recursive-array-delete',
+        'b'
+      )
+    });
+    expect(deleted.outcome).toBe('committed');
+    expect(runtime.snapshot().storage.children[1]?.children).toEqual([]);
+    source.close();
+  });
+
   it('projects stable source identity and retargets an edit after array positions shift', async () => {
     const { runtime, source, binding } = await arrayFixture('source');
     const initial = binding.project(source.snapshot());

@@ -273,6 +273,26 @@ describe('semantic artifact safe parsers', () => {
     expect(await safeParseStorageMappingArtifact(sourceIdentityArtifact)).toMatchObject({ success: true });
     expect(await safePrepareStorageMappingArtifact(sourceIdentityArtifact, { schemaRef, schema: prepared.value }))
       .toMatchObject({ success: true });
+    const recursive = mutate(sourceIdentity, (body) => {
+      body.relations['test.person'].collection = {
+        kind: 'recursive-array',
+        path: ['people'],
+        descendants: ['children'],
+        absent: 'invalid',
+        maxDepth: 64,
+        maxRows: 10_000,
+        maxTraversalSteps: 30_000
+      };
+    });
+    expect(await safeParseStorageMappingArtifact(
+      await seal('storage-mapping', recursive)
+    )).toMatchObject({ success: true });
+    const unboundedRecursive = mutate(recursive, (body) => {
+      delete body.relations['test.person'].collection.maxTraversalSteps;
+    });
+    expect(await safeParseStorageMappingArtifact(
+      await seal('storage-mapping', unboundedRecursive)
+    )).toMatchObject({ success: false });
     const unknownSourceMetadata = mutate(sourceIdentity, (body) => {
       body.relations['test.person'].keys.id.value = 'array-index';
     });

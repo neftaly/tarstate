@@ -172,7 +172,8 @@ const unsupportedMappingIssue = (
     const fields = [...Object.entries(relation.mapping.keys), ...Object.entries(relation.mapping.fields)];
     for (const [field, mapped] of fields) {
       if (mapped.kind === 'source-metadata'
-        && mapped.value === 'collection-element-identity') {
+        && (mapped.value === 'collection-element-identity'
+          || mapped.value === 'recursive-parent-element-identity')) {
         return createIssue({
           code: 'mapping.source_metadata_unavailable',
           phase: 'resolve',

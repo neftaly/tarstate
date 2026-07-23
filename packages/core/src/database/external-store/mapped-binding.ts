@@ -276,7 +276,9 @@ export const createExternalStoreMappedBinding = <State extends object>(input: {
         }
         const footprint = compiled.mapping.collection.kind === 'array'
           ? subtreeFootprint(compiled.mapping.collection.path)
-          : exactFootprint(row.storagePath);
+          : compiled.mapping.collection.kind === 'recursive-array'
+            ? subtreeFootprint(row.storagePath.slice(0, -1))
+            : exactFootprint(row.storagePath);
         intents.push({ footprint, command: Object.freeze({ kind: 'delete', path: row.storagePath }) });
         continue;
       }
@@ -398,9 +400,13 @@ const externalStoreWriteCapabilities = (
       }
     }
     const collectionWritable = compiled.mapping.collection.kind !== 'singleton';
+    const collectionInsertable =
+      compiled.mapping.collection.kind !== 'singleton'
+      && compiled.mapping.collection.kind !== 'recursive-array';
     return [relationId, Object.freeze({
       relationId,
-      ...(collectionWritable ? { insert: true as const, delete: true as const } : {}),
+      ...(collectionInsertable ? { insert: true as const } : {}),
+      ...(collectionWritable ? { delete: true as const } : {}),
       fields: Object.freeze(fields)
     })] as const;
   })
@@ -418,13 +424,14 @@ const planInsert = <State extends object>(input: {
 }): { readonly intent: { readonly footprint: JsonTreePathFootprint; readonly command: JsonTreeCommand } }
   | { readonly issues: readonly Issue[] } => {
   const collection = input.compiled.mapping.collection;
-  if (collection.kind === 'singleton') {
+  if (collection.kind === 'singleton'
+    || collection.kind === 'recursive-array') {
     return { issues: [bindingIssue(
       'transaction.capability_unavailable',
       input.snapshot.sourceId,
       input.relationId,
       collection.path,
-      { edit: 'insert', collection: 'singleton' }
+      { edit: 'insert', collection: collection.kind }
     )] };
   }
   const keyValues = Array.isArray(input.key) ? input.key : [];
@@ -588,6 +595,10 @@ const candidatePath = (
   if (mapping.collection.kind === 'array' && locator.kind === 'array-position') {
     return [...mapping.collection.path, locator.index];
   }
+  if (mapping.collection.kind === 'recursive-array'
+    && locator.kind === 'recursive-array-position') {
+    return [...locator.collectionPath, locator.index];
+  }
   if (mapping.collection.kind === 'object-map' && locator.kind === 'object-map-key') {
     return [...mapping.collection.path, locator.key];
   }
@@ -674,6 +685,12 @@ const compoundKey = (...parts: readonly string[]): string => {
 const locatorOccurrenceId = (locator: MappingLocator): string => {
   if (locator.kind === 'singleton') return 'singleton';
   if (locator.kind === 'array-position') return 'array:' + locator.index;
+  if (locator.kind === 'recursive-array-position') {
+    return 'recursive:' + canonicalizeJson([
+      ...locator.collectionPath,
+      locator.index
+    ]);
+  }
   return 'object:' + locator.key.length + ':' + locator.key;
 };
 
@@ -694,6 +711,22 @@ function externalLocatorIdentity(locator: unknown): string | undefined {
       && Number.isSafeInteger(token.index)
       && token.durable === false
       ? 'array:' + token.index
+      : token.kind === 'recursive-array-position'
+        && Array.isArray(token.collectionPath)
+        && token.collectionPath.every((part) =>
+          typeof part === 'string'
+          || (typeof part === 'number' && Number.isSafeInteger(part) && part >= 0))
+        && typeof token.index === 'number'
+        && Number.isSafeInteger(token.index)
+        && token.index >= 0
+        && typeof token.depth === 'number'
+        && Number.isSafeInteger(token.depth)
+        && token.depth >= 0
+        && token.durable === false
+        ? 'recursive:' + canonicalizeJson([
+            ...token.collectionPath,
+            token.index
+          ])
       : token.kind === 'object-map-key' && typeof token.key === 'string'
         ? 'object:' + token.key.length + ':' + token.key
         : undefined;

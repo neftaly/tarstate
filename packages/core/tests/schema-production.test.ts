@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
 import { createIssue } from '../src/issues.js';
 import { prepareSchema, parseRelationCandidate, parseLogicalKey, type RelationRow, type SchemaBody } from '../src/schema.js';
-import { compileStorageMapping, planStorageIntents, planStoragePatch, projectStorage, type StorageMappingBody } from '../src/mapping.js';
+import {
+  compileStorageMapping,
+  planStorageIntents,
+  planStoragePatch,
+  projectStorage,
+  type SourceMetadataResolver,
+  type StorageMappingBody
+} from '../src/mapping.js';
 import { projectLensRelation, resolveLensPath, translateLensEdits, validateLens, type LensArtifact, type LensRows, type SchemaLensBody } from '../src/lens.js';
 import { parseScalarValue, type CodecImplementation } from '../src/codec.js';
 
@@ -306,6 +313,225 @@ describe('production JSON-tree storage mappings', () => {
       { key: ['element:0'], row: { occurrenceId: 'element:0', order: 0, name: 'First' } },
       { key: ['element:1'], row: { occurrenceId: 'element:1', order: 1, name: 'Second' } }
     ]);
+  });
+
+  it('projects bounded recursive arrays with parent evidence and exact write locations', () => {
+    const prepared = prepareSchema({ relations: { pieces: {
+      relationId: 'test.piece',
+      key: ['occurrenceId'],
+      fields: {
+        occurrenceId: { type: { kind: 'string' } },
+        parentOccurrenceId: {
+          type: { kind: 'string' },
+          nullable: true
+        },
+        order: { type: { kind: 'integer' } },
+        name: { type: { kind: 'string' } }
+      }
+    } } });
+    if (!prepared.success) throw new Error('recursive schema fixture failed');
+    const mapping: StorageMappingBody = {
+      schema: schemaRef,
+      model: 'json-tree-v1',
+      relations: { 'test.piece': {
+        collection: {
+          kind: 'recursive-array',
+          path: ['children'],
+          descendants: ['children'],
+          absent: 'invalid',
+          maxDepth: 2,
+          maxRows: 8,
+          maxTraversalSteps: 32
+        },
+        keys: {
+          occurrenceId: {
+            kind: 'source-metadata',
+            value: 'collection-element-identity'
+          }
+        },
+        fields: {
+          parentOccurrenceId: {
+            kind: 'source-metadata',
+            value: 'recursive-parent-element-identity'
+          },
+          order: { kind: 'source-metadata', value: 'collection-position' },
+          name: {
+            path: ['name'],
+            write: { replace: replaceRef }
+          }
+        }
+      } }
+    };
+    const compiled = compileStorageMapping(mapping, schemaRef, prepared.value);
+    if (!compiled.success) throw new Error('recursive mapping fixture failed');
+    const grandchild = { name: 'Grandchild', children: [] };
+    const child = { name: 'Child', children: [grandchild] };
+    const root = { name: 'Root', children: [child] };
+    const sibling = { name: 'Sibling', children: [] };
+    const snapshot = { children: [root, sibling] };
+    const identities = new WeakMap<object, string>([
+      [root, 'root'],
+      [sibling, 'sibling'],
+      [child, 'child'],
+      [grandchild, 'grandchild']
+    ]);
+    const sourceMetadata: SourceMetadataResolver = ({
+      value,
+      candidate,
+      parentCandidate
+    }) => {
+      const target = value === 'recursive-parent-element-identity'
+        ? parentCandidate
+        : candidate;
+      return target !== null && typeof target === 'object'
+        ? identities.get(target)
+        : undefined;
+    };
+    const projection = projectStorage(compiled.value, snapshot, {
+      sourceMetadata
+    });
+    expect(projection).toMatchObject({
+      completeness: 'exact',
+      issues: []
+    });
+    expect(projection.relations.get('test.piece')?.rows).toMatchObject([
+      {
+        key: ['root'],
+        row: {
+          occurrenceId: 'root',
+          parentOccurrenceId: null,
+          order: 0,
+          name: 'Root'
+        },
+        locator: {
+          kind: 'recursive-array-position',
+          collectionPath: ['children'],
+          index: 0,
+          depth: 0,
+          durable: false
+        }
+      },
+      {
+        key: ['child'],
+        row: {
+          occurrenceId: 'child',
+          parentOccurrenceId: 'root',
+          order: 0,
+          name: 'Child'
+        }
+      },
+      {
+        key: ['grandchild'],
+        row: {
+          occurrenceId: 'grandchild',
+          parentOccurrenceId: 'child',
+          order: 0,
+          name: 'Grandchild'
+        }
+      },
+      {
+        key: ['sibling'],
+        row: {
+          occurrenceId: 'sibling',
+          parentOccurrenceId: null,
+          order: 1,
+          name: 'Sibling'
+        }
+      }
+    ]);
+    const grandchildRow = projection.relations.get('test.piece')?.rows[2];
+    if (grandchildRow === undefined) throw new Error('grandchild row missing');
+    expect(planStoragePatch(
+      compiled.value,
+      snapshot,
+      'test.piece',
+      grandchildRow.locator,
+      { name: 'Changed' }
+    )).toMatchObject({
+      success: true,
+      value: {
+        intents: [{
+          path: [
+            'children',
+            0,
+            'children',
+            0,
+            'children',
+            0,
+            'name'
+          ]
+        }]
+      }
+    });
+
+    const tooDeep = projectStorage(compiled.value, {
+      children: [{
+        name: 'one',
+        children: [{
+          name: 'two',
+          children: [{
+            name: 'three',
+            children: [{ name: 'four', children: [] }]
+          }]
+        }]
+      }]
+    }, {
+      sourceMetadata: ({ locator }) =>
+        locator.kind === 'recursive-array-position'
+          ? JSON.stringify([...locator.collectionPath, locator.index])
+          : undefined
+    });
+    expect(tooDeep).toMatchObject({
+      completeness: 'unknown',
+      issues: [{
+        code: 'mapping.recursive_limit_exceeded',
+        details: { limit: 'maxDepth', maximum: 2 }
+      }]
+    });
+
+    const cyclic: { name: string; children: unknown[] } = {
+      name: 'cycle',
+      children: []
+    };
+    cyclic.children.push(cyclic);
+    expect(projectStorage(compiled.value, { children: [cyclic] }, {
+      sourceMetadata: () => 'cycle'
+    })).toMatchObject({
+      completeness: 'unknown',
+      issues: [{
+        code: 'mapping.recursive_not_tree',
+        details: { reason: 'candidate_repeated' }
+      }]
+    });
+
+    let inspectedMembers = 0;
+    const wide = new Proxy(
+      Array.from({ length: 1_000 }, (_, index) => ({
+        name: 'wide:' + index,
+        children: []
+      })),
+      {
+        getOwnPropertyDescriptor: (target, property) => {
+          inspectedMembers += property === 'length' ? 0 : 1;
+          return Reflect.getOwnPropertyDescriptor(target, property);
+        }
+      }
+    );
+    expect(projectStorage(compiled.value, { children: wide }, {
+      sourceMetadata: ({ candidate }) =>
+        typeof candidate === 'object'
+          && candidate !== null
+          && 'name' in candidate
+          ? String(candidate.name)
+          : undefined
+    })).toMatchObject({
+      completeness: 'unknown',
+      issues: [{
+        code: 'mapping.recursive_limit_exceeded',
+        details: { limit: 'maxRows', maximum: 8 }
+      }]
+    });
+    expect(inspectedMembers).toBe(8);
   });
 
   it('rejects map-key mismatch, retains duplicate candidates for repair, and preserves unknown storage on edit', async () => {
