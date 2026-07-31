@@ -186,7 +186,22 @@ export class SourceLifecycleCoordinator {
   }
 
   execute(command: SourceLifecycleCommand, options: { readonly signal?: AbortSignal } = {}): Promise<SourceLifecycleReceipt> {
-    const ownedCommand = adoptCoordinatorCommand<SourceLifecycleCommand>(command, 'Source lifecycle command');
+    let ownedCommand: SourceLifecycleCommand;
+    try {
+      ownedCommand = adoptCoordinatorCommand<SourceLifecycleCommand>(command, 'Source lifecycle command');
+    } catch (error) {
+      if (!(error instanceof CoordinatorInvalidCommandError)) throw error;
+      return invalidCommandHash(
+        'source-lifecycle',
+        commandIdentity(command, 'operationEpoch'),
+        commandIdentity(command, 'operationId')
+      ).then((commandHash) => lifecycleReceipt(
+        command,
+        commandHash,
+        'rejected',
+        [coordinatorIssue('lifecycle.command_invalid', 'lifecycle', 'after_input')]
+      ));
+    }
     const canonicalization = new WeakMap<object, string>();
     const signal = options.signal;
     const run = this.#queue.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }, canonicalization));
@@ -373,7 +388,23 @@ export class GovernanceCoordinator {
   }
 
   execute(command: GovernanceCommand, options: { readonly signal?: AbortSignal } = {}): Promise<GovernanceReceipt> {
-    const ownedCommand = adoptCoordinatorCommand<GovernanceCommand>(command, 'Governance command');
+    let ownedCommand: GovernanceCommand;
+    try {
+      ownedCommand = adoptCoordinatorCommand<GovernanceCommand>(command, 'Governance command');
+    } catch (error) {
+      if (!(error instanceof CoordinatorInvalidCommandError)) throw error;
+      return invalidCommandHash(
+        'governance',
+        commandIdentity(command, 'operationEpoch'),
+        commandIdentity(command, 'operationId')
+      ).then((commandHash) => governanceReceipt(
+        command,
+        commandHash,
+        [],
+        'rejected',
+        [coordinatorIssue('governance.command_invalid', 'governance', 'after_input')]
+      ));
+    }
     const canonicalization = new WeakMap<object, string>();
     const signal = options.signal;
     const sourceId = commandIdentity(ownedCommand, 'sourceId');
@@ -693,11 +724,25 @@ const governanceAction = (command: unknown): GovernanceReceipt['action'] => {
 
 const adoptCoordinatorCommand = <Command>(input: unknown, label: string): Command => {
   const owned = detachAndFreezeJsonValue(input);
-  if (!owned.success || owned.value === null || typeof owned.value !== 'object' || Array.isArray(owned.value)) {
-    throw new TypeError(label + ' must be descriptor-safe portable data');
+  if (!owned.success) {
+    if (owned.issues.some(({ code }) =>
+      code === 'artifact.hostile_shape' || code === 'artifact.cycle')) {
+      throw new TypeError(label + ' must be descriptor-safe portable data');
+    }
+    throw new CoordinatorInvalidCommandError();
+  }
+  if (owned.value === null || typeof owned.value !== 'object' || Array.isArray(owned.value)) {
+    throw new CoordinatorInvalidCommandError();
   }
   return owned.value as unknown as Command;
 };
+
+class CoordinatorInvalidCommandError extends Error {
+  constructor() {
+    super('Coordinator command is invalid');
+    this.name = 'CoordinatorInvalidCommandError';
+  }
+}
 
 const ownCoordinatorReceipt = <Receipt>(input: unknown, label: string): Receipt => {
   const owned = detachAndFreezeJsonValue(input);

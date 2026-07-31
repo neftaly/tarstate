@@ -46,7 +46,40 @@ const schemaBody = (reverse = false): SchemaBody => {
         player: { type: { kind: 'ref' as const, target: { relationId: 'urn:test:players' } } },
         round: { type: { kind: 'integer' as const } },
         score: { type: { kind: 'decimal' as const } },
-        payload: { type: { kind: 'json' as const }, optional: true, nullable: true }
+        payload: { type: { kind: 'json' as const }, optional: true, nullable: true },
+        operation: {
+          type: {
+            kind: 'union' as const,
+            alternatives: [
+              {
+                kind: 'record' as const,
+                fields: {
+                  action: { kind: 'string' as const, values: ['put'] },
+                  value: {
+                    kind: 'tuple' as const,
+                    items: [
+                      { kind: 'number' as const },
+                      { kind: 'null' as const },
+                      { kind: 'number' as const }
+                    ]
+                  }
+                }
+              },
+              {
+                kind: 'record' as const,
+                fields: {
+                  action: { kind: 'string' as const, values: ['move'] },
+                  path: {
+                    kind: 'array' as const,
+                    items: { kind: 'string' as const },
+                    maxItems: 2
+                  }
+                }
+              }
+            ]
+          },
+          optional: true
+        }
       }
     }]
   ] as const;
@@ -94,11 +127,13 @@ describe('schema outputs', () => {
     expect(generatedA.value.typescript).toContain('Content hash: ' + first.contentHash);
     expect(generatedA.value.typescript).toContain('readonly nickname?: string;');
     expect(generatedA.value.typescript).toContain('export type ScoresKey = readonly [PlayersKey, number];');
+    expect(generatedA.value.typescript).toContain('readonly operation?: Readonly<{ readonly action: "put"; readonly value: readonly [number, null, number] }> | Readonly<{ readonly action: "move"; readonly path: readonly (string)[] }>;');
     expect(generatedA.value.jsonSchema).toMatchObject({
       $schema: 'https://json-schema.org/draft/2020-12/schema',
       'x-tarstate-schema-ref': { id: first.id, contentHash: first.contentHash }
     });
     expect(generatedA.value.jsonSchemaText.endsWith('\n')).toBe(true);
+    expect(generatedA.value.jsonSchemaText).toContain('"oneOf"');
     expect(generatedA.value.markdown).toContain('| `nickname` | `string` | yes | no |');
 
     const stale = { ...first, contentHash: hash('f') };
@@ -306,7 +341,7 @@ describe('database descriptions', () => {
 
     const budget: DatabaseDescriptionBudget = {
       maxBytes: 2_000_000,
-      maxDepth: 64,
+      maxTotalStringCodeUnits: 8 * 1024 * 1024,
       maxArrayMembers: 100_000,
       maxObjectMembers: 100_000,
       maxTotalMembers: 500_000,

@@ -15,6 +15,37 @@ export type ScalarDeclaration =
   | { readonly kind: 'ref'; readonly target: { readonly relationId: string } }
   | { readonly kind: 'custom'; readonly codec: CapabilityRef };
 
+/**
+ * A finite portable-value contract shared by relation fields and query
+ * parameters. Arrays are explicitly bounded; recursive references are not
+ * part of the language.
+ */
+export type ValueDeclaration =
+  | ScalarDeclaration
+  | { readonly kind: 'null' }
+  | {
+      readonly kind: 'array';
+      readonly items: ValueDeclaration;
+      readonly maxItems: number;
+    }
+  | {
+      readonly kind: 'tuple';
+      readonly items: readonly ValueDeclaration[];
+    }
+  | {
+      readonly kind: 'record';
+      readonly fields: Readonly<Record<string, ValueDeclaration>>;
+      readonly optional?: readonly string[];
+    }
+  | {
+      readonly kind: 'union';
+      readonly alternatives: readonly [
+        ValueDeclaration,
+        ValueDeclaration,
+        ...ValueDeclaration[]
+      ];
+    };
+
 /** A host codec is total: malformed input is a ParseResult, never an exception. */
 export type CodecImplementation = {
   readonly kind: 'tarstate.codec';
@@ -80,6 +111,174 @@ export const parseScalarValue = (
       return success(value);
   }
 };
+
+/** Parses one value against the shared structured contract language. */
+export const parseValueDeclaration = (
+  declaration: ValueDeclaration,
+  input: unknown,
+  context: ScalarParseContext = {}
+): ParseResult<PortableValue> => {
+  if (isScalarDeclarationValue(declaration)) {
+    return parseScalarValue(declaration, input, context);
+  }
+  const path = context.path ?? [];
+  if (declaration.kind === 'null') {
+    return input === null
+      ? success(null)
+      : failure('schema.value_contract', path, { expected: 'null' });
+  }
+  const portable = safeParseJsonValue(input);
+  if (!portable.success) {
+    return {
+      success: false,
+      issues: portable.issues.map((issue) => contextualize(issue, path))
+    };
+  }
+  return parseOwnedValueDeclaration(declaration, portable.value, context, path);
+};
+
+const parseOwnedValueDeclaration = (
+  declaration: Exclude<ValueDeclaration, ScalarDeclaration>,
+  input: JsonValue,
+  context: ScalarParseContext,
+  path: readonly unknown[]
+): ParseResult<PortableValue> => {
+  if (declaration.kind === 'null') {
+    return input === null
+      ? success(null)
+      : failure('schema.value_contract', path, { expected: 'null' });
+  }
+  if (declaration.kind === 'array') {
+    if (!Array.isArray(input) || input.length > declaration.maxItems) {
+      return failure('schema.value_contract', path, {
+        expected: 'array',
+        maxItems: declaration.maxItems
+      });
+    }
+    return parseValueArray(declaration.items, input, context, path);
+  }
+  if (declaration.kind === 'tuple') {
+    if (!Array.isArray(input) || input.length !== declaration.items.length) {
+      return failure('schema.value_contract', path, {
+        expected: 'tuple',
+        arity: declaration.items.length
+      });
+    }
+    const output: PortableValue[] = [];
+    const issues: Issue[] = [];
+    for (let index = 0; index < declaration.items.length; index += 1) {
+      const parsed = parseOwnedDeclaredValue(
+        declaration.items[index] as ValueDeclaration,
+        input[index] as JsonValue,
+        context,
+        [...path, index]
+      );
+      if (parsed.success) output.push(parsed.value);
+      else issues.push(...parsed.issues);
+    }
+    return issues.length === 0
+      ? success(output)
+      : { success: false, issues };
+  }
+  if (declaration.kind === 'record') {
+    if (input === null || Array.isArray(input) || typeof input !== 'object') {
+      return failure('schema.value_contract', path, { expected: 'record' });
+    }
+    const record = input as Readonly<Record<string, JsonValue>>;
+    const optional = new Set(declaration.optional ?? []);
+    const output: Record<string, PortableValue> = {};
+    const issues: Issue[] = [];
+    for (const name of Object.keys(record)) {
+      if (!Object.hasOwn(declaration.fields, name)) {
+        issues.push(valueContractIssue([...path, name], { reason: 'extra' }));
+      }
+    }
+    for (const [name, member] of Object.entries(declaration.fields)) {
+      if (!Object.hasOwn(record, name)) {
+        if (!optional.has(name)) {
+          issues.push(valueContractIssue([...path, name], { reason: 'missing' }));
+        }
+        continue;
+      }
+      const parsed = parseOwnedDeclaredValue(
+        member,
+        record[name] as JsonValue,
+        context,
+        [...path, name]
+      );
+      if (parsed.success) output[name] = parsed.value;
+      else issues.push(...parsed.issues);
+    }
+    return issues.length === 0
+      ? success(output)
+      : { success: false, issues };
+  }
+  const matches: PortableValue[] = [];
+  for (const alternative of declaration.alternatives) {
+    const parsed = parseOwnedDeclaredValue(alternative, input, context, path);
+    if (parsed.success) matches.push(parsed.value);
+  }
+  return matches.length === 1
+    ? success(matches[0] as PortableValue)
+    : failure('schema.value_contract', path, {
+        expected: 'union',
+        matches: matches.length
+      });
+};
+
+const parseOwnedDeclaredValue = (
+  declaration: ValueDeclaration,
+  input: JsonValue,
+  context: ScalarParseContext,
+  path: readonly unknown[]
+): ParseResult<PortableValue> =>
+  isScalarDeclarationValue(declaration)
+    ? parseScalarValue(declaration, input, { ...context, path })
+    : parseOwnedValueDeclaration(declaration, input, context, path);
+
+const parseValueArray = (
+  declaration: ValueDeclaration,
+  input: readonly JsonValue[],
+  context: ScalarParseContext,
+  path: readonly unknown[]
+): ParseResult<PortableValue> => {
+  const output: PortableValue[] = [];
+  const issues: Issue[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const parsed = parseOwnedDeclaredValue(
+      declaration,
+      input[index] as JsonValue,
+      context,
+      [...path, index]
+    );
+    if (parsed.success) output.push(parsed.value);
+    else issues.push(...parsed.issues);
+  }
+  return issues.length === 0
+    ? success(output)
+    : { success: false, issues };
+};
+
+const valueContractIssue = (
+  path: readonly unknown[],
+  details: JsonValue
+): Issue => createIssue({
+  code: 'schema.value_contract',
+  phase: 'parse',
+  severity: 'error',
+  retry: 'after_input',
+  path,
+  details
+});
+
+const isScalarDeclarationValue = (
+  declaration: ValueDeclaration
+): declaration is ScalarDeclaration =>
+  declaration.kind !== 'null'
+  && declaration.kind !== 'array'
+  && declaration.kind !== 'tuple'
+  && declaration.kind !== 'record'
+  && declaration.kind !== 'union';
 
 export const scalarEquals = (left: PortableValue, right: PortableValue, codec?: CodecImplementation): boolean => {
   if (isTaggedValue(left) && isTaggedValue(right) && left.type === right.type && codec?.type === left.type) return codec.equals(left, right);

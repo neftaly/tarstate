@@ -10,23 +10,47 @@ export const sameStructuralJson = (left: unknown, right: unknown): boolean => {
 };
 
 const sameJsonValue = (left: JsonValue, right: JsonValue): boolean => {
-  if (left === right) return typeof left !== 'number' || Number.isFinite(left);
-  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    for (let index = 0; index < left.length; index += 1) {
-      if (!sameJsonValue(left[index] as JsonValue, right[index] as JsonValue)) return false;
+  const leftValues: JsonValue[] = [left];
+  const rightValues: JsonValue[] = [right];
+  while (leftValues.length > 0) {
+    const leftValue = leftValues.pop() as JsonValue;
+    const rightValue = rightValues.pop() as JsonValue;
+    if (leftValue === rightValue) {
+      if (typeof leftValue === 'number' && !Number.isFinite(leftValue)) {
+        return false;
+      }
+      continue;
     }
-    return true;
-  }
-  const leftRecord = left as Readonly<Record<string, JsonValue>>;
-  const rightRecord = right as Readonly<Record<string, JsonValue>>;
-  const leftKeys = Object.keys(leftRecord);
-  if (leftKeys.length !== Object.keys(rightRecord).length) return false;
-  for (const key of leftKeys) {
-    if (!Object.hasOwn(rightRecord, key)
-      || !sameJsonValue(leftRecord[key] as JsonValue, rightRecord[key] as JsonValue)) {
+    if (leftValue === null
+      || rightValue === null
+      || typeof leftValue !== 'object'
+      || typeof rightValue !== 'object') {
       return false;
+    }
+    if (Array.isArray(leftValue) || Array.isArray(rightValue)) {
+      if (!Array.isArray(leftValue)
+        || !Array.isArray(rightValue)
+        || leftValue.length !== rightValue.length) {
+        return false;
+      }
+      for (let index = 0; index < leftValue.length; index += 1) {
+        leftValues.push(leftValue[index] as JsonValue);
+        rightValues.push(rightValue[index] as JsonValue);
+      }
+      continue;
+    }
+    if (Object.getPrototypeOf(leftValue) !== Object.prototype
+      || Object.getPrototypeOf(rightValue) !== Object.prototype) {
+      return false;
+    }
+    const leftRecord = leftValue as Readonly<Record<string, JsonValue>>;
+    const rightRecord = rightValue as Readonly<Record<string, JsonValue>>;
+    const leftKeys = Object.keys(leftRecord);
+    if (leftKeys.length !== Object.keys(rightRecord).length) return false;
+    for (const key of leftKeys) {
+      if (!Object.hasOwn(rightRecord, key)) return false;
+      leftValues.push(leftRecord[key] as JsonValue);
+      rightValues.push(rightRecord[key] as JsonValue);
     }
   }
   return true;

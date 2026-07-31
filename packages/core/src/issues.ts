@@ -221,6 +221,7 @@ const declarations = [
   ['schema.required_codecs_invalid', 'parse', 'error', ['after_input']],
   ['schema-lens.artifact_invalid', 'parse', 'error', ['after_input']],
   ['schema.scalar_type', 'parse', 'error', ['after_input']],
+  ['schema.value_contract', 'parse', 'error', ['after_input']],
   ['source.closed', 'lifecycle', 'error', ['never']],
   ['source.hydration_failed', 'load', 'error', ['after_refresh']],
   ['source.not_ready', 'load', 'error', ['after_refresh']],

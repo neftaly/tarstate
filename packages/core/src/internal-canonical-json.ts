@@ -1,4 +1,4 @@
-import type { JsonValue } from './value.js';
+import type { JsonValue } from './value-model.js';
 
 export type CanonicalJsonCache = WeakMap<object, string>;
 const ownedCanonicalJson = new WeakMap<object, string>();
@@ -6,8 +6,11 @@ const ownedCanonicalJson = new WeakMap<object, string>();
 /** Canonicalizes an arbitrary JSON value without retaining identity-derived state. */
 export const canonicalizeJsonValue = (value: JsonValue): string => canonicalize(value);
 
-/** Canonicalizes immutable owned JSON while memoizing every container subtree. */
-export const canonicalizeJsonWithCache = (value: JsonValue, cache: CanonicalJsonCache): string => canonicalize(value, cache);
+/** Canonicalizes immutable owned JSON while memoizing only the requested root. */
+export const canonicalizeJsonWithCache = (
+  value: JsonValue,
+  cache: CanonicalJsonCache
+): string => canonicalize(value, cache);
 
 /** Reuses canonical text only for containers already owned as immutable values. */
 export const canonicalizeOwnedJsonValue = (value: JsonValue): string =>
@@ -21,9 +24,7 @@ const canonicalize = (value: JsonValue, cache?: CanonicalJsonCache): string => {
   }
   const cached = cache?.get(value);
   if (cached !== undefined) return cached;
-  const canonical = Array.isArray(value)
-    ? canonicalizeArray(value, cache)
-    : canonicalizeRecord(value as Readonly<Record<string, JsonValue>>, cache);
+  const canonical = renderCanonicalJson(value);
   cache?.set(value, canonical);
   return canonical;
 };
@@ -36,38 +37,89 @@ const canonicalizePrimitive = (value: null | string | number | boolean): string 
   return canonical;
 };
 
-/** Pure container rendering; cache ownership remains in `canonicalize`. */
-const canonicalizeArray = (value: readonly JsonValue[], cache?: CanonicalJsonCache): string => {
-  let canonical = '[';
-  for (let index = 0; index < value.length; index += 1) {
-    if (index !== 0) canonical += ',';
-    canonical += canonicalize(value[index] as JsonValue, cache);
-  }
-  return canonical + ']';
-};
+type CanonicalFrame =
+  | {
+      readonly kind: 'array';
+      readonly value: readonly JsonValue[];
+      index: number;
+    }
+  | {
+      readonly kind: 'record';
+      readonly value: Readonly<Record<string, JsonValue>>;
+      readonly keys: readonly string[];
+      index: number;
+    };
 
-/** Pure key ordering and rendering; cache ownership remains in `canonicalize`. */
-const canonicalizeRecord = (value: Readonly<Record<string, JsonValue>>, cache?: CanonicalJsonCache): string => {
-  const keys = Object.keys(value).sort(compareUnicodeScalars);
-  let canonical = '{';
-  for (let index = 0; index < keys.length; index += 1) {
-    if (index !== 0) canonical += ',';
-    const key = keys[index] as string;
-    assertUnicodeScalarString(key);
-    canonical += JSON.stringify(key) + ':' + canonicalize(value[key] as JsonValue, cache);
+/** Iterative rendering keeps narrow deep values linear in work and retained text. */
+const renderCanonicalJson = (root: JsonValue): string => {
+  const chunks: string[] = [];
+  const stack: CanonicalFrame[] = [];
+  let current = root;
+  let hasCurrent = true;
+  while (hasCurrent || stack.length > 0) {
+    if (hasCurrent) {
+      if (current === null || typeof current !== 'object') {
+        chunks.push(canonicalizePrimitive(current));
+        hasCurrent = false;
+        continue;
+      }
+      if (Array.isArray(current)) {
+        chunks.push('[');
+        if (current.length === 0) {
+          chunks.push(']');
+          hasCurrent = false;
+        } else {
+          stack.push({ kind: 'array', value: current, index: 0 });
+          current = current[0] as JsonValue;
+          hasCurrent = true;
+        }
+        continue;
+      }
+      const record = current as Readonly<Record<string, JsonValue>>;
+      const keys = Object.keys(record).sort(compareUnicodeScalars);
+      chunks.push('{');
+      if (keys.length === 0) {
+        chunks.push('}');
+        hasCurrent = false;
+      } else {
+        const key = keys[0] as string;
+        assertUnicodeScalarString(key);
+        chunks.push(JSON.stringify(key), ':');
+        stack.push({ kind: 'record', value: record, keys, index: 0 });
+        current = record[key] as JsonValue;
+        hasCurrent = true;
+      }
+      continue;
+    }
+    const frame = stack.at(-1) as CanonicalFrame;
+    frame.index += 1;
+    const length = frame.kind === 'array'
+      ? frame.value.length
+      : frame.keys.length;
+    if (frame.index >= length) {
+      chunks.push(frame.kind === 'array' ? ']' : '}');
+      stack.pop();
+      continue;
+    }
+    chunks.push(',');
+    if (frame.kind === 'array') {
+      current = frame.value[frame.index] as JsonValue;
+      hasCurrent = true;
+    } else {
+      const key = frame.keys[frame.index] as string;
+      assertUnicodeScalarString(key);
+      chunks.push(JSON.stringify(key), ':');
+      current = frame.value[key] as JsonValue;
+      hasCurrent = true;
+    }
   }
-  return canonical + '}';
+  return chunks.join('');
 };
 
 export const compareUnicodeScalars = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
+const loneSurrogate = /[\uD800-\uDFFF]/u;
+
 export const assertUnicodeScalarString = (value: string): void => {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new TypeError('Lone surrogate');
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) throw new TypeError('Lone surrogate');
-  }
+  if (loneSurrogate.test(value)) throw new TypeError('Lone surrogate');
 };

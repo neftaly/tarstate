@@ -1,5 +1,6 @@
 import { normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { isContentHash } from './canonical-json.js';
+import type { ValueDeclaration } from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { samePortableJson } from './internal-json-equality.js';
@@ -223,7 +224,7 @@ export const compileStorageMapping = (
       } else if (fieldMapping.kind === 'source-metadata'
         && fieldMapping.value === 'recursive-parent-element-identity'
         && (mapping.collection.kind !== 'recursive-array'
-          || declaration.nullable !== true)) {
+          || !fieldAllowsNull(declaration))) {
         issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field], {
           field,
           reason: mapping.collection.kind !== 'recursive-array'
@@ -256,6 +257,14 @@ export const compileStorageMapping = (
     issues: []
   };
 };
+
+const fieldAllowsNull = (field: FieldDeclaration): boolean =>
+  field.nullable === true || declarationAllowsNull(field.type);
+
+const declarationAllowsNull = (declaration: ValueDeclaration): boolean =>
+  declaration.kind === 'null'
+  || (declaration.kind === 'union'
+    && declaration.alternatives.some(declarationAllowsNull));
 
 export const projectStorage = (
   binding: CompiledStorageMapping,

@@ -54,7 +54,7 @@ describe('inert Automerge JSON adoption', () => {
   it('enforces traversal budgets before materializing an unbounded graph', () => {
     const document = Automerge.from({ values: [1, 2, 3] });
     expect(adoptAutomergeJsonValue(document, {
-      maxDepth: 8,
+      maxTotalStringCodeUnits: 8 * 1024 * 1024,
       maxArrayMembers: 2,
       maxObjectMembers: 8,
       maxTotalMembers: 8
@@ -74,6 +74,15 @@ describe('inert Automerge JSON adoption', () => {
         path: ['outer', 0, 'inner'],
         details: { type: 'bytes' }
       }]
+    });
+  });
+
+  it('adopts deep Automerge JSON without exposing the host call stack', () => {
+    let value: unknown = 'leaf';
+    for (let index = 0; index < 256; index += 1) value = { next: value };
+    const document = Automerge.from({ value });
+    expect(adoptAutomergeJsonValue(document.value)).toMatchObject({
+      success: true
     });
   });
 });

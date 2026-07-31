@@ -1,7 +1,8 @@
 import { createIssue, type Issue, type ParseResult } from './issues.js';
+import { assertUnicodeScalarString } from './internal-canonical-json.js';
+import type { JsonValue } from './value-model.js';
 
-export type JsonPrimitive = null | boolean | number | string;
-export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+export type { JsonPrimitive, JsonValue } from './value-model.js';
 
 /** Realm-stable semantic sentinels; compatible package copies must compare them by identity. */
 export const missingValue = Symbol.for('@tarstate/core/value/missing/v1');
@@ -23,89 +24,249 @@ export type TaggedValue = {
 export type PortableValue = JsonValue | TaggedValue;
 
 export type ValueParseBudget = {
-  readonly maxDepth: number;
   readonly maxArrayMembers: number;
   readonly maxObjectMembers: number;
   readonly maxTotalMembers: number;
+  readonly maxTotalStringCodeUnits: number;
 };
 
 export const defaultValueParseBudget: ValueParseBudget = Object.freeze({
-  maxDepth: 64,
   maxArrayMembers: 100_000,
   maxObjectMembers: 100_000,
-  maxTotalMembers: 500_000
+  maxTotalMembers: 500_000,
+  maxTotalStringCodeUnits: 8 * 1024 * 1024
 });
 
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 const inspectionFailure = Symbol('inspectionFailure');
 type InspectionFailure = { readonly [inspectionFailure]: Issue };
 const failedInspection = (issue: Issue): InspectionFailure => ({ [inspectionFailure]: issue });
-const isInspectionFailure = (value: JsonValue | InspectionFailure): value is InspectionFailure => inspectionFailure in Object(value);
+const isInspectionFailure = (value: unknown): value is InspectionFailure =>
+  inspectionFailure in Object(value);
 
 export const safeParseJsonValue = (input: unknown, budget: ValueParseBudget = defaultValueParseBudget): ParseResult<JsonValue> => {
-  const seen = new Set<object>();
+  const ancestors = new Set<object>();
   const path: unknown[] = [];
   let totalMembers = 0;
+  let totalStringCodeUnits = 0;
   const issuePath = (segment?: unknown): readonly unknown[] => segment === undefined ? [...path] : [...path, segment];
-  const inspect = (value: unknown, depth: number): JsonValue | InspectionFailure => {
-    if (depth > budget.maxDepth) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxDepth', limit: budget.maxDepth } }));
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  const countString = (value: string): InspectionFailure | undefined => {
+    try {
+      assertUnicodeScalarString(value);
+    } catch {
+      return failedInspection(createIssue({
+        code: 'artifact.unsupported_value',
+        retry: 'after_input',
+        path: issuePath(),
+        details: { type: 'invalid_unicode_string' }
+      }));
+    }
+    totalStringCodeUnits += value.length;
+    return totalStringCodeUnits > budget.maxTotalStringCodeUnits
+      ? failedInspection(createIssue({
+          code: 'artifact.budget_exceeded',
+          retry: 'after_input',
+          path: issuePath(),
+          details: {
+            budget: 'maxTotalStringCodeUnits',
+            limit: budget.maxTotalStringCodeUnits
+          }
+        }))
+      : undefined;
+  };
+  const inspectPrimitive = (value: unknown): JsonValue | InspectionFailure | undefined => {
+    if (value === null || typeof value === 'boolean') return value;
+    if (typeof value === 'string') return countString(value) ?? value;
     if (typeof value === 'number') {
       if (!Number.isFinite(value)) return failedInspection(createIssue({ code: 'artifact.unsupported_value', retry: 'after_input', path: issuePath(), details: { type: 'non_finite_number' } }));
       return Object.is(value, -0) ? 0 : value;
     }
-    if (typeof value !== 'object') return failedInspection(createIssue({ code: 'artifact.unsupported_value', retry: 'after_input', path: issuePath(), details: { type: typeof value } }));
+    return undefined;
+  };
+
+  type Member = {
+    readonly key: string | number;
+    readonly value: unknown;
+  };
+  type Frame = {
+    readonly input: object;
+    readonly output: JsonValue[] | Record<string, JsonValue>;
+    readonly members: readonly Member[];
+    readonly ownsPathSegment: boolean;
+    index: number;
+  };
+
+  const inspectContainer = (
+    value: object,
+    ownsPathSegment: boolean
+  ): Frame | InspectionFailure => {
     try {
-      if (seen.has(value)) return failedInspection(createIssue({ code: 'artifact.cycle', retry: 'after_input', path: issuePath() }));
-      if (Object.getPrototypeOf(value) !== Object.prototype && !Array.isArray(value)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'prototype' } }));
-      seen.add(value);
+      if (ancestors.has(value)) return failedInspection(createIssue({ code: 'artifact.cycle', retry: 'after_input', path: issuePath() }));
       if (Array.isArray(value)) {
-        if (value.length > budget.maxArrayMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxArrayMembers', limit: budget.maxArrayMembers } }));
-        const descriptors = Object.getOwnPropertyDescriptors(value);
-        for (let index = 0; index < value.length; index += 1) {
-          const descriptor = descriptors[String(index)];
-          if (descriptor === undefined) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(index), details: { reason: 'sparse_array' } }));
-          if (!descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(index), details: { reason: 'array_descriptor' } }));
+        const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+        const length = lengthDescriptor !== undefined && 'value' in lengthDescriptor
+          ? lengthDescriptor.value
+          : undefined;
+        if (!Number.isSafeInteger(length) || length < 0) {
+          return failedInspection(createIssue({
+            code: 'artifact.hostile_shape',
+            retry: 'after_input',
+            path: issuePath(),
+            details: { reason: 'array_length' }
+          }));
         }
-        totalMembers += value.length;
+        if (length > budget.maxArrayMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxArrayMembers', limit: budget.maxArrayMembers } }));
+        const keys = Reflect.ownKeys(value);
+        if (keys.length !== length + 1
+          || keys.some((key) => key !== 'length'
+            && (typeof key !== 'string'
+              || !isArrayIndex(key, length)))) {
+          return failedInspection(createIssue({
+            code: 'artifact.hostile_shape',
+            retry: 'after_input',
+            path: issuePath(),
+            details: { reason: 'array_property' }
+          }));
+        }
+        totalMembers += length;
         if (totalMembers > budget.maxTotalMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxTotalMembers', limit: budget.maxTotalMembers } }));
-        const output: JsonValue[] = [];
-        for (let index = 0; index < value.length; index += 1) {
-          path.push(index);
-          const parsed = inspect((descriptors[String(index)] as PropertyDescriptor & { readonly value: unknown }).value, depth + 1);
-          path.pop();
-          if (isInspectionFailure(parsed)) return parsed;
-          output.push(parsed);
+        const members: Member[] = [];
+        for (let index = 0; index < length; index += 1) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, index);
+          if (descriptor === undefined
+            || !descriptor.enumerable
+            || !('value' in descriptor)) {
+            return failedInspection(createIssue({
+              code: 'artifact.hostile_shape',
+              retry: 'after_input',
+              path: issuePath(index),
+              details: {
+                reason: descriptor === undefined
+                  ? 'sparse_array'
+                  : 'array_descriptor'
+              }
+            }));
+          }
+          members.push({ key: index, value: descriptor.value });
         }
-        return output;
+        ancestors.add(value);
+        return {
+          input: value,
+          output: [],
+          members,
+          ownsPathSegment,
+          index: 0
+        };
       }
-      const descriptors = Object.getOwnPropertyDescriptors(value);
+      if (Object.getPrototypeOf(value) !== Object.prototype) {
+        return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'prototype' } }));
+      }
       const keys = Reflect.ownKeys(value);
       if (keys.some((key) => typeof key !== 'string')) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'symbol_key' } }));
       if (keys.length > budget.maxObjectMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxObjectMembers', limit: budget.maxObjectMembers } }));
       totalMembers += keys.length;
       if (totalMembers > budget.maxTotalMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxTotalMembers', limit: budget.maxTotalMembers } }));
-      const output: Record<string, JsonValue> = {};
+      const members: Member[] = [];
       for (const property of keys as string[]) {
         if (forbiddenKeys.has(property)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(property), details: { reason: 'prototype_pollution_key' } }));
-        const descriptor = descriptors[property];
-        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(property), details: { reason: 'object_descriptor' } }));
         path.push(property);
-        const parsed = inspect(descriptor.value, depth + 1);
+        const stringFailure = countString(property);
         path.pop();
-        if (isInspectionFailure(parsed)) return parsed;
-        output[property] = parsed;
+        if (stringFailure !== undefined) return stringFailure;
+        const descriptor = Object.getOwnPropertyDescriptor(value, property);
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(property), details: { reason: 'object_descriptor' } }));
+        members.push({ key: property, value: descriptor.value });
       }
-      return output;
+      ancestors.add(value);
+      return {
+        input: value,
+        output: {},
+        members,
+        ownsPathSegment,
+        index: 0
+      };
     } catch (error) {
       return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'inspection_threw', error: error instanceof Error ? error.name : typeof error } }));
-    } finally {
-      seen.delete(value);
     }
   };
 
-  const value = inspect(input, 0);
-  return isInspectionFailure(value) ? { success: false, issues: [value[inspectionFailure]] } : { success: true, value, issues: [] };
+  const rootPrimitive = inspectPrimitive(input);
+  if (rootPrimitive !== undefined) {
+    return isInspectionFailure(rootPrimitive)
+      ? { success: false, issues: [rootPrimitive[inspectionFailure]] }
+      : { success: true, value: rootPrimitive, issues: [] };
+  }
+  if (typeof input !== 'object' || input === null) {
+    return {
+      success: false,
+      issues: [createIssue({
+        code: 'artifact.unsupported_value',
+        retry: 'after_input',
+        details: { type: typeof input }
+      })]
+    };
+  }
+  const root = inspectContainer(input, false);
+  if (isInspectionFailure(root)) {
+    return { success: false, issues: [root[inspectionFailure]] };
+  }
+  const stack: Frame[] = [root];
+  while (stack.length > 0) {
+    const frame = stack.at(-1) as Frame;
+    if (frame.index >= frame.members.length) {
+      ancestors.delete(frame.input);
+      stack.pop();
+      if (frame.ownsPathSegment) path.pop();
+      continue;
+    }
+    const member = frame.members[frame.index] as Member;
+    frame.index += 1;
+    path.push(member.key);
+    const primitive = inspectPrimitive(member.value);
+    if (primitive !== undefined) {
+      if (isInspectionFailure(primitive)) {
+        return { success: false, issues: [primitive[inspectionFailure]] };
+      }
+      assignMember(frame.output, member.key, primitive);
+      path.pop();
+      continue;
+    }
+    if (typeof member.value !== 'object' || member.value === null) {
+      return {
+        success: false,
+        issues: [createIssue({
+          code: 'artifact.unsupported_value',
+          retry: 'after_input',
+          path: issuePath(),
+          details: { type: typeof member.value }
+        })]
+      };
+    }
+    const child = inspectContainer(member.value, true);
+    if (isInspectionFailure(child)) {
+      return { success: false, issues: [child[inspectionFailure]] };
+    }
+    assignMember(frame.output, member.key, child.output);
+    stack.push(child);
+  }
+  return { success: true, value: root.output, issues: [] };
+};
+
+const assignMember = (
+  output: JsonValue[] | Record<string, JsonValue>,
+  key: string | number,
+  value: JsonValue
+): void => {
+  if (Array.isArray(output) && typeof key === 'number') output.push(value);
+  else (output as Record<string, JsonValue>)[key] = value;
+};
+
+const isArrayIndex = (key: string, length: number): boolean => {
+  const index = Number(key);
+  return Number.isSafeInteger(index)
+    && index >= 0
+    && index < length
+    && String(index) === key;
 };
 
 export const isTaggedValue = (value: JsonValue): value is TaggedValue => {

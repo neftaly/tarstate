@@ -1,12 +1,22 @@
-import { parseScalarValue, type ScalarDeclaration } from './codec.js';
+import {
+  parseScalarValue,
+  parseValueDeclaration,
+  type ScalarDeclaration,
+  type ValueDeclaration
+} from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { canonicalizeOwnedJsonValue } from './internal-canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
 import { assertPreparedRelation, assertPreparedSchema, sealPreparedRelation, sealPreparedSchema } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
+import { isValueDeclaration as isStructuredValueDeclaration } from './internal-value-declaration.js';
 import { CapabilityRegistry } from './registry.js';
-import type { JsonValue, PortableValue } from './value.js';
+import {
+  defaultValueParseBudget,
+  type JsonValue,
+  type PortableValue
+} from './value.js';
 
 export type RelationId = string;
 export type LogicalKey = readonly [PortableValue, ...PortableValue[]];
@@ -35,7 +45,7 @@ export type RelationDeclaration = {
 };
 
 export type FieldDeclaration = {
-  readonly type: ScalarDeclaration;
+  readonly type: ValueDeclaration;
   readonly optional?: boolean;
   readonly nullable?: boolean;
   readonly editCapabilities?: readonly CapabilityRef[];
@@ -51,7 +61,9 @@ export type PreparedRelation = {
   readonly [preparedRelationBrand]: true;
   readonly name: string;
   readonly declaration: RelationDeclaration;
-  readonly keyFields: readonly FieldDeclaration[];
+  readonly keyFields: readonly (
+    FieldDeclaration & { readonly type: ScalarDeclaration }
+  )[];
 };
 
 export type PreparedSchema = {
@@ -121,19 +133,35 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
         relationValid = false;
         continue;
       }
-      if (field.type.kind === 'string' && field.type.values !== undefined && (field.type.values.length === 0 || new Set(field.type.values).size !== field.type.values.length)) {
-        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName, 'type', 'values'], { reason: field.type.values.length === 0 ? 'empty_enum' : 'duplicate_enum_value' }));
+      const typeIssue = valueDeclarationIssue(
+        field.type,
+        [...path, 'fields', fieldName, 'type']
+      );
+      if (typeIssue !== undefined) {
+        issues.push(typeIssue);
         relationValid = false;
       }
     }
     if (!relationValid) continue;
-    const keyFields: FieldDeclaration[] = [];
+    const keyFields: (FieldDeclaration & { readonly type: ScalarDeclaration })[] = [];
     for (const fieldName of declaration.key) {
       const field = declaration.fields[fieldName];
-      if (field === undefined || field.optional === true || field.nullable === true) {
-        issues.push(schemaIssue('schema.key_invalid', [...path, 'key', fieldName], { reason: field === undefined ? 'unknown_field' : field.optional === true ? 'optional' : 'nullable' }));
+      if (field === undefined
+        || field.optional === true
+        || field.nullable === true
+        || !isScalarDeclaration(field.type)) {
+        const reason = field === undefined
+          ? 'unknown_field'
+          : field.optional === true
+            ? 'optional'
+            : field.nullable === true
+              ? 'nullable'
+              : 'structured';
+        issues.push(schemaIssue('schema.key_invalid', [...path, 'key', fieldName], { reason }));
         relationValid = false;
-      } else keyFields.push(field);
+      } else {
+        keyFields.push(field as FieldDeclaration & { readonly type: ScalarDeclaration });
+      }
     }
     if (!relationValid) continue;
     const prepared = sealPreparedRelation<PreparedRelation>({ name, declaration, keyFields: Object.freeze(keyFields) });
@@ -143,8 +171,10 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
 
   for (const relation of relationsById.values()) {
     for (const [fieldName, field] of Object.entries(relation.declaration.fields)) {
-      if (field.type.kind === 'ref' && !relationsById.has(field.type.target.relationId)) {
-        issues.push(schemaIssue('schema.ref_target_missing', ['relations', relation.name, 'fields', fieldName, 'type', 'target'], { relationId: field.type.target.relationId }));
+      for (const relationId of referencedRelationIds(field.type)) {
+        if (!relationsById.has(relationId)) {
+          issues.push(schemaIssue('schema.ref_target_missing', ['relations', relation.name, 'fields', fieldName, 'type'], { relationId }));
+        }
       }
     }
   }
@@ -207,12 +237,11 @@ const parseRelationCandidateFields = (
       continue;
     }
     const value = input[name];
-    if (value === null) {
-      if (field.nullable === true) row[name] = null;
-      else issues.push(contextualIssue('schema.null_not_allowed', prepared.declaration.relationId, context, fieldPath, { field: name }));
+    if (value === null && field.nullable === true) {
+      row[name] = null;
       continue;
     }
-    const parsed = parseScalarValue(field.type, value, {
+    const parsed = parseValueDeclaration(field.type, value, {
       ...(registry === undefined ? {} : { registry }),
       path: fieldPath,
       refFields: (relationId) => schema.relationsById.get(relationId)?.keyFields.map((keyField) => keyField.type)
@@ -356,10 +385,10 @@ export const parseScalarValueForField = (
   path: readonly unknown[] = []
 ): ParseResult<PortableValue> => {
   assertPreparedSchema(schema);
-  if (input === null) return field.nullable === true
-    ? { success: true, value: null, issues: [] }
-    : schemaFailure('schema.null_not_allowed', path);
-  const parsed = parseScalarValue(field.type, input, {
+  if (input === null && field.nullable === true) {
+    return { success: true, value: null, issues: [] };
+  }
+  const parsed = parseValueDeclaration(field.type, input, {
     ...(registry === undefined ? {} : { registry }),
     path,
     refFields: (relationId) => schema.relationsById.get(relationId)?.keyFields.map((keyField) => keyField.type)
@@ -388,7 +417,7 @@ const isRelationDeclaration = (value: unknown): value is RelationDeclaration => 
   && (value.metadata === undefined || isRecord(value.metadata));
 const isFieldDeclaration = (value: unknown): value is FieldDeclaration => isRecord(value)
   && hasOnlyKeys(value, ['type', 'optional', 'nullable', 'editCapabilities', 'description', 'metadata'])
-  && isScalarDeclaration(value.type)
+  && isStructuredValueDeclaration(value.type, isScalarDeclaration)
   && (value.optional === undefined || typeof value.optional === 'boolean')
   && (value.nullable === undefined || typeof value.nullable === 'boolean')
   && (value.editCapabilities === undefined || isCapabilityRefs(value.editCapabilities))
@@ -401,6 +430,236 @@ const isScalarDeclaration = (value: unknown): value is ScalarDeclaration => {
   if (value.kind === 'instant') return hasOnlyKeys(value, ['kind', 'precision']) && (value.precision === 'millisecond' || value.precision === 'microsecond' || value.precision === 'nanosecond');
   if (value.kind === 'ref') return hasOnlyKeys(value, ['kind', 'target']) && isRecord(value.target) && hasOnlyKeys(value.target, ['relationId']) && typeof value.target.relationId === 'string' && value.target.relationId.length > 0;
   return value.kind === 'custom' && hasOnlyKeys(value, ['kind', 'codec']) && isCapabilityRef(value.codec);
+};
+const valueDeclarationIssue = (
+  declaration: ValueDeclaration,
+  path: readonly unknown[],
+  depth = 0,
+  validation: ValueDeclarationValidation = {
+    remainingComparisons: defaultValueParseBudget.maxTotalMembers,
+    exhausted: false
+  }
+): Issue | undefined => {
+  if (depth > 64) {
+    return schemaIssue('schema.field_invalid', path, {
+      reason: 'contract_depth'
+    });
+  }
+  if (declaration.kind === 'string' && declaration.values !== undefined) {
+    if (declaration.values.length === 0
+      || new Set(declaration.values).size !== declaration.values.length) {
+      return schemaIssue('schema.field_invalid', [...path, 'values'], {
+        reason: declaration.values.length === 0
+          ? 'empty_enum'
+          : 'duplicate_enum_value'
+      });
+    }
+  }
+  if (declaration.kind === 'array') {
+    if (declaration.maxItems > defaultValueParseBudget.maxArrayMembers) {
+      return schemaIssue('schema.field_invalid', [...path, 'maxItems'], {
+        reason: 'array_bound_exceeds_parse_budget',
+        maximum: defaultValueParseBudget.maxArrayMembers
+      });
+    }
+    return valueDeclarationIssue(
+      declaration.items,
+      [...path, 'items'],
+      depth + 1,
+      validation
+    );
+  }
+  if (declaration.kind === 'tuple') {
+    if (declaration.items.length > defaultValueParseBudget.maxArrayMembers) {
+      return schemaIssue('schema.field_invalid', [...path, 'items'], {
+        reason: 'tuple_exceeds_parse_budget'
+      });
+    }
+    for (let index = 0; index < declaration.items.length; index += 1) {
+      const issue = valueDeclarationIssue(
+        declaration.items[index] as ValueDeclaration,
+        [...path, 'items', index],
+        depth + 1,
+        validation
+      );
+      if (issue !== undefined) return issue;
+    }
+    return undefined;
+  }
+  if (declaration.kind === 'record') {
+    const optional = declaration.optional ?? [];
+    if (new Set(optional).size !== optional.length) {
+      return schemaIssue('schema.field_invalid', [...path, 'optional'], {
+        reason: 'duplicate_optional_field'
+      });
+    }
+    for (const name of optional) {
+      if (!Object.hasOwn(declaration.fields, name)) {
+        return schemaIssue('schema.field_invalid', [...path, 'optional'], {
+          reason: 'unknown_optional_field',
+          field: name
+        });
+      }
+    }
+    for (const [name, member] of Object.entries(declaration.fields)) {
+      if (name.length === 0) {
+        return schemaIssue('schema.field_invalid', [...path, 'fields', name], {
+          reason: 'empty_field_name'
+        });
+      }
+      const issue = valueDeclarationIssue(
+        member,
+        [...path, 'fields', name],
+        depth + 1,
+        validation
+      );
+      if (issue !== undefined) return issue;
+    }
+    return undefined;
+  }
+  if (declaration.kind === 'union') {
+    for (let index = 0; index < declaration.alternatives.length; index += 1) {
+      const issue = valueDeclarationIssue(
+        declaration.alternatives[index] as ValueDeclaration,
+        [...path, 'alternatives', index],
+        depth + 1,
+        validation
+      );
+      if (issue !== undefined) return issue;
+      for (let prior = 0; prior < index; prior += 1) {
+        if (!valueDeclarationsAreDisjoint(
+          declaration.alternatives[prior] as ValueDeclaration,
+          declaration.alternatives[index] as ValueDeclaration,
+          validation
+        )) {
+          return schemaIssue('schema.field_invalid', [...path, 'alternatives', index], {
+            reason: validation.exhausted
+              ? 'contract_complexity'
+              : 'ambiguous_union',
+            overlaps: prior
+          });
+        }
+      }
+    }
+  }
+  return undefined;
+};
+
+type ValueDeclarationValidation = {
+  remainingComparisons: number;
+  exhausted: boolean;
+};
+
+const valueDeclarationsAreDisjoint = (
+  left: ValueDeclaration,
+  right: ValueDeclaration,
+  validation: ValueDeclarationValidation
+): boolean => {
+  validation.remainingComparisons -= 1;
+  if (validation.remainingComparisons < 0) {
+    validation.exhausted = true;
+    return false;
+  }
+  if (left.kind === 'union') {
+    return left.alternatives.every((alternative) =>
+      valueDeclarationsAreDisjoint(alternative, right, validation));
+  }
+  if (right.kind === 'union') {
+    return right.alternatives.every((alternative) =>
+      valueDeclarationsAreDisjoint(left, alternative, validation));
+  }
+  const leftKinds = declarationJsonKinds(left);
+  const rightKinds = declarationJsonKinds(right);
+  if ([...leftKinds].every((kind) => !rightKinds.has(kind))) return true;
+  if (left.kind === 'string' && right.kind === 'string') {
+    return left.values !== undefined
+      && right.values !== undefined
+      && left.values.every((value) => !right.values?.includes(value));
+  }
+  if (left.kind === 'tuple' && right.kind === 'tuple') {
+    return left.items.length !== right.items.length
+      || left.items.some((item, index) =>
+        valueDeclarationsAreDisjoint(
+          item,
+          right.items[index] as ValueDeclaration,
+          validation
+        ));
+  }
+  if (left.kind === 'array' && right.kind === 'tuple') {
+    return right.items.length > left.maxItems;
+  }
+  if (left.kind === 'tuple' && right.kind === 'array') {
+    return left.items.length > right.maxItems;
+  }
+  if (left.kind === 'record' && right.kind === 'record') {
+    const leftOptional = new Set(left.optional ?? []);
+    const rightOptional = new Set(right.optional ?? []);
+    for (const [name, member] of Object.entries(left.fields)) {
+      if (!leftOptional.has(name) && !Object.hasOwn(right.fields, name)) return true;
+      const other = right.fields[name];
+      if (other !== undefined
+        && !leftOptional.has(name)
+        && !rightOptional.has(name)
+        && valueDeclarationsAreDisjoint(member, other, validation)) {
+        return true;
+      }
+    }
+    for (const name of Object.keys(right.fields)) {
+      if (!rightOptional.has(name) && !Object.hasOwn(left.fields, name)) return true;
+    }
+  }
+  if (isTaggedBuiltIn(left) && isTaggedBuiltIn(right)) {
+    return left.kind !== right.kind;
+  }
+  return false;
+};
+
+type JsonKind = 'null' | 'boolean' | 'number' | 'string' | 'array' | 'record';
+
+const declarationJsonKinds = (declaration: ValueDeclaration): ReadonlySet<JsonKind> => {
+  if (declaration.kind === 'json') {
+    return new Set(['null', 'boolean', 'number', 'string', 'array', 'record']);
+  }
+  if (declaration.kind === 'union') {
+    const kinds = new Set<JsonKind>();
+    for (const alternative of declaration.alternatives) {
+      for (const kind of declarationJsonKinds(alternative)) kinds.add(kind);
+    }
+    return kinds;
+  }
+  if (declaration.kind === 'null') return new Set(['null']);
+  if (declaration.kind === 'boolean') return new Set(['boolean']);
+  if (declaration.kind === 'number' || declaration.kind === 'integer') {
+    return new Set(['number']);
+  }
+  if (declaration.kind === 'string') return new Set(['string']);
+  if (declaration.kind === 'array'
+    || declaration.kind === 'tuple'
+    || declaration.kind === 'ref') {
+    return new Set(['array']);
+  }
+  return new Set(['record']);
+};
+
+const isTaggedBuiltIn = (
+  declaration: ValueDeclaration
+): declaration is Extract<ScalarDeclaration, { readonly kind: 'decimal' | 'instant' | 'bytes' }> =>
+  declaration.kind === 'decimal'
+  || declaration.kind === 'instant'
+  || declaration.kind === 'bytes';
+
+const referencedRelationIds = (declaration: ValueDeclaration): readonly string[] => {
+  const ids: string[] = [];
+  const pending: ValueDeclaration[] = [declaration];
+  while (pending.length > 0) {
+    const current = pending.pop() as ValueDeclaration;
+    if (current.kind === 'ref') ids.push(current.target.relationId);
+    else if (current.kind === 'array') pending.push(current.items);
+    else if (current.kind === 'tuple') pending.push(...current.items);
+    else if (current.kind === 'record') pending.push(...Object.values(current.fields));
+    else if (current.kind === 'union') pending.push(...current.alternatives);
+  }
+  return ids;
 };
 const isCapabilityRefs = (value: unknown): value is readonly CapabilityRef[] => Array.isArray(value) && value.every(isCapabilityRef);
 const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && typeof value.contractHash === 'string' && /^sha256:[0-9a-f]{64}$/.test(value.contractHash);

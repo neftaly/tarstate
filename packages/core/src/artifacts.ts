@@ -4,7 +4,7 @@ import {
   sha256Json,
   type ContentHash
 } from './canonical-json.js';
-import { assertUnicodeScalarString, compareUnicodeScalars } from './internal-canonical-json.js';
+import { compareUnicodeScalars } from './internal-canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
@@ -156,7 +156,9 @@ export const safeParseJsonText = (text: string, budget: ArtifactParseBudget = de
   const byteLength = utf8ByteLength(text);
   if (byteLength > budget.maxBytes) return { success: false, issues: [createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', details: { budget: 'maxBytes', limit: budget.maxBytes } })] };
   try {
-    return { success: true, value: new DuplicateAwareJsonParser(text, budget).parse(), issues: [] };
+    const value = JSON.parse(text) as unknown;
+    inspectJsonTextMemberNames(text);
+    return safeParseJsonValue(value, budget);
   } catch (error) {
     const issue = error instanceof JsonTextIssue ? error.issue : createIssue({ code: 'artifact.invalid_json', retry: 'after_input' });
     return { success: false, issues: [issue] };
@@ -172,140 +174,152 @@ class JsonTextIssue extends Error {
   }
 }
 
-class DuplicateAwareJsonParser {
-  readonly #text: string;
-  readonly #budget: ArtifactParseBudget;
-  #position = 0;
-  #totalMembers = 0;
+type JsonTextPath = {
+  readonly parent?: JsonTextPath;
+  readonly segment: string | number;
+};
 
-  constructor(text: string, budget: ArtifactParseBudget) { this.#text = text; this.#budget = budget; }
-
-  parse(): JsonValue {
-    this.#skipWhitespace();
-    const value = this.#value(0, []);
-    this.#skipWhitespace();
-    if (this.#position !== this.#text.length) this.#fail('artifact.invalid_json', [], { position: this.#position });
-    return value;
-  }
-
-  #value(depth: number, path: readonly unknown[]): JsonValue {
-    if (depth > this.#budget.maxDepth) this.#fail('artifact.budget_exceeded', path, { budget: 'maxDepth', limit: this.#budget.maxDepth });
-    this.#skipWhitespace();
-    const char = this.#text[this.#position];
-    if (char === '{') return this.#object(depth, path);
-    if (char === '[') return this.#array(depth, path);
-    if (char === '"') return this.#string(path);
-    if (char === 't' && this.#consume('true')) return true;
-    if (char === 'f' && this.#consume('false')) return false;
-    if (char === 'n' && this.#consume('null')) return null;
-    return this.#number(path);
-  }
-
-  #object(depth: number, path: readonly unknown[]): JsonValue {
-    this.#position += 1;
-    this.#skipWhitespace();
-    const output: Record<string, JsonValue> = {};
-    const seen = new Set<string>();
-    let members = 0;
-    if (this.#text[this.#position] === '}') { this.#position += 1; return output; }
-    while (true) {
-      if (this.#text[this.#position] !== '"') this.#fail('artifact.invalid_json', path, { position: this.#position });
-      const key = this.#string(path);
-      if (forbiddenKeys.has(key)) this.#fail('artifact.hostile_shape', [...path, key], { reason: 'prototype_pollution_key' });
-      if (seen.has(key)) this.#fail('artifact.duplicate_member', [...path, key], { member: key });
-      seen.add(key);
-      this.#skipWhitespace();
-      if (this.#text[this.#position] !== ':') this.#fail('artifact.invalid_json', [...path, key], { position: this.#position });
-      this.#position += 1;
-      output[key] = this.#value(depth + 1, [...path, key]);
-      members += 1;
-      this.#memberBudget(members, this.#budget.maxObjectMembers, 'maxObjectMembers', path);
-      this.#skipWhitespace();
-      const separator = this.#text[this.#position];
-      if (separator === '}') { this.#position += 1; return output; }
-      if (separator !== ',') this.#fail('artifact.invalid_json', path, { position: this.#position });
-      this.#position += 1;
-      this.#skipWhitespace();
+type JsonTextContainer =
+  | {
+      readonly kind: 'array';
+      readonly path: JsonTextPath | undefined;
+      nextIndex: number;
     }
-  }
+  | {
+      readonly kind: 'object';
+      readonly path: JsonTextPath | undefined;
+      readonly keys: Set<string>;
+      pendingKey: string | undefined;
+    };
 
-  #array(depth: number, path: readonly unknown[]): JsonValue {
-    this.#position += 1;
-    this.#skipWhitespace();
-    const output: JsonValue[] = [];
-    if (this.#text[this.#position] === ']') { this.#position += 1; return output; }
-    while (true) {
-      output.push(this.#value(depth + 1, [...path, output.length]));
-      this.#memberBudget(output.length, this.#budget.maxArrayMembers, 'maxArrayMembers', path);
-      this.#skipWhitespace();
-      const separator = this.#text[this.#position];
-      if (separator === ']') { this.#position += 1; return output; }
-      if (separator !== ',') this.#fail('artifact.invalid_json', path, { position: this.#position });
-      this.#position += 1;
+/** Native parsing is stack-safe; this lexical pass retains duplicate-key evidence. */
+const inspectJsonTextMemberNames = (text: string): void => {
+  const containers: JsonTextContainer[] = [];
+  let position = 0;
+  while (position < text.length) {
+    const char = text[position] as string;
+    if (' \t\r\n,:'.includes(char)) {
+      position += 1;
+      continue;
     }
-  }
-
-  #string(path: readonly unknown[]): string {
-    const start = this.#position;
-    this.#position += 1;
-    while (this.#position < this.#text.length) {
-      const code = this.#text.charCodeAt(this.#position);
-      if (code === 0x22) {
-        this.#position += 1;
-        const token = this.#text.slice(start, this.#position);
-        try {
-          const value = JSON.parse(token) as string;
-          assertUnicodeScalarString(value);
-          return value;
-        } catch {
-          this.#fail('artifact.invalid_json', path, { position: start });
+    if (char === '"') {
+      const token = scanJsonString(text, position);
+      position = token.end;
+      const next = nextNonWhitespace(text, position);
+      const container = containers.at(-1);
+      if (text[next] === ':' && container?.kind === 'object') {
+        const path = [...materializeTextPath(container.path), token.value];
+        if (forbiddenKeys.has(token.value)) {
+          throw new JsonTextIssue(createIssue({
+            code: 'artifact.hostile_shape',
+            retry: 'after_input',
+            path,
+            details: { reason: 'prototype_pollution_key' }
+          }));
         }
+        if (container.keys.has(token.value)) {
+          throw new JsonTextIssue(createIssue({
+            code: 'artifact.duplicate_member',
+            retry: 'after_input',
+            path,
+            details: { member: token.value }
+          }));
+        }
+        container.keys.add(token.value);
+        container.pendingKey = token.value;
+      } else {
+        takeTextValuePath(container);
       }
-      if (code < 0x20) this.#fail('artifact.invalid_json', path, { position: this.#position });
-      if (code === 0x5c) {
-        this.#position += 1;
-        const escape = this.#text[this.#position];
-        if (escape === 'u') {
-          const digits = this.#text.slice(this.#position + 1, this.#position + 5);
-          if (!/^[0-9a-fA-F]{4}$/.test(digits)) this.#fail('artifact.invalid_json', path, { position: this.#position });
-          this.#position += 4;
-        } else if (escape === undefined || !'"\\/bfnrt'.includes(escape)) this.#fail('artifact.invalid_json', path, { position: this.#position });
-      }
-      this.#position += 1;
+      continue;
     }
-    this.#fail('artifact.invalid_json', path, { position: start });
+    if (char === '{' || char === '[') {
+      const path = takeTextValuePath(containers.at(-1));
+      containers.push(char === '{'
+        ? { kind: 'object', path, keys: new Set(), pendingKey: undefined }
+        : { kind: 'array', path, nextIndex: 0 });
+      position += 1;
+      continue;
+    }
+    if (char === '}' || char === ']') {
+      containers.pop();
+      position += 1;
+      continue;
+    }
+    takeTextValuePath(containers.at(-1));
+    if (char === 't') position += 4;
+    else if (char === 'f') position += 5;
+    else if (char === 'n') position += 4;
+    else {
+      jsonNumberPattern.lastIndex = position;
+      const number = jsonNumberPattern.exec(text);
+      position += number?.[0].length ?? 1;
+    }
   }
+};
 
-  #number(path: readonly unknown[]): number {
-    jsonNumberPattern.lastIndex = this.#position;
-    const match = jsonNumberPattern.exec(this.#text);
-    if (match === null) this.#fail('artifact.invalid_json', path, { position: this.#position });
-    this.#position += match[0].length;
-    const value = Number(match[0]);
-    if (!Number.isFinite(value)) this.#fail('artifact.unsupported_value', path, { type: 'non_finite_number' });
-    return Object.is(value, -0) ? 0 : value;
+const scanJsonString = (
+  text: string,
+  start: number
+): { readonly value: string; readonly end: number } => {
+  let position = start + 1;
+  while (position < text.length) {
+    const code = text.charCodeAt(position);
+    if (code === 0x22) {
+      const end = position + 1;
+      return {
+        value: JSON.parse(text.slice(start, end)) as string,
+        end
+      };
+    }
+    if (code === 0x5c) position += 1;
+    position += 1;
   }
+  throw new SyntaxError('Unterminated JSON string');
+};
 
-  #consume(token: string): boolean {
-    if (!this.#text.startsWith(token, this.#position)) return false;
-    this.#position += token.length;
-    return true;
+const nextNonWhitespace = (text: string, start: number): number => {
+  let position = start;
+  while (position < text.length
+    && ' \t\r\n'.includes(text[position] as string)) {
+    position += 1;
   }
+  return position;
+};
 
-  #memberBudget(count: number, limit: number, name: string, path: readonly unknown[]): void {
-    this.#totalMembers += 1;
-    if (count > limit) this.#fail('artifact.budget_exceeded', path, { budget: name, limit });
-    if (this.#totalMembers > this.#budget.maxTotalMembers) this.#fail('artifact.budget_exceeded', path, { budget: 'maxTotalMembers', limit: this.#budget.maxTotalMembers });
+const takeTextValuePath = (
+  container: JsonTextContainer | undefined
+): JsonTextPath | undefined => {
+  if (container === undefined) return undefined;
+  if (container.kind === 'array') {
+    const path = {
+      ...(container.path === undefined ? {} : { parent: container.path }),
+      segment: container.nextIndex
+    };
+    container.nextIndex += 1;
+    return path;
   }
+  const key = container.pendingKey;
+  container.pendingKey = undefined;
+  return key === undefined
+    ? container.path
+    : {
+        ...(container.path === undefined ? {} : { parent: container.path }),
+        segment: key
+      };
+};
 
-  #skipWhitespace(): void {
-    while (this.#position < this.#text.length && ' \t\r\n'.includes(this.#text[this.#position] as string)) this.#position += 1;
+const materializeTextPath = (
+  path: JsonTextPath | undefined
+): readonly (string | number)[] => {
+  const reversed: (string | number)[] = [];
+  let current = path;
+  while (current !== undefined) {
+    reversed.push(current.segment);
+    current = current.parent;
   }
-
-  #fail(code: string, path: readonly unknown[], details?: unknown): never {
-    throw new JsonTextIssue(createIssue({ code, phase: 'parse', severity: 'error', retry: 'after_input', path, ...(details === undefined ? {} : { details }) }));
-  }
-}
+  reversed.reverse();
+  return reversed;
+};
 
 const utf8ByteLength = (text: string): number => {
   let bytes = 0;

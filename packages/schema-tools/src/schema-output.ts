@@ -4,7 +4,8 @@ import {
   type FieldDeclaration,
   type PreparedSchema,
   type ScalarDeclaration,
-  type SchemaArtifact
+  type SchemaArtifact,
+  type ValueDeclaration
 } from '@tarstate/core/schema';
 import { schemaToolsFailure } from './internal-issues.js';
 
@@ -69,10 +70,10 @@ export const renderTypeScriptDeclarations = ({ artifact, schema }: PreparedSchem
     for (const [fieldName, field] of sortedEntries(relation.declaration.fields)) {
       const optional = field.optional === true ? '?' : '';
       const nullable = field.nullable === true ? ' | null' : '';
-      lines.push('  readonly ' + propertyName(fieldName) + optional + ': ' + scalarTypeScript(field.type, names) + nullable + ';');
+      lines.push('  readonly ' + propertyName(fieldName) + optional + ': ' + valueTypeScript(field.type, names) + nullable + ';');
     }
     lines.push('}');
-    const keyTypes = relation.declaration.key.map((fieldName) => scalarTypeScript(relation.declaration.fields[fieldName]!.type, names));
+    const keyTypes = relation.declaration.key.map((fieldName) => valueTypeScript(relation.declaration.fields[fieldName]!.type, names));
     lines.push('export type ' + typeName + 'Key = readonly [' + keyTypes.join(', ') + '];');
     lines.push('');
   }
@@ -106,7 +107,7 @@ export const generateJsonSchema = ({ artifact, schema }: PreparedSchemaTooling):
     };
     definitions[typeName + 'Key'] = {
       type: 'array',
-      prefixItems: relation.declaration.key.map((fieldName) => scalarJsonSchema(relation.declaration.fields[fieldName]!.type, names)),
+      prefixItems: relation.declaration.key.map((fieldName) => valueJsonSchema(relation.declaration.fields[fieldName]!.type, names)),
       minItems: relation.declaration.key.length,
       maxItems: relation.declaration.key.length
     };
@@ -140,7 +141,7 @@ export const renderSchemaMarkdown = ({ artifact, schema }: PreparedSchemaTooling
     lines.push('- Logical key: ' + relation.declaration.key.map(markdownCode).join(', '), '');
     lines.push('| Field | Type | Optional | Nullable | Description |', '| --- | --- | --- | --- | --- |');
     for (const [fieldName, field] of sortedEntries(relation.declaration.fields)) {
-      lines.push('| ' + markdownCode(fieldName) + ' | ' + markdownCode(scalarLabel(field.type)) + ' | ' + yesNo(field.optional) + ' | ' + yesNo(field.nullable) + ' | ' + markdownText(field.description ?? '') + ' |');
+      lines.push('| ' + markdownCode(fieldName) + ' | ' + markdownCode(valueLabel(field.type)) + ' | ' + yesNo(field.optional) + ' | ' + yesNo(field.nullable) + ' | ' + markdownText(field.description ?? '') + ' |');
     }
     lines.push('');
   }
@@ -148,9 +149,54 @@ export const renderSchemaMarkdown = ({ artifact, schema }: PreparedSchemaTooling
 };
 
 const fieldJsonSchema = (field: FieldDeclaration, names: ReadonlyMap<string, string>): JsonValue => {
-  const scalar = scalarJsonSchema(field.type, names);
+  const scalar = valueJsonSchema(field.type, names);
   const schema = field.nullable === true ? { anyOf: [scalar, { type: 'null' }] } : scalar;
   return field.description === undefined ? schema : { ...schema as Readonly<Record<string, JsonValue>>, description: field.description };
+};
+
+const valueJsonSchema = (
+  declaration: ValueDeclaration,
+  names: ReadonlyMap<string, string>
+): JsonValue => {
+  if (declaration.kind === 'null') return { type: 'null' };
+  if (declaration.kind === 'array') {
+    return {
+      type: 'array',
+      items: valueJsonSchema(declaration.items, names),
+      maxItems: declaration.maxItems
+    };
+  }
+  if (declaration.kind === 'tuple') {
+    return {
+      type: 'array',
+      prefixItems: declaration.items.map((item) => valueJsonSchema(item, names)),
+      minItems: declaration.items.length,
+      maxItems: declaration.items.length
+    };
+  }
+  if (declaration.kind === 'record') {
+    const optional = new Set(declaration.optional ?? []);
+    return {
+      type: 'object',
+      additionalProperties: false,
+      properties: Object.fromEntries(
+        sortedEntries(declaration.fields).map(([name, member]) => [
+          name,
+          valueJsonSchema(member, names)
+        ])
+      ),
+      required: Object.keys(declaration.fields)
+        .filter((name) => !optional.has(name))
+        .sort(compare)
+    };
+  }
+  if (declaration.kind === 'union') {
+    return {
+      oneOf: declaration.alternatives.map((alternative) =>
+        valueJsonSchema(alternative, names))
+    };
+  }
+  return scalarJsonSchema(declaration, names);
 };
 
 const scalarJsonSchema = (scalar: ScalarDeclaration, names: ReadonlyMap<string, string>): JsonValue => {
@@ -185,12 +231,69 @@ const scalarTypeScript = (scalar: ScalarDeclaration, names: ReadonlyMap<string, 
   return "Readonly<{ kind: 'tarstate.value'; type: " + JSON.stringify(scalar.kind) + '; value: string }>';
 };
 
+const valueTypeScript = (
+  declaration: ValueDeclaration,
+  names: ReadonlyMap<string, string>
+): string => {
+  if (declaration.kind === 'null') return 'null';
+  if (declaration.kind === 'array') {
+    return 'readonly (' + valueTypeScript(declaration.items, names) + ')[]';
+  }
+  if (declaration.kind === 'tuple') {
+    return 'readonly [' + declaration.items
+      .map((item) => valueTypeScript(item, names))
+      .join(', ') + ']';
+  }
+  if (declaration.kind === 'record') {
+    const optional = new Set(declaration.optional ?? []);
+    return 'Readonly<{ '
+      + sortedEntries(declaration.fields)
+        .map(([name, member]) =>
+          'readonly '
+          + propertyName(name)
+          + (optional.has(name) ? '?' : '')
+          + ': '
+          + valueTypeScript(member, names))
+        .join('; ')
+      + ' }>';
+  }
+  if (declaration.kind === 'union') {
+    return declaration.alternatives
+      .map((alternative) => valueTypeScript(alternative, names))
+      .join(' | ');
+  }
+  return scalarTypeScript(declaration, names);
+};
+
 const scalarLabel = (scalar: ScalarDeclaration): string => {
   if (scalar.kind === 'string' && scalar.values !== undefined) return 'string(' + scalar.values.join(' | ') + ')';
   if (scalar.kind === 'instant') return 'instant/' + scalar.precision;
   if (scalar.kind === 'ref') return 'ref(' + scalar.target.relationId + ')';
   if (scalar.kind === 'custom') return 'custom(' + scalar.codec.id + '@' + scalar.codec.version + ')';
   return scalar.kind;
+};
+
+const valueLabel = (declaration: ValueDeclaration): string => {
+  if (declaration.kind === 'null') return 'null';
+  if (declaration.kind === 'array') {
+    return 'array<' + valueLabel(declaration.items) + '>[' + declaration.maxItems + ']';
+  }
+  if (declaration.kind === 'tuple') {
+    return '[' + declaration.items.map(valueLabel).join(', ') + ']';
+  }
+  if (declaration.kind === 'record') {
+    const optional = new Set(declaration.optional ?? []);
+    return '{ '
+      + sortedEntries(declaration.fields)
+        .map(([name, member]) =>
+          name + (optional.has(name) ? '?' : '') + ': ' + valueLabel(member))
+        .join('; ')
+      + ' }';
+  }
+  if (declaration.kind === 'union') {
+    return declaration.alternatives.map(valueLabel).join(' | ');
+  }
+  return scalarLabel(declaration);
 };
 
 const requiredRelationTypeName = (names: ReadonlyMap<string, string>, relationId: string): string => {

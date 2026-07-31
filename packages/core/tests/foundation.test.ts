@@ -18,6 +18,9 @@ import {
   logicalUnknown,
   missingValue,
   parseArtifactText,
+  parseRelationCandidate,
+  parseScalarValue,
+  prepareSchema,
   safeParseArtifactText,
   safeParseJsonText,
   safeParseJsonValue,
@@ -115,7 +118,7 @@ describe('production foundation', () => {
     expect(Object.isFrozen(occurrenceIds)).toBe(true);
   });
 
-  it('memoizes canonical subtrees only inside an explicit owned-graph context', () => {
+  it('memoizes only requested canonical roots inside an explicit owned-graph context', () => {
     const leaf = Object.freeze({ value: Object.freeze([1, 2, 3]) });
     const root = Object.freeze({ first: leaf, second: leaf });
     const cache = new WeakMap<object, string>();
@@ -123,9 +126,10 @@ describe('production foundation', () => {
 
     expect(canonical).toBe('{"first":{"value":[1,2,3]},"second":{"value":[1,2,3]}}');
     expect(cache.get(root)).toBe(canonical);
+    expect(cache.has(leaf)).toBe(false);
+    expect(cache.has(leaf.value)).toBe(false);
+    expect(canonicalizeJsonWithCache(leaf, cache)).toBe('{"value":[1,2,3]}');
     expect(cache.get(leaf)).toBe('{"value":[1,2,3]}');
-    expect(cache.get(leaf.value)).toBe('[1,2,3]');
-    expect(canonicalizeJsonWithCache(leaf, cache)).toBe(cache.get(leaf));
     const isolated = new WeakMap<object, string>();
     expect(canonicalizeJsonWithCache(root, isolated)).toBe(canonical);
     expect(isolated.has(root)).toBe(true);
@@ -181,8 +185,43 @@ describe('production foundation', () => {
   });
 
   it('enforces text and structural budgets', () => {
-    expect(safeParseJsonText('[]', { maxBytes: 1, maxDepth: 1, maxArrayMembers: 1, maxObjectMembers: 1, maxTotalMembers: 1, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });
-    expect(safeParseJsonText('[[0]]', { maxBytes: 10, maxDepth: 1, maxArrayMembers: 2, maxObjectMembers: 1, maxTotalMembers: 3, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });
+    expect(safeParseJsonText('[]', { maxBytes: 1, maxArrayMembers: 1, maxObjectMembers: 1, maxTotalMembers: 1, maxTotalStringCodeUnits: 1, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });
+    expect(safeParseJsonText('[[0]]', { maxBytes: 10, maxArrayMembers: 2, maxObjectMembers: 1, maxTotalMembers: 1, maxTotalStringCodeUnits: 1, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });
+  });
+
+  it('keeps deep portable JSON stack-safe and composition-independent', () => {
+    const depth = 10_000;
+    let deep: JsonValue = 'leaf';
+    for (let index = 0; index < depth; index += 1) deep = [deep];
+
+    const direct = parseScalarValue({ kind: 'json' }, deep);
+    expect(direct.success).toBe(true);
+    const prepared = prepareSchema({
+      relations: {
+        nested: {
+          relationId: 'test.deep',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            value: { type: { kind: 'json' } }
+          }
+        }
+      }
+    });
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) return;
+    const nested = parseRelationCandidate(
+      prepared.value,
+      'test.deep',
+      { id: 'one', value: deep }
+    );
+    expect(nested.success).toBe(true);
+    if (!direct.success || !nested.success) return;
+
+    const canonical = canonicalizeJson(direct.value as JsonValue);
+    expect(canonical).toBe('['.repeat(depth) + '"leaf"' + ']'.repeat(depth));
+    expect(sameStructuralJson(direct.value, nested.value.row.value)).toBe(true);
+    expect(safeParseJsonText(canonical)).toMatchObject({ success: true });
   });
 
   it('publishes immutable issue policy and issue envelopes', () => {

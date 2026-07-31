@@ -11,10 +11,20 @@ export const detachAndFreezeJsonValue = (input: unknown, budget?: ValueParseBudg
 /** Freezes a parser-owned JSON graph in place without traversing it through validation again. */
 export const freezeOwnedJsonValue = (value: JsonValue): JsonValue => {
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) {
-    for (const member of value) freezeOwnedJsonValue(member);
-    return Object.freeze(value);
+  const containers: object[] = [];
+  const pending: object[] = [value];
+  while (pending.length > 0) {
+    const container = pending.pop() as JsonValue[] | Record<string, JsonValue>;
+    containers.push(container);
+    const children = Array.isArray(container)
+      ? container
+      : Object.values(container);
+    for (const child of children) {
+      if (child !== null && typeof child === 'object') pending.push(child);
+    }
   }
-  for (const member of Object.values(value)) freezeOwnedJsonValue(member);
-  return Object.freeze(value);
+  for (let index = containers.length - 1; index >= 0; index -= 1) {
+    Object.freeze(containers[index]);
+  }
+  return value;
 };

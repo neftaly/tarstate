@@ -8,6 +8,7 @@ import {
   logicalUnknown,
   openIncrementalQueryMaintenance,
   parseArtifactText,
+  parseValueDeclaration,
   safeMaterializePortableBytes,
   safeParseJsonValue,
   sealArtifact,
@@ -83,6 +84,19 @@ const globalQueries: readonly QueryNode[] = [
 ];
 
 describe('shrinking property laws', () => {
+  propertyTest('bounded-value-contract-arrays-enforce-their-declared-limit', fc.property(
+    fc.array(fc.string(), { maxLength: 32 }),
+    fc.integer({ min: 0, max: 32 }),
+    (values, maxItems) => {
+      const parsed = parseValueDeclaration(
+        { kind: 'array', items: { kind: 'string' }, maxItems },
+        values
+      );
+      expect(parsed.success).toBe(values.length <= maxItems);
+      if (parsed.success) expect(parsed.value).toEqual(values);
+    }
+  ));
+
   propertyTest('non-atomic-batch-shells-share-outcome-semantics', fc.asyncProperty(
     fc.array(fc.constantFrom<CommitReceipt['outcome']>('committed', 'rejected', 'unknown'), {
       maxLength: 12

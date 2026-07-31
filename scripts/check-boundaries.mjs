@@ -73,6 +73,7 @@ assignArchitectureGroup('foundation', [
   'issues.ts',
   'portable-bytes.ts',
   'portable-order.ts',
+  'value-model.ts',
   'value.ts'
 ]);
 assignArchitectureGroup('capability', ['builtins.ts', 'host.ts', 'registry.ts', 'resolver.ts']);
@@ -88,6 +89,7 @@ assignArchitectureGroup('schema', [
   'codec.ts',
   'constraints.ts',
   'internal-recursive-array.ts',
+  'internal-value-declaration.ts',
   'internal-semantic-provenance.ts',
   'lens.ts',
   'mapping.ts',

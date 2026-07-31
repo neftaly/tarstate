@@ -4,8 +4,12 @@
 
 Portable JSON is detached and adopted once at an untrusted public boundary.
 Internals may then rely on owned readonly values. Adoption must enforce bounded
-depth, property count, array length, and byte/string limits where hostile input
-could otherwise amplify work.
+property count, array length, total membership, and byte/string limits where
+hostile input could otherwise amplify work. Generic JSON nesting has no
+semantic depth limit: inspection, freezing, canonicalization, equality, text
+parsing, and adapter adoption must remain stack-safe for deep acyclic values.
+Domain traversals such as recursive storage mappings and source discovery may
+still declare explicit depth limits when depth is part of that operation.
 
 Tagged values extend JSON without allowing data-selected code. Their tag and
 payload remain portable. Native values such as `Uint8Array` cross an adapter
@@ -42,6 +46,14 @@ keys are invalid when exact relation state requires uniqueness.
 
 Schemas are the type source of truth. Type generation and typed literals must
 retain exact string literals and tuple order without changing runtime behavior.
+
+Relation fields and query parameters share one finite value-declaration
+language. Alongside scalar and opaque `json` declarations it supports null,
+fixed tuples, closed records with explicit optional members, bounded
+homogeneous arrays, and unions whose alternatives preparation can prove
+disjoint. Literal string sets provide discriminants. The same prepared
+declaration drives row parsing and generated TypeScript, JSON Schema, and
+Markdown; connectors still receive detached ordinary portable values.
 
 ## Mappings
 

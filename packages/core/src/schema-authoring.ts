@@ -1,5 +1,5 @@
 import type { ArtifactRef } from './artifacts.js';
-import type { ScalarDeclaration } from './codec.js';
+import type { ScalarDeclaration, ValueDeclaration } from './codec.js';
 import type { CapabilityRef } from './issues.js';
 import type { RelationDeclaration, SchemaArtifact, SchemaBody } from './schema.js';
 import type { JsonValue, PortableValue, TaggedValue } from './value.js';
@@ -70,18 +70,22 @@ export type ScalarValueOf<Declaration> =
                       : never;
 
 export type ValueOfDeclaration<Declaration> =
-  Declaration extends ScalarDeclaration ? ScalarValueOf<Declaration>
-    : Declaration extends { readonly kind: 'array'; readonly items: infer Item } ? readonly ValueOfDeclaration<Item>[]
+  ValueDeclaration extends Declaration ? PortableValue
+    : Declaration extends ScalarDeclaration ? ScalarValueOf<Declaration>
+    : Declaration extends { readonly kind: 'null' } ? null
+      : Declaration extends { readonly kind: 'array'; readonly items: infer Item } ? readonly ValueOfDeclaration<Item>[]
       : Declaration extends { readonly kind: 'tuple'; readonly items: infer Items extends readonly unknown[] } ? { readonly [Index in keyof Items]: ValueOfDeclaration<Items[Index]> }
         : Declaration extends { readonly kind: 'record'; readonly fields: infer Fields; readonly optional?: infer Optional extends readonly string[] }
           ? Simplify<
               { readonly [Key in Exclude<keyof Fields, Optional[number]>]: ValueOfDeclaration<Fields[Key]> }
               & { readonly [Key in Extract<keyof Fields, Optional[number]>]?: ValueOfDeclaration<Fields[Key]> }
             >
-          : never;
+          : Declaration extends { readonly kind: 'union'; readonly alternatives: infer Alternatives extends readonly unknown[] }
+            ? ValueOfDeclaration<Alternatives[number]>
+            : never;
 
 type FieldValue<Field> = Field extends { readonly type: infer Declaration }
-  ? ScalarValueOf<Declaration> | (Field extends { readonly nullable: true } ? null : never)
+  ? ValueOfDeclaration<Declaration> | (Field extends { readonly nullable: true } ? null : never)
   : never;
 
 type RelationById<Body extends SchemaBody, Id> = {
@@ -94,7 +98,7 @@ type SchemaScalarValue<Body extends SchemaBody, Declaration> =
   Declaration extends ReferenceScalarDeclaration<infer Target> ? RelationKey<Target>
     : Declaration extends { readonly kind: 'ref'; readonly target: { readonly relationId: infer RelationId } }
       ? SchemaRelationKey<Body, RelationById<Body, RelationId>>
-      : ScalarValueOf<Declaration>;
+      : ValueOfDeclaration<Declaration>;
 
 type SchemaFieldValue<Body extends SchemaBody, Field> = Field extends { readonly type: infer Declaration }
   ? SchemaScalarValue<Body, Declaration> | (Field extends { readonly nullable: true } ? null : never)

@@ -1,4 +1,5 @@
-import { detachAndFreezeJsonValue } from '../../internal-owned-json.js';
+import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from '../../internal-owned-json.js';
+import { assertUnicodeScalarString } from '../../internal-canonical-json.js';
 import { ownedReadonlyMap } from '../../internal-owned-map.js';
 import { isPreparedPlan } from './prepared-plan.js';
 import { defaultValueParseBudget, logicalUnknown, safeParseJsonValue, type JsonValue } from '../../value.js';
@@ -50,26 +51,19 @@ export const sealOwnedQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate):
 };
 
 export const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
-  const parsed = safeParseJsonValue(root, { ...defaultValueParseBudget, maxDepth: 1_024 });
+  const parsed = safeParseJsonValue(root);
   if (!parsed.success) throw new TypeError('Query AST must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
   return freezePortableValue(parsed.value) as QueryNode;
 };
 
 export const cloneAndFreezeExpression = (expression: Expr): Expr => {
-  const parsed = safeParseJsonValue(expression, { ...defaultValueParseBudget, maxDepth: 1_024 });
+  const parsed = safeParseJsonValue(expression);
   if (!parsed.success) throw new TypeError('Query expression must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
   return freezePortableValue(parsed.value) as Expr;
 };
 
 export const freezePortableValue = <Value extends JsonValue>(value: Value): Value => {
-  if (value === null || typeof value !== 'object') return value;
-  if (Object.isFrozen(value)) return value;
-  if (Array.isArray(value)) {
-    for (const item of value) freezePortableValue(item);
-  } else {
-    for (const item of Object.values(value)) freezePortableValue(item);
-  }
-  return Object.freeze(value);
+  return freezeOwnedJsonValue(value) as Value;
 };
 
 export const adoptJsonValue = (input: unknown, label: string): JsonValue => {
@@ -93,19 +87,38 @@ const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValu
   if (input !== null && typeof input === 'object' && ownedQueryLogicalContainers.has(input)) {
     return input as QueryLogicalValue;
   }
-  const seen = new Set<object>();
+  const ancestors = new Set<object>();
   let totalMembers = 0;
-  const visit = (value: unknown, depth: number): QueryLogicalValue => {
+  let totalStringCodeUnits = 0;
+  const primitive = (value: unknown): QueryLogicalValue | undefined => {
     if (value === logicalUnknown) return logicalUnknown;
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (value === null || typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      assertUnicodeScalarString(value);
+      totalStringCodeUnits += value.length;
+      if (totalStringCodeUnits > defaultValueParseBudget.maxTotalStringCodeUnits) {
+        throw new TypeError(label + ' exceeds the string budget');
+      }
+      return value;
+    }
     if (typeof value === 'number') {
       if (!Number.isFinite(value)) throw new TypeError(label + ' contains a non-finite number');
       return Object.is(value, -0) ? 0 : value;
     }
-    if (typeof value !== 'object') throw new TypeError(label + ' contains a non-portable value');
-    if (depth > defaultValueParseBudget.maxDepth) throw new TypeError(label + ' exceeds the maximum depth');
-    if (seen.has(value)) throw new TypeError(label + ' contains a cycle');
-    seen.add(value);
+    return undefined;
+  };
+  type Member = {
+    readonly key: string | number;
+    readonly value: unknown;
+  };
+  type Frame = {
+    readonly input: object;
+    readonly output: QueryLogicalValue[] | Record<string, QueryLogicalValue>;
+    readonly members: readonly Member[];
+    index: number;
+  };
+  const open = (value: object): Frame => {
+    if (ancestors.has(value)) throw new TypeError(label + ' contains a cycle');
     try {
       const descriptors = Object.getOwnPropertyDescriptors(value);
       const keys = Reflect.ownKeys(descriptors);
@@ -113,37 +126,81 @@ const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValu
       if (Array.isArray(value)) {
         const length = descriptors.length?.value;
         if (!Number.isSafeInteger(length) || length < 0 || length > defaultValueParseBudget.maxArrayMembers) throw new TypeError(label + ' contains an invalid or oversized array');
+        if (keys.length !== length + 1) throw new TypeError(label + ' contains an extra array property');
         totalMembers += length;
         if (totalMembers > defaultValueParseBudget.maxTotalMembers) throw new TypeError(label + ' exceeds the total-member budget');
-        const output: QueryLogicalValue[] = [];
+        const members: Member[] = [];
         for (let index = 0; index < length; index += 1) {
           const descriptor = descriptors[String(index)];
           if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
-          output.push(visit(descriptor.value, depth + 1));
+          members.push({ key: index, value: descriptor.value });
         }
-        const owned = Object.freeze(output);
-        ownedQueryLogicalContainers.add(owned);
-        return owned;
+        ancestors.add(value);
+        return { input: value, output: [], members, index: 0 };
       }
       if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError(label + ' contains a hostile prototype');
       if (keys.length > defaultValueParseBudget.maxObjectMembers) throw new TypeError(label + ' exceeds the object-member budget');
       totalMembers += keys.length;
       if (totalMembers > defaultValueParseBudget.maxTotalMembers) throw new TypeError(label + ' exceeds the total-member budget');
-      const output: Record<string, QueryLogicalValue> = {};
+      const members: Member[] = [];
       for (const key of keys as string[]) {
         if (forbiddenQueryKeys.has(key)) throw new TypeError(label + ' contains a prototype-pollution key');
+        assertUnicodeScalarString(key);
+        totalStringCodeUnits += key.length;
+        if (totalStringCodeUnits > defaultValueParseBudget.maxTotalStringCodeUnits) {
+          throw new TypeError(label + ' exceeds the string budget');
+        }
         const descriptor = descriptors[key];
         if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile object descriptor');
-        output[key] = visit(descriptor.value, depth + 1);
+        members.push({ key, value: descriptor.value });
       }
-      const owned = Object.freeze(output);
-      ownedQueryLogicalContainers.add(owned);
-      return owned;
-    } finally {
-      seen.delete(value);
+      ancestors.add(value);
+      return { input: value, output: {}, members, index: 0 };
+    } catch (error) {
+      ancestors.delete(value);
+      throw error;
     }
   };
-  return visit(input, 0);
+  const rootPrimitive = primitive(input);
+  if (rootPrimitive !== undefined) return rootPrimitive;
+  if (typeof input !== 'object' || input === null) {
+    throw new TypeError(label + ' contains a non-portable value');
+  }
+  const root = open(input);
+  const stack: Frame[] = [root];
+  while (stack.length > 0) {
+    const frame = stack.at(-1) as Frame;
+    if (frame.index >= frame.members.length) {
+      Object.freeze(frame.output);
+      ownedQueryLogicalContainers.add(frame.output);
+      ancestors.delete(frame.input);
+      stack.pop();
+      continue;
+    }
+    const member = frame.members[frame.index] as Member;
+    frame.index += 1;
+    const adopted = primitive(member.value);
+    if (adopted !== undefined) {
+      assignQueryLogicalMember(frame.output, member.key, adopted);
+      continue;
+    }
+    if (typeof member.value !== 'object' || member.value === null) {
+      throw new TypeError(label + ' contains a non-portable value');
+    }
+    const child = open(member.value);
+    assignQueryLogicalMember(frame.output, member.key, child.output);
+    stack.push(child);
+  }
+  return root.output;
+};
+
+const assignQueryLogicalMember = (
+  output: QueryLogicalValue[] | Record<string, QueryLogicalValue>,
+  key: string | number,
+  value: QueryLogicalValue
+): void => {
+  if (Array.isArray(output) && typeof key === 'number') output.push(value);
+  else (output as Record<string, QueryLogicalValue>)[key] = value;
 };
 
 export const adoptQueryRecord = (input: unknown, label = 'Query row'): QueryRecord => {

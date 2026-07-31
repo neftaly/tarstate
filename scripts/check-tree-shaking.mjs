@@ -68,17 +68,19 @@ const cases = [
     name: 'incremental database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // This is the complete incremental evaluator, including joins, aggregates,
-    // windows, fallback evaluation, field-dependency projection, observation,
-    // fixed-source lifecycle, and the lazy settlement-coordinator entry point.
+    // windows, fallback evaluation, structured field parsing,
+    // field-dependency projection, observation, fixed-source lifecycle, and
+    // the lazy settlement-coordinator entry point.
     initialOnly: true,
-    maxGzipBytes: 45_250
+    maxGzipBytes: 46_250
   },
   {
     name: 'source-link database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // Optional fixed-point traversal and settlement coordination are lazy;
-    // the complete closure also includes field-dependency projection.
-    maxGzipBytes: 48_400
+    // the complete closure also includes structured field parsing and
+    // field-dependency projection.
+    maxGzipBytes: 49_400
   },
   {
     name: 'query expression evaluator',
@@ -98,7 +100,8 @@ const cases = [
   {
     name: 'schema JSON generator',
     source: selectedExport('packages/schema-tools/dist/index.js', 'generateJsonSchema'),
-    maxGzipBytes: 8_500
+    // Includes recursive structured-contract JSON Schema projection.
+    maxGzipBytes: 9_300
   },
   {
     name: 'artifact bundle runtime catalog',
@@ -127,7 +130,8 @@ const cases = [
       'packages/automerge/dist/system-database/index.js',
       'openAutomergeSystemDatabase'
     ),
-    maxGzipBytes: 13_000
+    // System relations share the canonical structured field parser.
+    maxGzipBytes: 14_000
   },
   {
     name: 'Automerge mapped relation row selector',
@@ -144,12 +148,12 @@ const cases = [
     source: selectedExport('packages/automerge/dist/index.js', 'openAutomergeDatabase'),
     // Automerge itself remains external. This covers Tarstate's complete
     // conflict-aware attachment, retained causal publication, transaction,
-    // strict exact-basis adoption and text positions, bounded recursive
-    // mappings, and observation closure.
+    // strict exact-basis adoption and text positions, structured field
+    // contracts, bounded recursive mappings, and observation closure.
     // Optional sibling entries can perturb shared chunk names and compression
     // without changing this closure. Keep a raw bound as the code-growth ratchet.
-    maxBytes: 292_500,
-    maxGzipBytes: 73_800
+    maxBytes: 302_000,
+    maxGzipBytes: 76_500
   }
 ];
 

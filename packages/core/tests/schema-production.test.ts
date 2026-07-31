@@ -93,6 +93,144 @@ describe('production schemas and codecs', () => {
     expect(parseLogicalKey(schema, 'test.user', ['a'], registry)).toMatchObject({ success: true, value: ['a'] });
   });
 
+  it('parses finite structured contracts and rejects ambiguous unions', () => {
+    const operation = {
+      kind: 'union',
+      alternatives: [
+        {
+          kind: 'record',
+          fields: {
+            action: { kind: 'string', values: ['put'] },
+            path: {
+              kind: 'tuple',
+              items: [
+                { kind: 'string' },
+                { kind: 'string', values: ['position'] }
+              ]
+            },
+            value: {
+              kind: 'tuple',
+              items: [{ kind: 'number' }, { kind: 'number' }, { kind: 'number' }]
+            }
+          }
+        },
+        {
+          kind: 'record',
+          fields: {
+            action: { kind: 'string', values: ['move'] },
+            path: { kind: 'tuple', items: [{ kind: 'string' }] },
+            to: {
+              kind: 'union',
+              alternatives: [
+                {
+                  kind: 'tuple',
+                  items: [{ kind: 'string', values: ['children'] }]
+                },
+                {
+                  kind: 'tuple',
+                  items: [
+                    { kind: 'string' },
+                    { kind: 'string', values: ['children'] }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    } as const;
+    const prepared = prepareSchema({
+      relations: {
+        presence: {
+          relationId: 'test.presence',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            operation: { type: operation },
+            vector: {
+              type: {
+                kind: 'tuple',
+                items: [
+                  { kind: 'number' },
+                  {
+                    kind: 'union',
+                    alternatives: [{ kind: 'number' }, { kind: 'null' }]
+                  },
+                  { kind: 'number' }
+                ]
+              }
+            },
+            labels: {
+              type: {
+                kind: 'array',
+                items: { kind: 'string' },
+                maxItems: 2
+              }
+            },
+            maybe: {
+              type: {
+                kind: 'union',
+                alternatives: [{ kind: 'number' }, { kind: 'null' }]
+              }
+            }
+          }
+        }
+      }
+    });
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) return;
+
+    expect(parseRelationCandidate(prepared.value, 'test.presence', {
+      id: 'one',
+      operation: {
+        action: 'put',
+        path: ['piece', 'position'],
+        value: [1, 2, 3]
+      },
+      vector: [1, null, 3],
+      labels: ['a', 'b'],
+      maybe: null
+    })).toMatchObject({ success: true });
+    expect(parseRelationCandidate(prepared.value, 'test.presence', {
+      id: 'one',
+      operation: {
+        action: 'put',
+        path: ['piece', 'position'],
+        value: [1, 2, 3],
+        extra: true
+      },
+      vector: [1, 2],
+      labels: ['a', 'b', 'c'],
+      maybe: null
+    })).toMatchObject({
+      success: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({ code: 'schema.value_contract' })
+      ])
+    });
+
+    expect(prepareSchema({
+      relations: {
+        invalid: {
+          relationId: 'test.invalid',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            value: {
+              type: {
+                kind: 'union',
+                alternatives: [{ kind: 'number' }, { kind: 'integer' }]
+              }
+            }
+          }
+        }
+      }
+    })).toMatchObject({
+      success: false,
+      issues: [{ code: 'schema.field_invalid', details: { reason: 'ambiguous_union' } }]
+    });
+  });
+
   it('turns a throwing custom codec into a structured issue', async () => {
     const { codecRef } = await makeFixture();
     const declaration: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: codecRef.id, version: codecRef.version, class: 'codec', contract: { type: 'urn:test:upper' }, implies: [] };

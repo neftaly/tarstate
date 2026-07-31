@@ -159,15 +159,90 @@ export const projectAutomergeFacts = <T extends object>(
 };
 
 export const normalizeAutomergeValue = (value: unknown): AutomergeFactValue => {
-  if (Automerge.isCounter(value)) return Object.freeze({ '@type': 'automerge-counter', value: Number(value) });
-  if (value instanceof Date) return Object.freeze({ '@type': 'date', value: value.toISOString() });
-  if (value instanceof Uint8Array) return Object.freeze({ '@type': 'bytes', value: Object.freeze([...value]) });
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : Object.freeze({ '@type': 'unsupported-number' });
-  if (Array.isArray(value)) return Object.freeze(value.map(normalizeAutomergeValue));
-  if (isRecord(value)) {
-    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, child]) => [key, normalizeAutomergeValue(child)])));
+  const leaf = normalizeAutomergeLeaf(value);
+  if (leaf !== containerValue) return leaf;
+  const root = Array.isArray(value) ? [] : {};
+  const cached = new WeakMap<object, object>([[value as object, root]]);
+  const containers: object[] = [root];
+  const pending: {
+    readonly input: object;
+    readonly output: AutomergeFactValue[] | Record<string, AutomergeFactValue>;
+  }[] = [{ input: value as object, output: root }];
+  while (pending.length > 0) {
+    const frame = pending.pop() as {
+      readonly input: object;
+      readonly output: AutomergeFactValue[] | Record<string, AutomergeFactValue>;
+    };
+    for (const [key, child] of Object.entries(frame.input)) {
+      const normalized = normalizeAutomergeLeaf(child);
+      if (normalized !== containerValue) {
+        assignNormalizedValue(frame.output, key, normalized);
+        continue;
+      }
+      const prior = cached.get(child as object);
+      if (prior !== undefined) {
+        assignNormalizedValue(
+          frame.output,
+          key,
+          prior as AutomergeFactValue
+        );
+        continue;
+      }
+      const output: AutomergeFactValue[] | Record<string, AutomergeFactValue> =
+        Array.isArray(child) ? [] : {};
+      cached.set(child as object, output);
+      containers.push(output);
+      assignNormalizedValue(frame.output, key, output);
+      pending.push({ input: child as object, output });
+    }
   }
+  for (let index = containers.length - 1; index >= 0; index -= 1) {
+    Object.freeze(containers[index]);
+  }
+  return root as AutomergeFactValue;
+};
+
+const containerValue = Symbol('containerValue');
+
+const assignNormalizedValue = (
+  output: AutomergeFactValue[] | Record<string, AutomergeFactValue>,
+  key: string,
+  value: AutomergeFactValue
+): void => {
+  if (Array.isArray(output)) output[Number(key)] = value;
+  else if (key === '__proto__') {
+    Object.defineProperty(output, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+  } else {
+    output[key] = value;
+  }
+};
+
+const normalizeAutomergeLeaf = (
+  value: unknown
+): AutomergeFactValue | typeof containerValue => {
+  if (Automerge.isCounter(value)) {
+    return Object.freeze({ '@type': 'automerge-counter', value: Number(value) });
+  }
+  if (value instanceof Date) {
+    return Object.freeze({ '@type': 'date', value: value.toISOString() });
+  }
+  if (value instanceof Uint8Array) {
+    return Object.freeze({ '@type': 'bytes', value: Object.freeze([...value]) });
+  }
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value)
+      ? value
+      : Object.freeze({ '@type': 'unsupported-number' });
+  }
+  if (Array.isArray(value) || isRecord(value)) return containerValue;
   return Object.freeze({ '@type': 'unsupported', jsType: typeof value });
 };
 

@@ -649,7 +649,11 @@ const validateValueDeclaration = (
   const declaration = input;
   const kind = declaration.kind as string;
   if (declaration.kind === 'array') {
-    shape(context, declaration, ['kind', 'items'], [], path);
+    shape(context, declaration, ['kind', 'items', 'maxItems'], [], path);
+    if (!Number.isSafeInteger(declaration.maxItems)
+      || (declaration.maxItems as number) < 0) {
+      invalid(context, [...path, 'maxItems'], 'non_negative_safe_integer_required');
+    }
     validateValueDeclaration(
       context,
       declaration.items as JsonValue,
@@ -657,6 +661,27 @@ const validateValueDeclaration = (
       depth + 1,
       capabilities
     );
+    return;
+  }
+  if (declaration.kind === 'union') {
+    shape(context, declaration, ['kind', 'alternatives'], [], path);
+    if (!Array.isArray(declaration.alternatives)
+      || declaration.alternatives.length < 2) {
+      invalid(context, [...path, 'alternatives'], 'union_alternatives_required');
+    } else {
+      declaration.alternatives.forEach((alternative, index) =>
+        validateValueDeclaration(
+          context,
+          alternative,
+          [...path, 'alternatives', index],
+          depth + 1,
+          capabilities
+        ));
+    }
+    return;
+  }
+  if (declaration.kind === 'null') {
+    shape(context, declaration, ['kind'], [], path);
     return;
   }
   if (declaration.kind === 'tuple') {

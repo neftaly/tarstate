@@ -42,7 +42,7 @@ const queryBody = (): QueryArtifactBody => ({
   schemaViews: [schemaRef],
   parameters: {
     minimum: { kind: 'integer' },
-    filters: { kind: 'record', fields: { active: { kind: 'boolean' }, tags: { kind: 'array', items: { kind: 'string' } } }, optional: ['tags'] }
+    filters: { kind: 'record', fields: { active: { kind: 'boolean' }, tags: { kind: 'array', items: { kind: 'string' }, maxItems: 100 } }, optional: ['tags'] }
   },
   root: {
     kind: 'where',
