@@ -1,4 +1,5 @@
 import { canonicalizeJsonValue as canonicalizeJson } from '../../internal-canonical-json.js';
+import { samePortableJson } from '../../internal-json-equality.js';
 import { createIssue, type Issue } from '../../issues.js';
 import {
   emptyQueryFunctions,
@@ -691,7 +692,7 @@ export const indexWindowMaintenanceLayouts = (
 const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, context: QueryContext): NodeResult => {
   const inner = evaluateNode(node.input, context);
   if (inner.completeness !== 'exact') return nonMonotoneUnknown(context, 'seek');
-  if (context.environment.basis === undefined || context.environment.membershipRevision === undefined || canonicalizeJson(context.environment.basis) !== canonicalizeJson(node.after.basis) || context.environment.membershipRevision !== node.after.membershipRevision) {
+  if (context.environment.basis === undefined || context.environment.membershipRevision === undefined || !samePortableJson(context.environment.basis, node.after.basis) || context.environment.membershipRevision !== node.after.membershipRevision) {
     context.state.issues.push(createIssue({ code: 'query.cursor_stale', phase: 'query', severity: 'error', retry: 'after_refresh', details: { mode: node.after.mode } }));
     return { rows: [], completeness: 'unknown' };
   }

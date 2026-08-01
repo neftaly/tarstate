@@ -1,5 +1,5 @@
 import type { ArtifactRef } from '../artifacts.js';
-import type { CapabilityRef, Issue } from '../issues.js';
+import type { CapabilityRef, CapabilityRefKey, Issue } from '../issues.js';
 import type { PreparedPlan } from './plan-contract.js';
 import type { JsonValue, LogicalUnknown } from '../value.js';
 
@@ -21,8 +21,8 @@ export type RelationInput = {
 };
 
 export type QueryFunction = (args: readonly JsonValue[]) => JsonValue;
-/** Key with `capabilityRefKey`; legacy NUL-delimited keys remain accepted for NUL-free references. */
-export type FunctionRegistry = ReadonlyMap<string, QueryFunction>;
+/** Canonical capability keys to host query implementations. */
+export type FunctionRegistry = ReadonlyMap<CapabilityRefKey, QueryFunction>;
 
 export type Expr =
   | { readonly kind: 'literal'; readonly value: JsonValue }

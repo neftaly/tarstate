@@ -1525,10 +1525,8 @@ const projectLogicalState = <Storage, Command>(
   for (const binding of bindings) {
     const selectedRelations = affectedRelations === undefined
       ? undefined
-      : binding.relationIds === undefined
-        ? undefined
-        : new Set(binding.relationIds.filter((relationId) => affectedRelations.has(relationId)));
-    if (affectedRelations !== undefined && selectedRelations !== undefined && selectedRelations.size === 0) continue;
+      : new Set(binding.relationIds.filter((relationId) => affectedRelations.has(relationId)));
+    if (selectedRelations?.size === 0) continue;
     const prior = byBinding.get(binding.id);
     const mustProjectFully = selectedRelations === undefined || prior === undefined || prior.issues.length > 0;
     let projection: ReturnType<typeof binding.project>;

@@ -404,7 +404,6 @@ const externalStoreWriteCapabilities = (
       compiled.mapping.collection.kind !== 'singleton'
       && compiled.mapping.collection.kind !== 'recursive-array';
     return [relationId, Object.freeze({
-      relationId,
       ...(collectionInsertable ? { insert: true as const } : {}),
       ...(collectionWritable ? { delete: true as const } : {}),
       fields: Object.freeze(fields)

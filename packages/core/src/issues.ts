@@ -32,9 +32,12 @@ export type CapabilityRef = {
   readonly contractHash: `sha256:${string}`;
 };
 
+declare const capabilityRefKeyBrand: unique symbol;
+export type CapabilityRefKey = string & { readonly [capabilityRefKeyBrand]: true };
+
 /** Collision-free registry key for a capability reference. */
-export const capabilityRefKey = (ref: CapabilityRef): string =>
-  stringTupleKey(ref.id, ref.version, ref.contractHash);
+export const capabilityRefKey = (ref: CapabilityRef): CapabilityRefKey =>
+  stringTupleKey(ref.id, ref.version, ref.contractHash) as CapabilityRefKey;
 
 /** Stable, portable diagnostic with an explicit phase and retry policy. */
 export type Issue = {

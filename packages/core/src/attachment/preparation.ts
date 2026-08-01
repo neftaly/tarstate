@@ -193,7 +193,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
       if (snapshot.state !== 'ready') return { state: snapshot.state, issues: snapshot.issues };
       try {
         const selection = constraints.length === 0
-          ? selectStorageProjection(demand, declaration.storageSchema, binding.relationIds ?? [...schema.value.relationsById.keys()])
+          ? selectStorageProjection(demand, declaration.storageSchema, binding.relationIds)
           : undefined;
         const value = binding.project(
           snapshot,

@@ -2,6 +2,8 @@ import { normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { canonicalizeJson, isContentHash } from './canonical-json.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { samePortableJson } from './internal-json-equality.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { assertValidatedLens, assertValidatedLensSteps, sealValidatedLens } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import type { RelationId, RelationRow } from './schema.js';
@@ -391,9 +393,12 @@ const exactTuple = (value: PortableValue, length: number, field: string, rowInde
 };
 const fieldsMatch = (row: RelationRow, fields: readonly string[], tuple: readonly PortableValue[]): boolean => fields.every((field, index) => Object.hasOwn(row, field) && sameValue(row[field] as PortableValue, tuple[index] as PortableValue));
 const sameValue = (left: PortableValue, right: PortableValue): boolean => left === right
-  || canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue);
-const sameRef = (left: ArtifactRef | undefined, right: ArtifactRef): boolean => left !== undefined && refKey(left) === refKey(right);
-const refKey = (ref: ArtifactRef): string => JSON.stringify(normalizeArtifactRef(ref));
+  || samePortableJson(left, right);
+const sameRef = (left: ArtifactRef | undefined, right: ArtifactRef): boolean =>
+  left !== undefined
+  && left.id === right.id
+  && left.contentHash === right.contentHash;
+const refKey = (ref: ArtifactRef): string => stringTupleKey(ref.id, ref.contentHash);
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
 const isLensStep = (value: unknown): value is LensStep => {
   if (!isRecord(value) || typeof value.kind !== 'string') return false;

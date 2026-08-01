@@ -160,11 +160,11 @@ identity, and clean tarball installation.
 
 ## Large-module caution
 
-`transaction-executor.ts`, the query maintenance engine/evaluator,
-`AutomergeMappedStorageBinding`, and `AutomergeSourceRuntime` currently require
-large context. Their size alone is not a refactor mandate. When changing them,
-identify phase boundaries and authority first; extract only cohesive pure
-transformations or lifecycle owners with narrower inputs.
+`transaction-executor.ts`, the query maintenance engine/evaluator, the
+Automerge mapped-storage binding, and `AutomergeSourceRuntime` currently
+require large context. Their size alone is not a refactor mandate. When
+changing them, identify phase boundaries and authority first; extract only
+cohesive pure transformations or lifecycle owners with narrower inputs.
 
 Do not create generic helper folders. Name extracted modules after domain work,
 such as candidate validation, captured-intent reconciliation, or aggregate

@@ -1,6 +1,6 @@
 import type { ArtifactRef } from '../artifacts.js';
 import { canonicalizeJson } from '../canonical-json.js';
-import { capabilityRefKey, createIssue, type CapabilityRef, type Issue } from '../issues.js';
+import { capabilityRefKey, createIssue, type CapabilityRef, type CapabilityRefKey, type Issue } from '../issues.js';
 import type { WritableLogicalState } from '../logical-edit.js';
 import { evaluateQuery } from '../query/evaluate.js';
 import { createQueryOccurrenceIds } from '../query/internal/occurrence-identity.js';
@@ -132,9 +132,9 @@ const adoptConstraintRows = (
 };
 
 const queryFunctions = (query: JsonValue, registry: CapabilityRegistry): FunctionRegistry => {
-  const references = new Map<string, CapabilityRef>();
+  const references = new Map<CapabilityRefKey, CapabilityRef>();
   collectFunctionReferences(query, references);
-  const functions = new Map<string, (args: readonly JsonValue[]) => JsonValue>();
+  const functions = new Map<CapabilityRefKey, (args: readonly JsonValue[]) => JsonValue>();
   for (const [key, reference] of references) {
     const implementation = registry.implementation(reference)?.implementation;
     if (typeof implementation === 'function') {
@@ -144,7 +144,7 @@ const queryFunctions = (query: JsonValue, registry: CapabilityRegistry): Functio
   return functions;
 };
 
-const collectFunctionReferences = (value: JsonValue, output: Map<string, CapabilityRef>): void => {
+const collectFunctionReferences = (value: JsonValue, output: Map<CapabilityRefKey, CapabilityRef>): void => {
   if (Array.isArray(value)) {
     for (const child of value) collectFunctionReferences(child, output);
     return;

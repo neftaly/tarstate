@@ -58,20 +58,31 @@ export const createQueryStore = <Row>(
     });
   };
 
-  const ensureObserver = (): QueryObserver<Row> => {
+  const ensureObserver = (onDiagnostic?: ObserverDiagnosticReporter): QueryObserver<Row> => {
     if (observer !== undefined) return observer;
     const openedObserver = database.observe(request) as QueryObserver<Row>;
     observer = openedObserver;
-    unsubscribeObserver = openedObserver.subscribe(() => {
-      for (const subscription of Array.from(listeners)) {
-        notifyReactListener(
-          subscription.notify,
-          'react-query',
-          'publish-query-store',
-          subscription.onDiagnostic
-        );
-      }
-    });
+    try {
+      unsubscribeObserver = openedObserver.subscribe(() => {
+        for (const subscription of Array.from(listeners)) {
+          notifyReactListener(
+            subscription.notify,
+            'react-query',
+            'publish-query-store',
+            subscription.onDiagnostic
+          );
+        }
+      });
+    } catch (error) {
+      observer = undefined;
+      runReactCleanups(
+        [() => openedObserver.close()],
+        'react-query',
+        'rollback-query-observer',
+        onDiagnostic
+      );
+      throw error;
+    }
     if (listeners.size === 0) scheduleClose();
     return openedObserver;
   };
@@ -80,7 +91,13 @@ export const createQueryStore = <Row>(
     const subscription = { notify: listener, onDiagnostic };
     listeners.add(subscription);
     closeGeneration += 1;
-    ensureObserver();
+    try {
+      ensureObserver(onDiagnostic);
+    } catch (error) {
+      listeners.delete(subscription);
+      if (listeners.size === 0) scheduleClose(onDiagnostic);
+      throw error;
+    }
     return () => {
       if (!listeners.delete(subscription)) return;
       if (listeners.size === 0) scheduleClose(onDiagnostic);

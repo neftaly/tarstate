@@ -222,6 +222,37 @@ describe('@tarstate/react', () => {
     await Promise.resolve();
   });
 
+  it('rolls back a partially opened observer when subscription setup fails', async () => {
+    const database = new TestDatabase();
+    const diagnostics: ObserverDiagnostic[] = [];
+    const collect = vi.fn();
+    class FailingSubscriptionObserver extends TestObserver {
+      override subscribe(_listener: (change: ObserverChange<Row>) => void): () => void {
+        throw new Error('subscription setup failed');
+      }
+    }
+    database.observe = () => {
+      const observer = new FailingSubscriptionObserver(database.snapshot);
+      database.observers.push(observer);
+      return observer;
+    };
+    const store = createQueryStore<Row>(
+      database as ObservableDatabase<unknown, unknown>,
+      { plan },
+      collect
+    );
+
+    expect(() => store.subscribe(
+      () => undefined,
+      (diagnostic) => diagnostics.push(diagnostic)
+    )).toThrow('subscription setup failed');
+    expect(database.observers[0]?.closeCount).toBe(1);
+    expect(diagnostics).toEqual([]);
+
+    await Promise.resolve();
+    expect(collect).toHaveBeenCalledOnce();
+  });
+
   it('attempts every query teardown and reports contained cleanup failures', async () => {
     const diagnostics: ObserverDiagnostic[] = [];
     class ThrowingCleanupObserver extends TestObserver {
@@ -410,6 +441,82 @@ describe('@tarstate/react', () => {
     expect(observer?.closeCount).toBe(0);
     expect(firstCommit).not.toHaveBeenCalled();
     expect(secondCommit).toHaveBeenCalledTimes(1);
+  });
+
+  it('updates diagnostic reporting without replacing the query runtime', async () => {
+    const database = new TestDatabase();
+    const firstDiagnostics: ObserverDiagnostic[] = [];
+    const secondDiagnostics: ObserverDiagnostic[] = [];
+    const Consumer = () => { useQuery(plan); return null; };
+    const renderer = await mount(createElement(
+      TarstateProvider,
+      { database, onDiagnostic: (diagnostic) => firstDiagnostics.push(diagnostic) },
+      createElement(Consumer)
+    ));
+    const observer = database.observers[0];
+
+    await act(() => {
+      renderer.update(createElement(
+        TarstateProvider,
+        { database, onDiagnostic: (diagnostic) => secondDiagnostics.push(diagnostic) },
+        createElement(Consumer)
+      ));
+    });
+    expect(database.observers).toHaveLength(1);
+    expect(observer?.closeCount).toBe(0);
+
+    const next = openSnapshot([{ id: 2, name: 'two' }], 1);
+    let firstStateRead = true;
+    const failingForView = new Proxy(next, {
+      get(target, property, receiver) {
+        if (property === 'state' && firstStateRead) {
+          firstStateRead = false;
+          throw new Error('query view failed after diagnostic update');
+        }
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    await act(() => { observer?.publish(failingForView); });
+
+    expect(firstDiagnostics).toEqual([]);
+    expect(secondDiagnostics).toMatchObject([{
+      kind: 'listener_error',
+      component: 'react-query',
+      operation: 'publish-query-store'
+    }]);
+  });
+
+  it('preserves runtime state across equivalent server-observation arrays', async () => {
+    const database = new TestDatabase();
+    const request: ObserveRequest<Query> = { plan: plan as PreparedPlan<Query> };
+    const serverSnapshot = openSnapshot([{ id: 7, name: 'server' }]);
+    let commit: ReturnType<typeof useCommit> | undefined;
+    let mutationState: MutationState | undefined;
+    let resolveCommit: ((receipt: CommitReceipt) => void) | undefined;
+    const Consumer = () => {
+      commit = useCommit();
+      mutationState = useMutationState();
+      return null;
+    };
+    const props = () => ({
+      database,
+      executeCommit: () => new Promise<CommitReceipt>((resolve) => { resolveCommit = resolve; }),
+      serverQueryObservations: [{ request, snapshot: serverSnapshot }]
+    });
+    const renderer = await mount(createElement(TarstateProvider, props(), createElement(Consumer)));
+    let result: Promise<CommitReceipt> | undefined;
+    await act(() => { result = commit?.(transactionAttempt()); });
+    expect(mutationState?.pendingCount).toBe(1);
+
+    await act(() => {
+      renderer.update(createElement(TarstateProvider, props(), createElement(Consumer)));
+    });
+    expect(mutationState?.pendingCount).toBe(1);
+
+    await act(async () => {
+      resolveCommit?.(commitReceipt());
+      await result;
+    });
   });
 
   it('applies an immutable optimistic projection tagged by operation and source basis', async () => {
@@ -838,6 +945,36 @@ describe('@tarstate/react', () => {
     overlays.close();
   });
 
+  it('keeps speculative snapshot reads free of overlay lifecycle mutations', async () => {
+    const database = new TestDatabase();
+    const request: ObserveRequest<Query> = { plan };
+    const base = createQueryStore<Row>(
+      database as ObservableDatabase<unknown, unknown>,
+      request,
+      () => undefined
+    );
+    const reportError = vi.fn();
+    const projectRows = vi.fn(() => { throw new Error('cannot project'); });
+    const overlays = createOptimisticOverlayStore(reportError);
+    expect(overlays.add(1, transactionAttempt(), {
+      sourceId: 'source:one',
+      sourceBasis: { incarnation: 'one', revision: 0 },
+      projectRows
+    })).toBeUndefined();
+    const view = overlays.view(base, request, 'pure-speculative-read');
+
+    expect(view.getSnapshot()).toBe(database.snapshot);
+    expect(view.getSnapshot()).toBe(database.snapshot);
+    expect(projectRows).toHaveBeenCalledOnce();
+    expect(reportError).not.toHaveBeenCalled();
+
+    const unsubscribe = view.subscribe(() => undefined);
+    await Promise.resolve();
+    expect(reportError).toHaveBeenCalledOnce();
+    unsubscribe();
+    overlays.close();
+  });
+
   it('allows a delayed concurrent subscription after speculative view collection', async () => {
     const database = new TestDatabase();
     const request: ObserveRequest<Query> = { plan };
@@ -867,6 +1004,34 @@ describe('@tarstate/react', () => {
       current: { rows: [{ id: 1, name: 'one+pending' }] },
       optimistic: { operations: [{ operationId: 'operation:one' }] }
     });
+    unsubscribe();
+    overlays.close();
+  });
+
+  it('rolls back an optimistic view when its base subscription fails', () => {
+    const request: ObserveRequest<Query> = { plan };
+    const firstListener = vi.fn();
+    const secondListener = vi.fn();
+    let failSubscription = true;
+    let baseListener: (() => void) | undefined;
+    const base = {
+      getSnapshot: () => openSnapshot([{ id: 1, name: 'one' }]),
+      subscribe: (listener: () => void) => {
+        if (failSubscription) throw new Error('base subscription failed');
+        baseListener = listener;
+        return () => { baseListener = undefined; };
+      }
+    };
+    const overlays = createOptimisticOverlayStore(() => undefined);
+    const view = overlays.view(base, request, 'subscription-rollback');
+
+    expect(() => view.subscribe(firstListener)).toThrow('base subscription failed');
+    failSubscription = false;
+    const unsubscribe = view.subscribe(secondListener);
+    baseListener?.();
+
+    expect(firstListener).not.toHaveBeenCalled();
+    expect(secondListener).toHaveBeenCalledOnce();
     unsubscribe();
     overlays.close();
   });

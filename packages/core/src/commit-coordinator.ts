@@ -51,7 +51,7 @@ export const stageSourceEdits = <Storage, Command>(input: {
   const editedRelations = new Set<string>();
   for (const edit of input.edits) editedRelations.add(edit.relationId);
   for (const binding of sortedBindings(input.bindings)) {
-    if (binding.relationIds !== undefined && !binding.relationIds.some((relationId) => editedRelations.has(relationId))) continue;
+    if (!binding.relationIds.some((relationId) => editedRelations.has(relationId))) continue;
     let plan: PlanResult<Command>;
     try {
       plan = binding.plan(snapshot, input.edits);

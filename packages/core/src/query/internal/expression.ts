@@ -69,17 +69,11 @@ const knownObjects = new WeakMap<object, QueryExpressionResult>();
 const knownLiterals = new WeakMap<object, QueryExpressionResult>();
 const expressionFieldEntries = new WeakMap<object, readonly (readonly [string, Expr])[]>();
 
-const legacyCapabilityRefKey = (ref: CapabilityRef): string =>
-  ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
-
 const missingQueryFunction = Symbol('missing-query-function');
 const queryFunctions = new WeakMap<object, WeakMap<object, QueryFunction | typeof missingQueryFunction>>();
 
 const resolveQueryFunction = (functions: FunctionRegistry, ref: CapabilityRef): QueryFunction | undefined =>
-  functions.get(capabilityRefKey(ref))
-  ?? (ref.id.includes('\u0000') || ref.version.includes('\u0000') || ref.contractHash.includes('\u0000')
-    ? undefined
-    : functions.get(legacyCapabilityRefKey(ref)));
+  functions.get(capabilityRefKey(ref));
 
 const queryFunction = (functions: FunctionRegistry, ref: CapabilityRef): QueryFunction | undefined => {
   let byReference = queryFunctions.get(functions as object);

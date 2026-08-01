@@ -54,7 +54,6 @@ export type BindingFieldWriteCapabilities = {
 
 /** Concrete operations one binding can preserve and lower for a relation. */
 export type BindingRelationWriteCapabilities = {
-  readonly relationId: string;
   readonly insert?: true;
   readonly delete?: true;
   readonly generatedKeyInsert?: true;
@@ -63,8 +62,8 @@ export type BindingRelationWriteCapabilities = {
 
 export type StorageBinding<Storage, Command, Row = unknown> = {
   readonly id: string;
-  /** Relations this binding can project and handle. Omission preserves compatibility but disables relation routing. */
-  readonly relationIds?: readonly string[];
+  /** Exact relations this binding can project and handle. */
+  readonly relationIds: readonly string[];
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
   /** Stable implementation evidence used by attachment-scoped authoring. */

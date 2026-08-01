@@ -1,4 +1,4 @@
-import { normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
+import type { ArtifactRef } from './artifacts.js';
 import { isContentHash } from './canonical-json.js';
 import type { ValueDeclaration } from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
@@ -885,7 +885,10 @@ const copyDataRecord = (value: Readonly<Record<string, unknown>>): Record<string
   return output;
 };
 
-const sameRef = (value: unknown, expected: ArtifactRef): boolean => isRecord(value) && typeof value.id === 'string' && typeof value.contentHash === 'string' && JSON.stringify(normalizeArtifactRef(value as ArtifactRef)) === JSON.stringify(normalizeArtifactRef(expected));
+const sameRef = (value: unknown, expected: ArtifactRef): boolean =>
+  isRecord(value)
+  && value.id === expected.id
+  && value.contentHash === expected.contentHash;
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
 const isRelationMapping = (value: unknown): value is RelationStorageMapping => isRecord(value) && hasOnlyKeys(value, ['collection', 'keys', 'fields']) && isCollectionMapping(value.collection) && isRecord(value.keys) && isRecord(value.fields);
 const isCollectionMapping = (value: unknown): value is CollectionMapping => isRecord(value)

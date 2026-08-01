@@ -18,7 +18,7 @@ import {
   type QueryObserver
 } from '../src/observer.js';
 import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
-import type { QueryNode, QueryRecord, RelationInput } from '../src/query.js';
+import { capabilityRefKey, type QueryNode, type QueryRecord, type RelationInput } from '../src/query.js';
 import type { PreparedPlan } from '../src/maintenance.js';
 import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 import type { JsonValue } from '../src/value.js';
@@ -742,7 +742,7 @@ describe('database membership and observation', () => {
       datasetId: 'dataset:one', state: 'settled', members: [member('attachment:reentrant-observe', source.sourceId)]
     });
     const callable = { id: 'urn:test:observe-during-update', version: '1', contractHash: `sha256:${'d'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     let database: DatabaseView<QueryNode, QueryRecord>;
     let late: QueryObserver<QueryRecord> | undefined;
     let openLate = false;
@@ -796,7 +796,7 @@ describe('database membership and observation', () => {
     const attachmentLease = catalog.attach(relationalAttachment('attachment:reentrant-first-attach', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:reentrant-first-attach', source.sourceId)] });
     const callable = { id: 'urn:test:observe-during-first-attach', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     let database: DatabaseView<QueryNode, QueryRecord>;
     let late: QueryObserver<QueryRecord> | undefined;
     let openLate = true;
@@ -928,7 +928,7 @@ describe('database membership and observation', () => {
       datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-detached-delta', source.sourceId)]
     });
     const callable = { id: 'urn:test:mutate-source-after-delta', version: '1', contractHash: `sha256:${'7'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     const nextPayload = { label: 'detached' };
     let mutateDuringUpdate = false;
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
@@ -1087,7 +1087,7 @@ describe('database membership and observation', () => {
     const attachmentLease = catalog.attach(relationalAttachment('attachment:self-closing-query', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:self-closing-query', source.sourceId)] });
     const callable = { id: 'urn:test:self-closing-query', version: '1', contractHash: `sha256:${'c'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     let closeDuringCall = false;
     let closeObserver = (): void => undefined;
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {

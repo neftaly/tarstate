@@ -33,6 +33,8 @@ type ActiveOptimisticOverlay = {
   readonly definition: OptimisticOverlay<unknown, unknown>;
 };
 
+const failedOptimisticProjection = Symbol('failed-optimistic-projection');
+
 const overlayTargetKey = (attachmentId: string, sourceId: string): string =>
   attachmentId.length + ':' + attachmentId + sourceId.length + ':' + sourceId;
 
@@ -91,7 +93,6 @@ export type OptimisticQueryView<Row> = {
 };
 
 export type OptimisticOverlayStore = {
-  readonly onDiagnostic: ObserverDiagnosticReporter | undefined;
   readonly view: <Query, Row>(
     base: QueryStore<Row>,
     request: ObserveRequest<Query>,
@@ -103,11 +104,13 @@ export type OptimisticOverlayStore = {
     definition: OptimisticOverlay<unknown, unknown>
   ) => OptimisticUpdateError | undefined;
   readonly discard: (mutationId: number) => void;
-  readonly project: <Query, Row>(
-    authoritative: ObserverSnapshot<Row>,
-    request: ObserveRequest<Query>
-  ) => ReactObserverSnapshot<Row>;
   readonly close: () => void;
+};
+
+type FailedOptimisticProjection<Row> = {
+  readonly [failedOptimisticProjection]: true;
+  readonly snapshot: ReactObserverSnapshot<Row>;
+  readonly failures: readonly (readonly [ActiveOptimisticOverlay, OptimisticUpdateError])[];
 };
 
 export const createOptimisticOverlayStore = (
@@ -216,10 +219,10 @@ export const createOptimisticOverlayStore = (
     if (overlay !== undefined) changed([overlay]);
   };
 
-  const project = <Query, Row>(
+  const evaluateProjection = <Query, Row>(
     authoritative: ObserverSnapshot<Row>,
     request: ObserveRequest<Query>
-  ): ReactObserverSnapshot<Row> => {
+  ): ReactObserverSnapshot<Row> | FailedOptimisticProjection<Row> => {
     if (authoritative.state === 'closed' || authoritative.current.completeness === 'unknown' || overlays.size === 0) return authoritative;
     let rows = authoritative.current.rows;
     let resultKeys = authoritative.current.resultKeys;
@@ -286,15 +289,22 @@ export const createOptimisticOverlayStore = (
         rebased
       }));
     }
-    if (failures !== undefined) {
-      for (const [overlay, error] of failures) scheduleFailure(overlay, error);
-    }
-    if (operations.length === 0) return authoritative;
-    return Object.freeze({
-      ...authoritative,
-      current: Object.freeze({ ...authoritative.current, rows, resultKeys }),
-      optimistic: Object.freeze({ operations: Object.freeze(operations) })
-    });
+    const snapshot = operations.length === 0
+      ? authoritative
+      : Object.freeze({
+          ...authoritative,
+          current: Object.freeze({ ...authoritative.current, rows, resultKeys }),
+          optimistic: Object.freeze({ operations: Object.freeze(operations) })
+        });
+    return failures === undefined
+      ? snapshot
+      : { [failedOptimisticProjection]: true, snapshot, failures };
+  };
+
+  const rejectProjectionFailures = (
+    failures: readonly (readonly [ActiveOptimisticOverlay, OptimisticUpdateError])[]
+  ): void => {
+    for (const [overlay, error] of failures) scheduleFailure(overlay, error);
   };
 
   const view = <Query, Row>(
@@ -307,7 +317,8 @@ export const createOptimisticOverlayStore = (
     const created = createOptimisticQueryView(
       base,
       request,
-      project,
+      evaluateProjection,
+      rejectProjectionFailures,
       onDiagnostic,
       () => {
         if (closed) return false;
@@ -340,16 +351,19 @@ export const createOptimisticOverlayStore = (
     activeViews.clear();
   };
 
-  return { onDiagnostic, view, add, discard, project, close };
+  return { view, add, discard, close };
 };
 
 const createOptimisticQueryView = <Query, Row>(
   base: QueryStore<Row>,
   request: ObserveRequest<Query>,
-  project: (
+  evaluateProjection: (
     authoritative: ObserverSnapshot<Row>,
     request: ObserveRequest<Query>
-  ) => ReactObserverSnapshot<Row>,
+  ) => ReactObserverSnapshot<Row> | FailedOptimisticProjection<Row>,
+  rejectProjectionFailures: (
+    failures: readonly (readonly [ActiveOptimisticOverlay, OptimisticUpdateError])[]
+  ) => void,
   onDiagnostic: ObserverDiagnosticReporter | undefined,
   activate: () => boolean,
   deactivate: () => void,
@@ -361,6 +375,7 @@ const createOptimisticQueryView = <Query, Row>(
   let overlayRevision = 0;
   let projectedOverlayRevision = -1;
   let snapshot: ReactObserverSnapshot<Row> | undefined;
+  let projectionFailures: FailedOptimisticProjection<Row>['failures'] | undefined;
   let closeGeneration = 0;
   let closed = false;
 
@@ -370,6 +385,7 @@ const createOptimisticQueryView = <Query, Row>(
     unsubscribeBase = undefined;
     snapshot = undefined;
     baseSnapshot = undefined;
+    projectionFailures = undefined;
     runReactCleanups(cleanups, 'react-optimistic', 'close-query-view', onDiagnostic);
   };
 
@@ -390,29 +406,56 @@ const createOptimisticQueryView = <Query, Row>(
     }
     baseSnapshot = nextBaseSnapshot;
     projectedOverlayRevision = overlayRevision;
-    snapshot = project(nextBaseSnapshot, request);
+    const evaluated = evaluateProjection(nextBaseSnapshot, request);
+    if (failedOptimisticProjection in evaluated) {
+      snapshot = evaluated.snapshot;
+      projectionFailures = evaluated.failures;
+    } else {
+      snapshot = evaluated;
+      projectionFailures = undefined;
+    }
     return snapshot;
+  };
+
+  const rejectFailures = (): void => {
+    if (projectionFailures === undefined) return;
+    const failures = projectionFailures;
+    projectionFailures = undefined;
+    rejectProjectionFailures(failures);
   };
 
   const refresh = (): void => {
     if (closed) return;
     const previous = snapshot;
     const next = recompute();
+    rejectFailures();
     if (previous === next) return;
     notifyReactListeners(listeners, 'react-optimistic', 'publish-query-view', onDiagnostic);
   };
 
   const subscribe = (listener: () => void): (() => void) => {
     if (closed) return () => undefined;
-    if (listeners.size === 0) {
+    const wasInactive = listeners.size === 0;
+    if (wasInactive) {
       if (!activate()) return () => undefined;
       snapshot = undefined;
       baseSnapshot = undefined;
     }
     listeners.add(listener);
     closeGeneration += 1;
-    if (unsubscribeBase === undefined) {
-      unsubscribeBase = base.subscribe(refresh, onDiagnostic);
+    try {
+      if (unsubscribeBase === undefined) {
+        unsubscribeBase = base.subscribe(refresh, onDiagnostic);
+      }
+      recompute();
+      rejectFailures();
+    } catch (error) {
+      listeners.delete(listener);
+      if (wasInactive && listeners.size === 0) {
+        deactivate();
+        releaseBase();
+      }
+      throw error;
     }
     return () => {
       if (!listeners.delete(listener)) return;

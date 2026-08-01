@@ -59,10 +59,9 @@ describe('production query oracle', () => {
 
   it('preserves named capability evaluation count and unavailable semantics when prepared', () => {
     const capability: CapabilityRef = { id: 'urn:test:prepared-expression-call', version: '1', contractHash: `sha256:${'8'.repeat(64)}` };
-    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
     let calls = 0;
     const prepared = prepareExpression({ kind: 'call', capability, args: [{ kind: 'field', alias: 'row', name: 'value' }] });
-    const functions = new Map([[key, ([value]: readonly JsonValue[]) => { calls += 1; return value ?? null; }]]);
+    const functions = new Map([[capabilityRefKey(capability), ([value]: readonly JsonValue[]) => { calls += 1; return value ?? null; }]]);
 
     expect(evaluatePreparedExpression(prepared, { row: { value: 3 } }, { functions })).toBe(3);
     expect(evaluatePreparedExpression(prepared, { row: { value: 4 } }, { functions })).toBe(4);
@@ -125,7 +124,7 @@ describe('production query oracle', () => {
     expect(evaluateQuery({ root: tiedOrder, relations: [tiedInput] }).rows.map(({ id }) => id)).toEqual([2, 1]);
 
     const capability: CapabilityRef = { id: 'urn:test:order-call-count', version: '1', contractHash: `sha256:${'c'.repeat(64)}` };
-    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const key = capabilityRefKey(capability);
     let calls = 0;
     const callOrder: QueryNode = {
       kind: 'order', input: from('ordered', 'row'),
@@ -266,7 +265,7 @@ describe('production query oracle', () => {
 
   it('isolates named function arguments and retained return values', () => {
     const capability: CapabilityRef = { id: 'urn:test:owned-function', version: '1', contractHash: `sha256:${'e'.repeat(64)}` };
-    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const key = capabilityRefKey(capability);
     const source = { nested: { value: 1 } };
     const returned = { nested: { value: 2 } };
     let captured: readonly JsonValue[] | undefined;
@@ -551,7 +550,7 @@ describe('production query oracle', () => {
 
   it('shares partitioning and ordering work across equivalent window fields', () => {
     const capability: CapabilityRef = { id: 'urn:test:window-value', version: '1', contractHash: `sha256:${'f'.repeat(64)}` };
-    const capabilityKey = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const capabilityKey = capabilityRefKey(capability);
     let evaluations = 0;
     const call = (name: string) => ({ kind: 'call' as const, capability, args: [{ kind: 'field' as const, alias: 'score', name }] });
     const specification = {
@@ -687,7 +686,7 @@ describe('production query oracle', () => {
 
   it('evaluates an invariant recursive join side once as the frontier grows', () => {
     const capability: CapabilityRef = { id: 'urn:test:recursion-index-key', version: '1', contractHash: `sha256:${'d'.repeat(64)}` };
-    const capabilityKey = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const capabilityKey = capabilityRefKey(capability);
     const edgeCount = 48;
     let invariantEvaluations = 0;
     const functions = new Map([[capabilityKey, (args: readonly JsonValue[]) => {
@@ -961,7 +960,7 @@ describe('production query oracle', () => {
 
   it('turns a throwing named function into unavailable completeness', () => {
     const capability: CapabilityRef = { id: 'urn:test:throwing', version: '1', contractHash: `sha256:${'c'.repeat(64)}` };
-    const functions = new Map([[capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash, () => { throw new Error('boom'); }]]);
+    const functions = new Map([[capabilityRefKey(capability), () => { throw new Error('boom'); }]]);
     const result = evaluateQuery({ root: { kind: 'select', input: { kind: 'values', alias: 'v', rows: [{}] }, alias: 'out', fields: { value: { kind: 'call', capability, args: [] } } }, relations: [], functions });
     expect(result).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.function_failed' }] });
   });

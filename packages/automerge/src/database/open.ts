@@ -28,7 +28,7 @@ import {
 } from '@tarstate/core';
 import { adoptConflictFreeAutomergeJsonValue } from '../document/json-value.js';
 import { AutomergeAtomicSource } from '../adapter/atomic-source.js';
-import { AutomergeMappedStorageBinding } from '../adapter/mapped-storage.js';
+import { createAutomergeMappedStorageBinding } from '../adapter/mapped-storage.js';
 import { createAutomergeTextPositionResolver } from '../adapter/text-positions.js';
 import {
   createLiveAutomergeDatabase,
@@ -99,7 +99,7 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
     ownsRuntime: true
   });
   try {
-    const binding = new AutomergeMappedStorageBinding<T>({ mapping: preparation.mapping, registry });
+    const binding = createAutomergeMappedStorageBinding<T>({ mapping: preparation.mapping, registry });
     const attachmentIncarnation = globalThis.crypto.randomUUID();
     const projector = createMappedAttachmentProjector({
       binding,

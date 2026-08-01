@@ -202,7 +202,6 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
     this.declaredReadFootprint = Object.freeze(relations.map(({ relationId }) => relationFootprint(relationId)));
     this.declaredWriteFootprint = this.declaredReadFootprint;
     this.writeCapabilities = new Map(options.relations.map((relation) => [relation.relationId, {
-      relationId: relation.relationId,
       insert: true,
       delete: true,
       fields: Object.fromEntries((relation.replaceFields ?? []).map((field) => [field, { replace: true }]))

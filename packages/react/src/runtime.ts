@@ -17,7 +17,6 @@ export type Runtime = {
   readonly serverQuerySnapshots: ReadonlyMap<string, ObserverSnapshot<unknown>>;
   readonly mutationStore: MutationStore;
   readonly overlayStore: OptimisticOverlayStore;
-  readonly onDiagnostic: ObserverDiagnosticReporter | undefined;
   readonly acquire: () => () => void;
 };
 
@@ -40,7 +39,6 @@ export const createRuntime = (
     serverQuerySnapshots,
     mutationStore,
     overlayStore,
-    onDiagnostic,
     acquire: () => {
       if (closed) throw new Error('Tarstate provider runtime is closed');
       acquisitions += 1;

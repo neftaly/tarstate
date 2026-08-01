@@ -26,7 +26,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource
 } from '../src/adapter/atomic-source.js';
-import { AutomergeMappedStorageBinding } from '../src/adapter/mapped-storage.js';
+import { createAutomergeMappedStorageBinding } from '../src/adapter/mapped-storage.js';
 import { AutomergeSourceRuntime } from '../src/source/runtime.js';
 
 type TaskDoc = {
@@ -113,7 +113,7 @@ const fixture = async (doc: TaskDoc = {
   }
   const runtime = new AutomergeSourceRuntime({ sourceId: 'source:mapped', doc: Automerge.from<TaskDoc>(doc) });
   const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
-  const binding = new AutomergeMappedStorageBinding<TaskDoc>({ id: 'binding:mapped', mapping: compiled.value, registry });
+  const binding = createAutomergeMappedStorageBinding<TaskDoc>({ id: 'binding:mapped', mapping: compiled.value, registry });
   return { runtime, source, binding, registry, schemaArtifact, mappingArtifact };
 };
 
@@ -168,7 +168,7 @@ const singletonFixture = async (mimeTypeAbsent = false) => {
     })
   });
   const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
-  const binding = new AutomergeMappedStorageBinding<FileDoc>({ id: 'binding:file', mapping: compiled.value, registry });
+  const binding = createAutomergeMappedStorageBinding<FileDoc>({ id: 'binding:file', mapping: compiled.value, registry });
   return { runtime, source, binding };
 };
 
@@ -213,7 +213,7 @@ const immutableTextSingletonFixture = async () => {
     })
   });
   const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
-  const binding = new AutomergeMappedStorageBinding<ForeignTextFileDoc>({
+  const binding = createAutomergeMappedStorageBinding<ForeignTextFileDoc>({
     id: 'binding:immutable-text-file',
     mapping: compiled.value,
     registry
@@ -271,7 +271,7 @@ const arrayFixture = async (identity: 'source' | 'field') => {
     doc: Automerge.from<LinkDoc>(doc)
   });
   const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
-  const binding = new AutomergeMappedStorageBinding<LinkDoc>({
+  const binding = createAutomergeMappedStorageBinding<LinkDoc>({
     id: `binding:array:${identity}`,
     mapping: compiled.value,
     registry
@@ -373,7 +373,7 @@ const recursiveArrayFixture = async () => {
     runtime,
     operationEpoch: 'epoch:mapped'
   });
-  const binding = new AutomergeMappedStorageBinding<TreeDoc>({
+  const binding = createAutomergeMappedStorageBinding<TreeDoc>({
     id: 'binding:recursive-array',
     mapping: compiled.value,
     registry

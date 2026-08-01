@@ -1,5 +1,5 @@
 import type { ArtifactRef } from './artifacts.js';
-import { canonicalizeJson, isContentHash, sha256Bytes, sha256Json, type ContentHash } from './canonical-json.js';
+import { isContentHash, sha256Bytes, sha256Json, type ContentHash } from './canonical-json.js';
 import { canonicalizeJsonWithCache, type CanonicalJsonCache } from './internal-canonical-json.js';
 import {
   deriveCoordinatorFailureEvidence,
@@ -12,6 +12,7 @@ import {
   normalizeDocumentProjection
 } from './attachment/document-declaration.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { samePortableJson } from './internal-json-equality.js';
 import { positiveSafeInteger } from './internal-numeric-boundary.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
@@ -706,7 +707,7 @@ const durableLookupUnavailableIssue = (): Issue => coordinatorIssue(
 const errorDetails = (error: unknown): JsonValue => ({ error: error instanceof Error ? error.name : typeof error });
 const invalidCommandHash = (kind: string, operationEpoch: string, operationId: string): Promise<ContentHash> => sha256Json({ kind, invalid: true, operationEpoch, operationId });
 const operationKey = (epoch: string, id: string): string => stringTupleKey(epoch, id);
-const sameBasis = (left: SourceBasis, right: SourceBasis): boolean => canonicalizeJson(left) === canonicalizeJson(right);
+const sameBasis = (left: SourceBasis, right: SourceBasis): boolean => samePortableJson(left, right);
 const compare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 const signalAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 const commandIdentity = (command: unknown, member: string): string => {

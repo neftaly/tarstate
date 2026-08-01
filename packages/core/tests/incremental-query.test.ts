@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  capabilityRefKey,
   createPooledIncrementalQueryRuntime,
   diffQueryMaintenanceSnapshots,
   evaluatePreparedQuery,
@@ -300,7 +301,7 @@ describe('incremental query maintenance', () => {
 
   it('detaches function registry membership while retaining implementation identity', () => {
     const capability = { id: 'urn:test:owned-registry', version: '1', contractHash: `sha256:${'e'.repeat(64)}` } as const;
-    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const key = capabilityRefKey(capability);
     const original = (args: readonly JsonValue[]) => typeof args[0] === 'string' ? args[0] + '!' : 'unexpected';
     const functions = new Map([[key, original]]);
     const query: QueryNode = {
@@ -806,7 +807,7 @@ describe('incremental query maintenance', () => {
 
   it('rematerializes local operators when a call argument contains a subquery dependency', () => {
     const identity = { id: 'urn:test:nested-subquery-call', version: '1', contractHash: `sha256:${'6'.repeat(64)}` } as const;
-    const identityKey = identity.id + '\u0000' + identity.version + '\u0000' + identity.contractHash;
+    const identityKey = capabilityRefKey(identity);
     const functions = new Map([[identityKey, (args: readonly JsonValue[]) => args[0] ?? false]]);
     const enabled = {
       kind: 'subquery', mode: 'scalar',
@@ -1075,7 +1076,7 @@ describe('incremental query maintenance', () => {
 
   it('maintains every expression family with the same semantics as the oracle', () => {
     const callable = { id: 'urn:test:query-function', version: '1', contractHash: `sha256:${'e'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => typeof args[0] === 'string' ? args[0] + '!' : null]]);
     const query: QueryNode = {
       kind: 'select',
@@ -1416,7 +1417,7 @@ describe('incremental query maintenance', () => {
 
   it('propagates stable one-row replacements through a deep local pipeline without rescanning expressions', () => {
     const identity = { id: 'urn:test:local-identity', version: '1', contractHash: `sha256:${'7'.repeat(64)}` } as const;
-    const identityKey = identity.id + '\u0000' + identity.version + '\u0000' + identity.contractHash;
+    const identityKey = capabilityRefKey(identity);
     let calls = 0;
     const functions = new Map([[identityKey, (args: readonly JsonValue[]) => { calls += 1; return args[0] ?? null; }]]);
     const call = (value: ReturnType<typeof field>) => ({ kind: 'call', capability: identity, args: [value] } as const);
@@ -1727,7 +1728,7 @@ describe('incremental query maintenance', () => {
 
   it('limits downstream named-call work to slice and union-all output deltas', () => {
     const capability = { id: 'urn:test:delta-call', version: '1', contractHash: `sha256:${'8'.repeat(64)}` } as const;
-    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const key = capabilityRefKey(capability);
     let calls = 0;
     const functions = new Map([[key, (args: readonly JsonValue[]) => { calls += 1; return args[0] ?? null; }]]);
     const called = (input: QueryNode): QueryNode => ({ kind: 'select', input, alias: 'result', fields: { value: { kind: 'call', capability, args: [field('item', 'value')] } } });
@@ -1758,7 +1759,7 @@ describe('incremental query maintenance', () => {
 
   it('keeps named lag values on full evaluation instead of the stable-key micro path', () => {
     const capability = { id: 'urn:test:window-lag-call', version: '1', contractHash: `sha256:${'7'.repeat(64)}` } as const;
-    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const key = capabilityRefKey(capability);
     let calls = 0;
     const functions = new Map([[key, (args: readonly JsonValue[]) => { calls += 1; return args[0] ?? null; }]]);
     const query: QueryNode = {
@@ -1785,7 +1786,7 @@ describe('incremental query maintenance', () => {
 
   it('keeps named window calls on the conservative full-evaluation path', () => {
     const ordered = { id: 'urn:test:window-order-stateful', version: '1', contractHash: `sha256:${'6'.repeat(64)}` } as const;
-    const orderedKey = ordered.id + '\u0000' + ordered.version + '\u0000' + ordered.contractHash;
+    const orderedKey = capabilityRefKey(ordered);
     let failingId: number | undefined;
     const functions = new Map([[orderedKey, (args: readonly JsonValue[]) => {
       if (args[0] === failingId) throw new Error('stateful window failure');
@@ -1849,7 +1850,7 @@ describe('incremental query maintenance', () => {
 
   it('withdraws a private assertion after a named function returns a non-portable value and later recovers', () => {
     const callable = { id: 'urn:test:private-rollback', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => args[0] === 2 ? cyclic as unknown as JsonValue : args[0] ?? null]]);
@@ -1884,7 +1885,7 @@ describe('incremental query maintenance', () => {
 
   it('rejects recursive private updates and defers closure until the active update finishes', () => {
     const callable = { id: 'urn:test:private-reentrant', version: '1', contractHash: `sha256:${'8'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     let session: ReturnType<typeof openIncrementalQueryMaintenance>;
     let action: 'none' | 'reenter' | 'close' = 'none';
     let recursiveError: unknown;
@@ -2620,7 +2621,7 @@ describe('incremental query maintenance', () => {
 
   it('keeps pooled root reads atomic during reentrant query functions', () => {
     const callable = { id: 'urn:test:pooled-reentrant-read', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     const initial = snapshot(basePeople, 1);
     const changed = snapshot(middlePeople, 2);
     let root: ReturnType<ReturnType<typeof createPooledIncrementalQueryRuntime>['attach']> | undefined;
@@ -2663,7 +2664,7 @@ describe('incremental query maintenance', () => {
 
   it('defers root closure during updates and rejects recursive updates and attachment', () => {
     const callable = { id: 'urn:test:pooled-reentrant', version: '1', contractHash: `sha256:${'f'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     const initial = snapshot(basePeople, 1);
     const middle = snapshot(middlePeople, 2);
     const final = snapshot(finalPeople, 3);
@@ -2717,7 +2718,7 @@ describe('incremental query maintenance', () => {
 
   it('defers closure and rejects graph reentrancy while attaching a root', () => {
     const callable = { id: 'urn:test:pooled-attach-reentrant', version: '1', contractHash: `sha256:${'e'.repeat(64)}` } as const;
-    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const functionKey = capabilityRefKey(callable);
     const initial = snapshot(basePeople, 1);
     const next = snapshot(middlePeople, 2);
     let runtime: ReturnType<typeof createPooledIncrementalQueryRuntime>;

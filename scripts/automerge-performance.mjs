@@ -2,8 +2,8 @@ import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import {
-  AutomergeMappedStorageBinding,
   AutomergeSystemRelationState,
+  createAutomergeMappedStorageBinding,
   projectAutomergeFacts
 } from '../packages/automerge/dist/internal-benchmark.js';
 import { adoptAutomergeJsonValue } from '../packages/automerge/dist/values/index.js';
@@ -106,7 +106,7 @@ const measureTitleOnlyFileProjection = () => {
   if (!mapping.success) throw new Error('Performance file mapping preparation failed');
   const contentBytes = 8 * 1024 * 1024;
   const document = Automerge.from({ name: 'large.bin', content: new Uint8Array(contentBytes) });
-  const binding = new AutomergeMappedStorageBinding({
+  const binding = createAutomergeMappedStorageBinding({
     id: 'performance:title-only',
     mapping: mapping.value
   });

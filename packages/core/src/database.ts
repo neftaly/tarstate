@@ -1,6 +1,6 @@
-import { canonicalizeJson } from './canonical-json.js';
 import type { AttachmentProjection } from './attachment/model.js';
 import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
+import { samePortableJson } from './internal-json-equality.js';
 import { comparePortableStrings } from './portable-order.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import type { ObservableSource, SourceSnapshot } from './source-state.js';
@@ -193,13 +193,13 @@ const normalizeMembers = (members: readonly DatasetMember[]): readonly DatasetMe
       ...(sourceAvailability === undefined ? {} : { sourceAvailability })
     });
     const existing = byAttachment.get(member.attachmentId);
-    if (existing !== undefined && canonicalizeJson(existing as never) !== canonicalizeJson(normalized as never)) throw new Error('Ambiguous dataset member ' + member.attachmentId);
+    if (existing !== undefined && !samePortableJson(existing, normalized)) throw new Error('Ambiguous dataset member ' + member.attachmentId);
     byAttachment.set(member.attachmentId, normalized);
   }
   return Object.freeze([...byAttachment.values()].sort((left, right) => comparePortableStrings(left.attachmentId, right.attachmentId)));
 };
 
-const sameMembers = (left: readonly DatasetMember[], right: readonly DatasetMember[]): boolean => canonicalizeJson(left as never) === canonicalizeJson(right as never);
+const sameMembers = (left: readonly DatasetMember[], right: readonly DatasetMember[]): boolean => samePortableJson(left, right);
 
 const freezeDataset = (snapshot: DatasetSnapshot): DatasetSnapshot => Object.freeze({
   ...snapshot,

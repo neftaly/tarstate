@@ -45,6 +45,7 @@ type TestPlan = Omit<PlanResult<Command>, 'handledEdits'> & Pick<Partial<PlanRes
 
 const binding = (id: string, plan: TestPlan, declared: readonly string[] = ['a', 'b']): StorageBinding<Storage, Command> => ({
   id,
+  relationIds: ['items'],
   writeCapabilities: new Map(),
   declaredReadFootprint: declared,
   declaredWriteFootprint: declared,
@@ -56,16 +57,16 @@ const binding = (id: string, plan: TestPlan, declared: readonly string[] = ['a',
 });
 
 const commitInput = { operationEpoch: 'epoch', operationId: 'operation', intentHash: `sha256:${'a'.repeat(64)}` as const, expectedBasis: 0 };
+const itemEdit = { kind: 'insert' as const, relationId: 'items', key: 'a', fields: { id: 'a' } };
 
 describe('generic source commit coordinator', () => {
   it('rejects unhandled and conflicting edit coverage while allowing explicit cooperation', () => {
     const value = source();
-    const edit = { kind: 'insert' as const, relationId: 'items', key: 'a', fields: { id: 'a' } };
     const unhandled = stageSourceEdits({
       source: value,
       bindings: [binding('ignores-items', { handledEdits: [], readFootprint: [], writeFootprint: [], intents: [], issues: [] })],
       snapshot: value.snapshot(),
-      edits: [edit]
+      edits: [itemEdit]
     });
     expect(unhandled).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.edit_unhandled' }] });
 
@@ -74,7 +75,7 @@ describe('generic source commit coordinator', () => {
       source: value,
       bindings: [binding('first', exclusive), binding('second', exclusive)],
       snapshot: value.snapshot(),
-      edits: [edit]
+      edits: [itemEdit]
     });
     expect(conflicting).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.edit_handling_conflict' }] });
 
@@ -85,7 +86,7 @@ describe('generic source commit coordinator', () => {
         binding('second', { ...exclusive, handledEdits: [{ editIndex: 0, mode: 'cooperative' }] })
       ],
       snapshot: value.snapshot(),
-      edits: [edit]
+      edits: [itemEdit]
     });
     expect(cooperative).toMatchObject({ outcome: 'staged' });
   });
@@ -98,7 +99,7 @@ describe('generic source commit coordinator', () => {
       source: value,
       bindings: [binding('write:first', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'a', value: 1 } }], issues: [] })],
       snapshot: initial,
-      edits: []
+      edits: [itemEdit]
     });
     expect(first).toMatchObject({ outcome: 'staged', snapshot: { storage: { a: 1 } }, commands: [{ path: 'a', value: 1 }] });
     if (first.outcome !== 'staged') return;
@@ -106,7 +107,7 @@ describe('generic source commit coordinator', () => {
       source: value,
       bindings: [binding('write:second', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'a', value: 2 } }], issues: [] })],
       snapshot: first.snapshot,
-      edits: []
+      edits: [itemEdit]
     });
     expect(second).toMatchObject({ outcome: 'staged', snapshot: { storage: { a: 2 } }, commands: [{ path: 'a', value: 2 }] });
     expect(commit).not.toHaveBeenCalled();
@@ -118,10 +119,10 @@ describe('generic source commit coordinator', () => {
     const result = await coordinateSourceCommit({
       source: source(commit),
       bindings: [
-        binding('z', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'z', value: 2 } }], issues: [] }),
-        binding('a', { readFootprint: ['b'], writeFootprint: ['b'], intents: [{ footprint: ['b'], command: { path: 'a', value: 1 } }], issues: [] })
+        binding('z', { handledEdits: [{ editIndex: 0, mode: 'cooperative' }], readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'z', value: 2 } }], issues: [] }),
+        binding('a', { handledEdits: [{ editIndex: 0, mode: 'cooperative' }], readFootprint: ['b'], writeFootprint: ['b'], intents: [{ footprint: ['b'], command: { path: 'a', value: 1 } }], issues: [] })
       ],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput,
       validate: ({ snapshot, plans }) => { observed.push(...plans.map((_plan, index) => String(index)), ...Object.keys(snapshot.storage ?? {})); return []; }
     });
@@ -133,7 +134,7 @@ describe('generic source commit coordinator', () => {
   it.each(['disjoint', 'contains', 'overlaps', 'unknown'] as const)('rejects %s where containment proof is required', async (relation) => {
     const commit = vi.fn(async () => ({ outcome: 'committed' as const, issues: [] }));
     const value = source(commit, () => relation);
-    const result = await coordinateSourceCommit({ source: value, bindings: [binding('bad', { readFootprint: ['outside'], writeFootprint: [], intents: [], issues: [] })], edits: [], commit: commitInput });
+    const result = await coordinateSourceCommit({ source: value, bindings: [binding('bad', { readFootprint: ['outside'], writeFootprint: [], intents: [], issues: [] })], edits: [itemEdit], commit: commitInput });
     expect(result.outcome).toBe('rejected');
     expect(result.issues.some((issue) => issue.code === 'binding.footprint_out_of_bounds' && (issue.details as { relation?: string }).relation === relation)).toBe(true);
     expect(commit).not.toHaveBeenCalled();
@@ -145,7 +146,7 @@ describe('generic source commit coordinator', () => {
     const result = await coordinateSourceCommit({
       source: value,
       bindings: [binding('bounded', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'a', value: 1 } }], issues: [] })],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput
     });
     expect(result.outcome).toBe('committed');
@@ -158,7 +159,7 @@ describe('generic source commit coordinator', () => {
     const warned = await coordinateSourceCommit({
       source: source(commit),
       bindings: [binding('warning', { readFootprint: [], writeFootprint: [], intents: [], issues: [warning] })],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput
     });
     expect(warned).toMatchObject({ outcome: 'committed', issues: [{ code: 'lens.lossy_value', severity: 'warning' }] });
@@ -167,7 +168,7 @@ describe('generic source commit coordinator', () => {
     const failed = await coordinateSourceCommit({
       source: source(commit),
       bindings: [{ ...binding('throwing', { readFootprint: [], writeFootprint: [], intents: [], issues: [] }), plan: () => { throw new TypeError('planner failed'); } }],
-      edits: [],
+      edits: [itemEdit],
       commit: { ...commitInput, operationId: 'planner-failed' }
     });
     expect(failed).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.plan_failed' }] });
@@ -187,7 +188,7 @@ describe('generic source commit coordinator', () => {
         snapshot: () => { throw new Error('snapshot failed'); }
       },
       bindings: [emptyBinding],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput
     });
     expect(snapshotFailure).toMatchObject({
@@ -203,7 +204,7 @@ describe('generic source commit coordinator', () => {
         intents: [],
         issues: []
       })],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput
     });
     expect(footprintFailure).toMatchObject({
@@ -219,7 +220,7 @@ describe('generic source commit coordinator', () => {
         mergeIntents: () => { throw new Error('merge failed'); }
       },
       bindings: [emptyBinding],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput
     });
     expect(mergeFailure).toMatchObject({
@@ -230,7 +231,7 @@ describe('generic source commit coordinator', () => {
     const validationFailure = await coordinateSourceCommit({
       source: source(),
       bindings: [emptyBinding],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput,
       validate: () => { throw new Error('validation failed'); }
     });
@@ -242,7 +243,7 @@ describe('generic source commit coordinator', () => {
     const commitFailure = await coordinateSourceCommit({
       source: source(async () => { throw new Error('commit result lost'); }),
       bindings: [emptyBinding],
-      edits: [],
+      edits: [itemEdit],
       commit: commitInput
     });
     expect(commitFailure).toMatchObject({
@@ -269,12 +270,13 @@ describe('generic source commit coordinator', () => {
         return { outcome: 'committed' as const, beforeBasis: 0, afterBasis: 1, issues: [] };
       });
       const bindings = order.map((id, index) => binding(id, {
+        handledEdits: [{ editIndex: 0, mode: 'cooperative' }],
         readFootprint: [id],
         writeFootprint: [id],
         intents: [{ footprint: [id], command: { path: id, value: index } }],
         issues: []
       }, [id]));
-      await coordinateSourceCommit({ source: source(commit), bindings, edits: [], commit: commitInput });
+      await coordinateSourceCommit({ source: source(commit), bindings, edits: [itemEdit], commit: commitInput });
     }
     expect(committedCommands.map((commands) => commands.map(({ path }) => path))).toEqual([
       ['a', 'b', 'c'],
@@ -310,7 +312,7 @@ describe('generic source commit coordinator', () => {
       expectedBasis: { incarnation: 'incarnation:one', revision: 0 }
     };
 
-    const handedOff = await coordinateSourceCommit({ source: firstRuntime, bindings: [write], edits: [], commit: identity });
+    const handedOff = await coordinateSourceCommit({ source: firstRuntime, bindings: [write], edits: [itemEdit], commit: identity });
     expect(handedOff).toMatchObject({ outcome: 'unknown', beforeBasis: identity.expectedBasis, issues: [{ code: 'transaction.outcome_unavailable', retry: 'query_outcome' }] });
     expect(store.read()).toMatchObject({
       revision: 1,
@@ -331,14 +333,14 @@ describe('generic source commit coordinator', () => {
 
     // An exact retry returns the persisted result before stale-basis checking
     // and does not apply the command again.
-    const retried = await coordinateSourceCommit({ source: recoveredRuntime, bindings: [write], edits: [], commit: identity });
+    const retried = await coordinateSourceCommit({ source: recoveredRuntime, bindings: [write], edits: [itemEdit], commit: identity });
     expect(retried).toEqual(lookup.result);
     expect(recoveredStore.read().storage).toEqual({ a: 1 });
     expect(recoveredStore.read().revision).toBe(1);
 
     const differentIntent = { ...identity, intentHash: `sha256:${'e'.repeat(64)}` as const, expectedBasis: { incarnation: 'incarnation:one', revision: 1 } };
     await expect(recoveredRuntime.queryOutcome(differentIntent)).resolves.toEqual({ status: 'ambiguous' });
-    const ambiguous = await coordinateSourceCommit({ source: recoveredRuntime, bindings: [write], edits: [], commit: differentIntent });
+    const ambiguous = await coordinateSourceCommit({ source: recoveredRuntime, bindings: [write], edits: [itemEdit], commit: differentIntent });
     expect(ambiguous).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.operation_id_ambiguous', retry: 'never' }] });
     expect(recoveredStore.read()).toMatchObject({ revision: 1, storage: { a: 1 } });
   });
