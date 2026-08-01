@@ -12,6 +12,7 @@ import {
 } from '../src/mapping.js';
 import { projectLensRelation, resolveLensPath, translateLensEdits, validateLens, type LensArtifact, type LensRows, type SchemaLensBody } from '../src/lens.js';
 import { parseScalarValue, type CodecImplementation } from '../src/codec.js';
+import { defaultValueParseBudget } from '../src/value.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 const schemaRef = { id: 'urn:test:schema', contentHash: hash('1') };
@@ -167,6 +168,12 @@ describe('production schemas and codecs', () => {
                 maxItems: 2
               }
             },
+            selection: {
+              type: {
+                kind: 'array',
+                items: { kind: 'string' }
+              }
+            },
             maybe: {
               type: {
                 kind: 'union',
@@ -189,6 +196,7 @@ describe('production schemas and codecs', () => {
       },
       vector: [1, null, 3],
       labels: ['a', 'b'],
+      selection: ['a', 'b', 'c', 'd'],
       maybe: null
     })).toMatchObject({ success: true });
     expect(parseRelationCandidate(prepared.value, 'test.presence', {
@@ -201,6 +209,7 @@ describe('production schemas and codecs', () => {
       },
       vector: [1, 2],
       labels: ['a', 'b', 'c'],
+      selection: [],
       maybe: null
     })).toMatchObject({
       success: false,
@@ -229,6 +238,25 @@ describe('production schemas and codecs', () => {
       success: false,
       issues: [{ code: 'schema.field_invalid', details: { reason: 'ambiguous_union' } }]
     });
+
+    expect(prepareSchema({
+      relations: {
+        portable: {
+          relationId: 'test.portable',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            values: {
+              type: {
+                kind: 'array',
+                items: { kind: 'string' },
+                maxItems: defaultValueParseBudget.maxArrayMembers + 1
+              }
+            }
+          }
+        }
+      }
+    })).toMatchObject({ success: true });
   });
 
   it('turns a throwing custom codec into a structured issue', async () => {
@@ -525,6 +553,70 @@ describe('production JSON-tree storage mappings', () => {
         ? identities.get(target)
         : undefined;
     };
+    const pieceMapping = mapping.relations['test.piece'];
+    if (pieceMapping === undefined) throw new Error('recursive relation mapping missing');
+    const mappingWithoutSemanticLimits: StorageMappingBody = {
+      ...mapping,
+      relations: {
+        'test.piece': {
+          ...pieceMapping,
+          collection: {
+            kind: 'recursive-array',
+            path: ['children'],
+            descendants: ['children'],
+            absent: 'invalid'
+          }
+        }
+      }
+    };
+    const compiledWithoutSemanticLimits = compileStorageMapping(
+      mappingWithoutSemanticLimits,
+      schemaRef,
+      prepared.value
+    );
+    if (!compiledWithoutSemanticLimits.success) {
+      throw new Error('unbounded recursive mapping fixture failed');
+    }
+    expect(compiledWithoutSemanticLimits.value.body.relations['test.piece']?.collection)
+      .not.toHaveProperty('maxRows');
+    expect(projectStorage(
+      compiledWithoutSemanticLimits.value,
+      snapshot,
+      { sourceMetadata }
+    )).toMatchObject({ completeness: 'exact', issues: [] });
+
+    type DeepNode = { readonly id: string; readonly name: string; readonly children: DeepNode[] };
+    let deepNode: DeepNode = { id: 'deep:513', name: 'Deep 513', children: [] };
+    for (let depth = 512; depth >= 0; depth -= 1) {
+      deepNode = {
+        id: 'deep:' + depth,
+        name: 'Deep ' + depth,
+        children: [deepNode]
+      };
+    }
+    const operationallyLimited = projectStorage(
+      compiledWithoutSemanticLimits.value,
+      { children: [deepNode] },
+      {
+        sourceMetadata: ({ value, candidate, parentCandidate }) => {
+          const target = value === 'recursive-parent-element-identity'
+            ? parentCandidate
+            : candidate;
+          return target !== null && typeof target === 'object' && 'id' in target
+            ? target.id
+            : undefined;
+        }
+      }
+    );
+    expect(operationallyLimited).toMatchObject({
+      completeness: 'unknown',
+      issues: [{
+        code: 'mapping.recursive_budget_exceeded',
+        phase: 'query',
+        details: { budget: 'maxDepth', maximum: 512 }
+      }]
+    });
+
     const projection = projectStorage(compiled.value, snapshot, {
       sourceMetadata
     });

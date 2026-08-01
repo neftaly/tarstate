@@ -42,7 +42,7 @@ const queryBody = (): QueryArtifactBody => ({
   schemaViews: [schemaRef],
   parameters: {
     minimum: { kind: 'integer' },
-    filters: { kind: 'record', fields: { active: { kind: 'boolean' }, tags: { kind: 'array', items: { kind: 'string' }, maxItems: 100 } }, optional: ['tags'] }
+    filters: { kind: 'record', fields: { active: { kind: 'boolean' }, tags: { kind: 'array', items: { kind: 'string' } } }, optional: ['tags'] }
   },
   root: {
     kind: 'where',
@@ -150,6 +150,14 @@ describe('semantic artifact safe parsers', () => {
     })).toMatchObject({ success: true, value: { rows: [{ id: 1, score: 4 }], completeness: 'exact' } });
     expect(await safeEvaluateQueryArtifact(artifact, { relations: [], parameters: { minimum: 3, filters: { active: true }, extra: true } }))
       .toMatchObject({ success: false, issues: [{ code: 'query.parameter_invalid', details: { reason: 'extra' } }] });
+    const unknownOptionalField = mutate(queryBody(), (body) => {
+      body.parameters.filters.optional = ['missing'];
+    });
+    expect(await safeParseQueryArtifact(await seal('query', unknownOptionalField)))
+      .toMatchObject({
+        success: false,
+        issues: [{ details: { reason: 'unknown_optional_field' } }]
+      });
   });
 
   it('refuses to evaluate query artifacts until every required capability is implemented', async () => {
@@ -288,11 +296,20 @@ describe('semantic artifact safe parsers', () => {
       await seal('storage-mapping', recursive)
     )).toMatchObject({ success: true });
     const unboundedRecursive = mutate(recursive, (body) => {
+      delete body.relations['test.person'].collection.maxDepth;
+      delete body.relations['test.person'].collection.maxRows;
       delete body.relations['test.person'].collection.maxTraversalSteps;
     });
-    expect(await safeParseStorageMappingArtifact(
-      await seal('storage-mapping', unboundedRecursive)
-    )).toMatchObject({ success: false });
+    const unboundedRecursiveArtifact = await seal(
+      'storage-mapping',
+      unboundedRecursive
+    );
+    expect(await safeParseStorageMappingArtifact(unboundedRecursiveArtifact))
+      .toMatchObject({ success: true });
+    expect(await safePrepareStorageMappingArtifact(
+      unboundedRecursiveArtifact,
+      { schemaRef, schema: prepared.value }
+    )).toMatchObject({ success: true });
     const unknownSourceMetadata = mutate(sourceIdentity, (body) => {
       body.relations['test.person'].keys.id.value = 'array-index';
     });

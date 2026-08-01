@@ -68,10 +68,7 @@ const recursiveMappingBody: StorageMappingBody = {
         kind: 'recursive-array',
         path: ['children'],
         descendants: ['children'],
-        absent: 'invalid',
-        maxDepth: 6,
-        maxRows: 128,
-        maxTraversalSteps: 512
+        absent: 'invalid'
       },
       keys: { id: { kind: 'field', path: ['id'] } },
       fields: {

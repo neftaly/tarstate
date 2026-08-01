@@ -16,8 +16,9 @@ export const isValueDeclaration = (
   if (value.kind === 'null') return hasOnlyKeys(value, ['kind']);
   if (value.kind === 'array') {
     return hasOnlyKeys(value, ['kind', 'items', 'maxItems'])
-      && Number.isSafeInteger(value.maxItems)
-      && (value.maxItems as number) >= 0
+      && (value.maxItems === undefined
+        || (Number.isSafeInteger(value.maxItems)
+          && (value.maxItems as number) >= 0))
       && isValueDeclaration(value.items, isScalar, depth + 1);
   }
   if (value.kind === 'tuple') {

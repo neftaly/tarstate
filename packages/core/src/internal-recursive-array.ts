@@ -4,6 +4,12 @@ export type RecursiveArrayTraversal = {
   readonly path: RecursiveStoragePath;
   readonly descendants: RecursiveStoragePath;
   readonly absent: 'empty' | 'invalid';
+  readonly maxDepth?: number;
+  readonly maxRows?: number;
+  readonly maxTraversalSteps?: number;
+};
+
+export type RecursiveArrayTraversalBudget = {
   readonly maxDepth: number;
   readonly maxRows: number;
   readonly maxTraversalSteps: number;
@@ -26,6 +32,7 @@ export type RecursiveArrayProblem = {
   readonly code:
     | 'collection-absent'
     | 'collection-invalid'
+    | 'recursive-budget-exceeded'
     | 'recursive-limit-exceeded'
     | 'recursive-not-tree';
   readonly path: RecursiveStoragePath;
@@ -50,13 +57,20 @@ type RecursiveArrayFrame = {
 /** Bounded depth-first traversal over enumerable array data properties. */
 export const traverseRecursiveArray = (
   root: readonly unknown[],
-  traversal: RecursiveArrayTraversal
+  traversal: RecursiveArrayTraversal,
+  budget: RecursiveArrayTraversalBudget
 ): RecursiveArrayTraversalResult => {
   const occurrences: RecursiveArrayOccurrence[] = [];
   const problems: RecursiveArrayProblem[] = [];
   const frames: RecursiveArrayFrame[] = [];
   const seenCollections = new WeakSet<object>();
   const seenCandidates = new WeakSet<object>();
+  const maxDepth = Math.min(traversal.maxDepth ?? budget.maxDepth, budget.maxDepth);
+  const maxRows = Math.min(traversal.maxRows ?? budget.maxRows, budget.maxRows);
+  const maxTraversalSteps = Math.min(
+    traversal.maxTraversalSteps ?? budget.maxTraversalSteps,
+    budget.maxTraversalSteps
+  );
   let complete = true;
   let traversalSteps = 0;
   let limited = false;
@@ -70,15 +84,28 @@ export const traverseRecursiveArray = (
     complete = false;
   };
 
+  const recordLimitProblem = (
+    name: keyof RecursiveArrayTraversalBudget,
+    maximum: number,
+    path: RecursiveStoragePath
+  ): void => {
+    const declared = traversal[name];
+    const semantic = declared !== undefined && declared <= budget[name];
+    recordProblem(
+      semantic ? 'recursive-limit-exceeded' : 'recursive-budget-exceeded',
+      path,
+      semantic ? { limit: name, maximum } : { budget: name, maximum }
+    );
+  };
+
   const consumeStep = (path: RecursiveStoragePath): boolean => {
     traversalSteps += 1;
-    if (traversalSteps <= traversal.maxTraversalSteps) return true;
-    if (!limited) {
-      recordProblem('recursive-limit-exceeded', path, {
-        limit: 'maxTraversalSteps',
-        maximum: traversal.maxTraversalSteps
-      });
-    }
+    if (traversalSteps <= maxTraversalSteps) return true;
+    recordLimitProblem(
+      'maxTraversalSteps',
+      maxTraversalSteps,
+      path
+    );
     limited = true;
     return false;
   };
@@ -127,11 +154,12 @@ export const traverseRecursiveArray = (
     frame.index += 1;
     const absolutePath = [...frame.collectionPath, index];
     if (!consumeStep(absolutePath)) break;
-    if (occurrences.length >= traversal.maxRows) {
-      recordProblem('recursive-limit-exceeded', absolutePath, {
-        limit: 'maxRows',
-        maximum: traversal.maxRows
-      });
+    if (occurrences.length >= maxRows) {
+      recordLimitProblem(
+        'maxRows',
+        maxRows,
+        absolutePath
+      );
       break;
     }
     const inspectedMember = inspectDataArrayMember(
@@ -194,7 +222,7 @@ export const traverseRecursiveArray = (
       });
       continue;
     }
-    if (frame.depth >= traversal.maxDepth) {
+    if (frame.depth >= maxDepth) {
       const inspected = inspectDataArrayLength(
         descendants.value,
         descendantsPath
@@ -202,10 +230,11 @@ export const traverseRecursiveArray = (
       if (!inspected.success) {
         recordProblem('collection-invalid', inspected.path, inspected.details);
       } else if (inspected.length > 0) {
-        recordProblem('recursive-limit-exceeded', descendantsPath, {
-          limit: 'maxDepth',
-          maximum: traversal.maxDepth
-        });
+        recordLimitProblem(
+          'maxDepth',
+          maxDepth,
+          descendantsPath
+        );
       }
       continue;
     }

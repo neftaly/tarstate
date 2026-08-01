@@ -49,26 +49,37 @@ retain exact string literals and tuple order without changing runtime behavior.
 
 Relation fields and query parameters share one finite value-declaration
 language. Alongside scalar and opaque `json` declarations it supports null,
-fixed tuples, closed records with explicit optional members, bounded
-homogeneous arrays, and unions whose alternatives preparation can prove
-disjoint. Literal string sets provide discriminants. The same prepared
+fixed tuples, closed records with explicit optional members, homogeneous
+arrays with optional semantic item-count limits, and unions whose alternatives
+preparation can prove disjoint. Literal string sets provide discriminants. The same prepared
 declaration drives row parsing and generated TypeScript, JSON Schema, and
 Markdown; connectors still receive detached ordinary portable values.
+
+Omitting an array's `maxItems` means the schema declares no item-count rule.
+Operational parser and allocation budgets remain host policy and report their
+own resource-exhaustion issues; they are not serialized as application facts.
 
 ## Mappings
 
 A storage mapping declares how a source shape projects to logical relations.
-It may use singleton, array, object-map, or bounded recursive-array
+It may use singleton, array, object-map, or recursive-array
 collections; stored, literal, map-key, or source-metadata key fields; stored,
 absent, or source-metadata fields; and explicit write capabilities.
 
 A recursive-array collection repeats through one declared descendant path.
-Its artifact supplies depth, row, and traversal-step limits. Projection is
-iterative, rejects repeated objects or collections rather than treating a
-graph as a tree, and exposes sibling position plus optional adapter-provided
-element and parent-element identity. Root parent identity is `null`; therefore
-a field mapped from `recursive-parent-element-identity` must be nullable.
-One traversal step enters an array or visits one candidate.
+Its artifact may supply depth, row, and traversal-step limits when those are
+application data rules. Independently, the projector applies an operational
+depth, row, and traversal-step budget. An explicit mapping limit is a source
+data violation; operational exhaustion only makes projection incomplete and
+must use a distinct diagnostic. Omitting semantic limits must not serialize a
+hidden fallback limit into the artifact.
+
+Projection is iterative, rejects repeated objects or collections rather than
+treating a graph as a tree, and exposes sibling position plus optional
+adapter-provided element and parent-element identity. Root parent identity is
+`null`; therefore a field mapped from
+`recursive-parent-element-identity` must be nullable. One traversal step enters
+an array or visits one candidate.
 Recursive mappings do not imply identity-preserving move or arbitrary child
 insertion.
 

@@ -84,12 +84,13 @@ const validateCollectionMapping = (
         'kind',
         'path',
         'descendants',
-        'absent',
+        'absent'
+      ],
+      [
         'maxDepth',
         'maxRows',
         'maxTraversalSteps'
       ],
-      [],
       path
     )) return;
     validateStoragePath(context, input.path, [...path, 'path']);
@@ -101,14 +102,20 @@ const validateCollectionMapping = (
       ...path,
       'absent'
     ]);
-    validateBound(context, input.maxDepth, [...path, 'maxDepth'], true);
-    validateBound(context, input.maxRows, [...path, 'maxRows'], false);
-    validateBound(
-      context,
-      input.maxTraversalSteps,
-      [...path, 'maxTraversalSteps'],
-      false
-    );
+    if (input.maxDepth !== undefined) {
+      validateBound(context, input.maxDepth, [...path, 'maxDepth'], true);
+    }
+    if (input.maxRows !== undefined) {
+      validateBound(context, input.maxRows, [...path, 'maxRows'], false);
+    }
+    if (input.maxTraversalSteps !== undefined) {
+      validateBound(
+        context,
+        input.maxTraversalSteps,
+        [...path, 'maxTraversalSteps'],
+        false
+      );
+    }
     return;
   }
   if (!semanticShape(context, input, ['kind', 'path', 'absent'], [], path)) return;

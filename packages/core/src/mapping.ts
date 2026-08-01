@@ -9,6 +9,7 @@ import {
   inspectDataArray,
   readDataPath,
   traverseRecursiveArray,
+  type RecursiveArrayTraversalBudget,
   type RecursiveArrayProblem
 } from './internal-recursive-array.js';
 import { assertCompiledStorageMapping, assertPreparedSchema, sealCompiledStorageMapping } from './internal-semantic-provenance.js';
@@ -24,9 +25,9 @@ export type RecursiveArrayCollectionMapping = {
   readonly descendants: StoragePath;
   readonly absent: 'empty' | 'invalid';
   /** Root elements have depth zero. */
-  readonly maxDepth: number;
-  readonly maxRows: number;
-  readonly maxTraversalSteps: number;
+  readonly maxDepth?: number;
+  readonly maxRows?: number;
+  readonly maxTraversalSteps?: number;
 };
 export type CollectionMapping =
   | { readonly kind: 'object-map'; readonly path: StoragePath; readonly absent: 'empty' | 'creatable' | 'invalid' }
@@ -149,6 +150,12 @@ export type ProjectStorageOptions = {
   readonly fieldsByRelation?: ReadonlyMap<RelationId, ReadonlySet<string>>;
   readonly scalarDecoder?: StorageScalarDecoder;
   readonly sourceMetadata?: SourceMetadataResolver;
+};
+
+const defaultRecursiveArrayProjectionBudget: RecursiveArrayTraversalBudget = {
+  maxDepth: 512,
+  maxRows: 100_000,
+  maxTraversalSteps: 1_000_000
 };
 
 export type MappedStorageIntent = {
@@ -284,7 +291,12 @@ const projectStorageRelations = (
   let completeness: BindingProjection['completeness'] = 'exact';
   for (const [relationId, compiled] of binding.relations) {
     if (options.relationIds !== undefined && !options.relationIds.has(relationId)) continue;
-    const extracted = extractCandidates(snapshot, compiled.mapping.collection, relationId, options.sourceId);
+    const extracted = extractCandidates(
+      snapshot,
+      compiled.mapping.collection,
+      relationId,
+      options.sourceId
+    );
     const rawCandidates: { value: RelationRow; locator: MappingLocator }[] = [];
     const rejectedLocators: MappingLocator[] = [];
     const relationIssues = [...extracted.issues];
@@ -440,7 +452,12 @@ type ExtractedCandidate = {
   readonly absolutePath: StoragePath;
 };
 
-const extractCandidates = (snapshot: unknown, collection: CollectionMapping, relationId: RelationId, sourceId?: string): { candidates: readonly ExtractedCandidate[]; issues: readonly Issue[]; complete: boolean } => {
+const extractCandidates = (
+  snapshot: unknown,
+  collection: CollectionMapping,
+  relationId: RelationId,
+  sourceId?: string
+): { candidates: readonly ExtractedCandidate[]; issues: readonly Issue[]; complete: boolean } => {
   const resolved = readDataPath(snapshot, collection.path);
   if (!resolved.present) {
     if (resolved.reason === 'inspection_failed') return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: resolved.reason, error: resolved.error }, undefined, sourceId, relationId)], complete: false };
@@ -528,7 +545,11 @@ const extractRecursiveArrayCandidates = (
   readonly issues: readonly Issue[];
   readonly complete: boolean;
 } => {
-  const traversed = traverseRecursiveArray(root, collection);
+  const traversed = traverseRecursiveArray(
+    root,
+    collection,
+    defaultRecursiveArrayProjectionBudget
+  );
   return {
     candidates: traversed.occurrences,
     issues: traversed.problems.map((problem) => mappingIssue(
@@ -551,6 +572,8 @@ const recursiveProblemCode = (problem: RecursiveArrayProblem): string => {
       return 'mapping.collection_absent';
     case 'collection-invalid':
       return 'mapping.collection_invalid';
+    case 'recursive-budget-exceeded':
+      return 'mapping.recursive_budget_exceeded';
     case 'recursive-limit-exceeded':
       return 'mapping.recursive_limit_exceeded';
     case 'recursive-not-tree':
@@ -569,7 +592,7 @@ const isRecursiveLocatorFor = (
     || locator.index < 0
     || !Number.isSafeInteger(locator.depth)
     || locator.depth < 0
-    || locator.depth > collection.maxDepth
+    || (collection.maxDepth !== undefined && locator.depth > collection.maxDepth)
     || locator.collectionPath.length
       !== collection.path.length
         + locator.depth * (collection.descendants.length + 1)) {
@@ -880,9 +903,9 @@ const isCollectionMapping = (value: unknown): value is CollectionMapping => isRe
       && isStoragePath(value.descendants)
       && value.descendants.length > 0
       && (value.absent === 'empty' || value.absent === 'invalid')
-      && isNonNegativeSafeInteger(value.maxDepth)
-      && isPositiveSafeInteger(value.maxRows)
-      && isPositiveSafeInteger(value.maxTraversalSteps)
+      && (value.maxDepth === undefined || isNonNegativeSafeInteger(value.maxDepth))
+      && (value.maxRows === undefined || isPositiveSafeInteger(value.maxRows))
+      && (value.maxTraversalSteps === undefined || isPositiveSafeInteger(value.maxTraversalSteps))
     : hasOnlyKeys(value, ['kind', 'path', 'absent'])
       && (value.kind === 'singleton'
         ? value.absent === 'empty' || value.absent === 'invalid'
@@ -921,9 +944,14 @@ const isPositiveSafeInteger = (value: unknown): value is number =>
 const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && isContentHash(value.contractHash);
 const hasOnlyKeys = (value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean => Object.keys(value).every((key) => allowed.includes(key));
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const mappingIssuePhase = (code: string): 'resolve' | 'query' | 'parse' => {
+  if (code.startsWith('mapping.capability')) return 'resolve';
+  if (code === 'mapping.recursive_budget_exceeded') return 'query';
+  return 'parse';
+};
 
 const mappingIssue = (code: string, path: readonly unknown[], details?: unknown, requiredCapabilities?: readonly CapabilityRef[], sourceId?: string, relationId?: string, retry: 'after_input' | 'after_capability' | 'manual_repair' = requiredCapabilities === undefined ? 'after_input' : 'after_capability'): Issue => createIssue({
-  code, phase: code.startsWith('mapping.capability') ? 'resolve' : 'parse', severity: 'error', retry, path,
+  code, phase: mappingIssuePhase(code), severity: 'error', retry, path,
   ...(details === undefined ? {} : { details }), ...(requiredCapabilities === undefined ? {} : { requiredCapabilities }), ...(sourceId === undefined ? {} : { sourceId }), ...(relationId === undefined ? {} : { relationId })
 });
 const mappingFailure = (code: string, path: readonly unknown[], details?: unknown, sourceId?: string, relationId?: string, retry?: 'after_input' | 'after_capability' | 'manual_repair'): ParseResult<never> => ({ success: false, issues: [mappingIssue(code, path, details, undefined, sourceId, relationId, retry)] });

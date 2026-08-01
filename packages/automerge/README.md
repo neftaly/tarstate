@@ -19,8 +19,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.8.0.tgz \
-  ./tarstate-automerge-0.8.0.tgz \
+  ./tarstate-core-0.8.1.tgz \
+  ./tarstate-automerge-0.8.1.tgz \
   @automerge/automerge
 ```
 

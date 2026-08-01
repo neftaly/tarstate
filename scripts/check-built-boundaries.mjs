@@ -18,9 +18,9 @@ try {
   assertClosure('artifacts/query/index.js', 165_000, ['query-incremental', 'observer-maintenance', 'semantic-transaction', 'semantic-storage-mapping', 'semantic-schema-lens', 'semantic-constraint']);
   assertClosure('artifacts/transaction/index.js', 80_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'constraint-']);
   assertClosure('artifacts/constraint-set/index.js', 85_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'transaction-']);
-  // Includes canonical structured field parsing, bounded recursive-array
-  // traversal, and owned-row reuse without a second parser.
-  assertClosure('artifacts/storage-mapping/index.js', 108_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
+  // Includes canonical structured field parsing, owned-row reuse, and the
+  // semantic-limit/operational-budget split for recursive-array traversal.
+  assertClosure('artifacts/storage-mapping/index.js', 109_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
   assertClosure('values/index.js', 25_000, ['query', 'schema', 'transaction', 'database', 'memory-source']);
@@ -30,8 +30,8 @@ try {
   // Includes strict structured declarations, effective write capabilities, captured-basis
   // reconciliation with retained-candidate validation, lazy text-target
   // indexing, one-stage text batching, generated-key authoring,
-  // field-bounded projection, and bounded recursive mappings.
-  assertClosure('attachment/adapter/index.js', 350_500, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // field-bounded projection, and authority-separated recursive mapping budgets.
+  assertClosure('attachment/adapter/index.js', 351_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('attachment/mapped-adapter/index.js', 95_000, ['transaction-executor', 'relation-delta-authoring', 'lifecycle-governance']);
   // Includes bounded queued-prefix lifecycle, evidence rolling, replay
   // validation, and exact-snapshot position selection without source-specific
@@ -53,8 +53,8 @@ try {
   assertClosure('query/authoring/index.js', 78_100, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/evaluate/index.js', 120_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'transaction-executor']);
   assertClosure('query/incremental/index.js', 217_500, ['internal-observer-query-maintenance', 'observer-maintenance-contracts', 'memory-source', 'transaction-executor']);
-  // Includes storage-mapping compilation and its bounded recursive traversal.
-  assertClosure('schema/index.js', 115_000, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
+  // Includes storage-mapping compilation and authority-separated recursive traversal budgets.
+  assertClosure('schema/index.js', 115_500, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
   assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/adapter/index.js', 25_000, ['query-incremental', 'internal-observer-query-maintenance', 'system-relations', 'transaction-executor']);

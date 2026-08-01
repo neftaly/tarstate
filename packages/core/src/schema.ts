@@ -456,12 +456,6 @@ const valueDeclarationIssue = (
     }
   }
   if (declaration.kind === 'array') {
-    if (declaration.maxItems > defaultValueParseBudget.maxArrayMembers) {
-      return schemaIssue('schema.field_invalid', [...path, 'maxItems'], {
-        reason: 'array_bound_exceeds_parse_budget',
-        maximum: defaultValueParseBudget.maxArrayMembers
-      });
-    }
     return valueDeclarationIssue(
       declaration.items,
       [...path, 'items'],
@@ -586,10 +580,12 @@ const valueDeclarationsAreDisjoint = (
         ));
   }
   if (left.kind === 'array' && right.kind === 'tuple') {
-    return right.items.length > left.maxItems;
+    return left.maxItems !== undefined
+      && right.items.length > left.maxItems;
   }
   if (left.kind === 'tuple' && right.kind === 'array') {
-    return left.items.length > right.maxItems;
+    return right.maxItems !== undefined
+      && left.items.length > right.maxItems;
   }
   if (left.kind === 'record' && right.kind === 'record') {
     const leftOptional = new Set(left.optional ?? []);

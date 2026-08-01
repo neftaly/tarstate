@@ -6,6 +6,13 @@ import type { JsonValue, PortableValue, TaggedValue } from './value.js';
 
 type Simplify<Value> = { readonly [Key in keyof Value]: Value[Key] };
 type StringKey<Value> = Extract<keyof Value, string>;
+type DeclaredOptionalKeys<Declaration, Fields> = 'optional' extends keyof Declaration
+  ? Declaration extends { readonly optional?: infer Optional }
+    ? Optional extends readonly (infer Name)[]
+      ? Extract<Name, keyof Fields>
+      : never
+    : never
+  : never;
 
 /** Identity authoring helper: const inference is erased and the portable value is unchanged. */
 export const schemaLiteral = <const Body extends SchemaBody>(body: Body): Body => body;
@@ -75,10 +82,10 @@ export type ValueOfDeclaration<Declaration> =
     : Declaration extends { readonly kind: 'null' } ? null
       : Declaration extends { readonly kind: 'array'; readonly items: infer Item } ? readonly ValueOfDeclaration<Item>[]
       : Declaration extends { readonly kind: 'tuple'; readonly items: infer Items extends readonly unknown[] } ? { readonly [Index in keyof Items]: ValueOfDeclaration<Items[Index]> }
-        : Declaration extends { readonly kind: 'record'; readonly fields: infer Fields; readonly optional?: infer Optional extends readonly string[] }
+        : Declaration extends { readonly kind: 'record'; readonly fields: infer Fields }
           ? Simplify<
-              { readonly [Key in Exclude<keyof Fields, Optional[number]>]: ValueOfDeclaration<Fields[Key]> }
-              & { readonly [Key in Extract<keyof Fields, Optional[number]>]?: ValueOfDeclaration<Fields[Key]> }
+              { readonly [Key in Exclude<keyof Fields, DeclaredOptionalKeys<Declaration, Fields>>]: ValueOfDeclaration<Fields[Key]> }
+              & { readonly [Key in DeclaredOptionalKeys<Declaration, Fields>]?: ValueOfDeclaration<Fields[Key]> }
             >
           : Declaration extends { readonly kind: 'union'; readonly alternatives: infer Alternatives extends readonly unknown[] }
             ? ValueOfDeclaration<Alternatives[number]>

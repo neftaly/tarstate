@@ -84,15 +84,20 @@ const globalQueries: readonly QueryNode[] = [
 ];
 
 describe('shrinking property laws', () => {
-  propertyTest('bounded-value-contract-arrays-enforce-their-declared-limit', fc.property(
+  propertyTest('array-value-contracts-enforce-only-declared-limits', fc.property(
     fc.array(fc.string(), { maxLength: 32 }),
-    fc.integer({ min: 0, max: 32 }),
+    fc.option(fc.integer({ min: 0, max: 32 }), { nil: undefined }),
     (values, maxItems) => {
+      const declaration = maxItems === undefined
+        ? { kind: 'array', items: { kind: 'string' } } as const
+        : { kind: 'array', items: { kind: 'string' }, maxItems } as const;
       const parsed = parseValueDeclaration(
-        { kind: 'array', items: { kind: 'string' }, maxItems },
+        declaration,
         values
       );
-      expect(parsed.success).toBe(values.length <= maxItems);
+      expect(parsed.success).toBe(
+        maxItems === undefined || values.length <= maxItems
+      );
       if (parsed.success) expect(parsed.value).toEqual(values);
     }
   ));

@@ -17,8 +17,8 @@ export type ScalarDeclaration =
 
 /**
  * A finite portable-value contract shared by relation fields and query
- * parameters. Arrays are explicitly bounded; recursive references are not
- * part of the language.
+ * parameters. Arrays may declare a semantic item-count limit; recursive
+ * references are not part of the language.
  */
 export type ValueDeclaration =
   | ScalarDeclaration
@@ -26,7 +26,7 @@ export type ValueDeclaration =
   | {
       readonly kind: 'array';
       readonly items: ValueDeclaration;
-      readonly maxItems: number;
+      readonly maxItems?: number;
     }
   | {
       readonly kind: 'tuple';
@@ -149,10 +149,14 @@ const parseOwnedValueDeclaration = (
       : failure('schema.value_contract', path, { expected: 'null' });
   }
   if (declaration.kind === 'array') {
-    if (!Array.isArray(input) || input.length > declaration.maxItems) {
+    if (!Array.isArray(input)
+      || (declaration.maxItems !== undefined
+        && input.length > declaration.maxItems)) {
       return failure('schema.value_contract', path, {
         expected: 'array',
-        maxItems: declaration.maxItems
+        ...(declaration.maxItems === undefined
+          ? {}
+          : { maxItems: declaration.maxItems })
       });
     }
     return parseValueArray(declaration.items, input, context, path);

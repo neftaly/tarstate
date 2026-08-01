@@ -79,6 +79,12 @@ const schemaBody = (reverse = false): SchemaBody => {
             ]
           },
           optional: true
+        },
+        selection: {
+          type: {
+            kind: 'array' as const,
+            items: { kind: 'string' as const }
+          }
         }
       }
     }]
@@ -128,6 +134,7 @@ describe('schema outputs', () => {
     expect(generatedA.value.typescript).toContain('readonly nickname?: string;');
     expect(generatedA.value.typescript).toContain('export type ScoresKey = readonly [PlayersKey, number];');
     expect(generatedA.value.typescript).toContain('readonly operation?: Readonly<{ readonly action: "put"; readonly value: readonly [number, null, number] }> | Readonly<{ readonly action: "move"; readonly path: readonly (string)[] }>;');
+    expect(generatedA.value.typescript).toContain('readonly selection: readonly (string)[];');
     expect(generatedA.value.jsonSchema).toMatchObject({
       $schema: 'https://json-schema.org/draft/2020-12/schema',
       'x-tarstate-schema-ref': { id: first.id, contentHash: first.contentHash }
@@ -135,6 +142,7 @@ describe('schema outputs', () => {
     expect(generatedA.value.jsonSchemaText.endsWith('\n')).toBe(true);
     expect(generatedA.value.jsonSchemaText).toContain('"oneOf"');
     expect(generatedA.value.markdown).toContain('| `nickname` | `string` | yes | no |');
+    expect(generatedA.value.markdown).toContain('| `selection` | `array<string>` | no | no |');
 
     const stale = { ...first, contentHash: hash('f') };
     await expect(safePrepareSchemaArtifact(stale)).resolves.toMatchObject({ success: false, issues: [{ code: 'artifact.hash_mismatch' }] });
@@ -147,6 +155,21 @@ describe('schema outputs', () => {
     const root = generated.value.jsonSchema as Readonly<Record<string, JsonValue>>;
     const definitions = root.$defs as Readonly<Record<string, JsonValue>>;
     expect(definitions.PlayersRow).toMatchObject({ required: ['id', 'joinedAt', 'status'] });
+    const scoresRow = definitions.ScoresRow as Readonly<Record<string, JsonValue>>;
+    const scoresProperties = scoresRow.properties as Readonly<Record<string, JsonValue>>;
+    const operation = scoresProperties.operation as Readonly<Record<string, JsonValue>>;
+    const operationAlternatives = operation.oneOf as readonly JsonValue[];
+    const moveOperation = operationAlternatives[1] as Readonly<Record<string, JsonValue>>;
+    const moveProperties = moveOperation.properties as Readonly<Record<string, JsonValue>>;
+    expect(moveProperties.path).toEqual({
+      type: 'array',
+      items: { type: 'string' },
+      maxItems: 2
+    });
+    expect(scoresProperties.selection).toEqual({
+      type: 'array',
+      items: { type: 'string' }
+    });
   });
 
   it('escapes generated comments and markdown without inventing impossible enum types', async () => {

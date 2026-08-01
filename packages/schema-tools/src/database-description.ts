@@ -318,9 +318,10 @@ const parseArtifactRef = (value: unknown, path: readonly JsonValue[], allowLocat
 
 const isValueDeclaration = (value: unknown, depth = 0): value is ValueDeclaration => {
   if (depth > 32 || !isRecord(value) || typeof value.kind !== 'string') return false;
-  if (value.kind === 'array') return exactKeys(value, ['items', 'kind', 'maxItems'])
-    && Number.isSafeInteger(value.maxItems)
-    && (value.maxItems as number) >= 0
+  if (value.kind === 'array') return exactKeys(value, ['items', 'kind'], ['maxItems'])
+    && (value.maxItems === undefined
+      || (Number.isSafeInteger(value.maxItems)
+        && (value.maxItems as number) >= 0))
     && isValueDeclaration(value.items, depth + 1);
   if (value.kind === 'tuple') return exactKeys(value, ['items', 'kind']) && Array.isArray(value.items) && value.items.every((item) => isValueDeclaration(item, depth + 1));
   if (value.kind === 'record') return exactKeys(value, ['fields', 'kind'], ['optional']) && isRecord(value.fields) && Object.values(value.fields).every((item) => isValueDeclaration(item, depth + 1)) && (value.optional === undefined || (Array.isArray(value.optional) && value.optional.every((item) => typeof item === 'string' && Object.hasOwn(value.fields as object, item))));

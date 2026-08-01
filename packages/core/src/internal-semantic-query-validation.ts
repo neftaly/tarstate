@@ -649,9 +649,10 @@ const validateValueDeclaration = (
   const declaration = input;
   const kind = declaration.kind as string;
   if (declaration.kind === 'array') {
-    shape(context, declaration, ['kind', 'items', 'maxItems'], [], path);
-    if (!Number.isSafeInteger(declaration.maxItems)
-      || (declaration.maxItems as number) < 0) {
+    shape(context, declaration, ['kind', 'items'], ['maxItems'], path);
+    if (declaration.maxItems !== undefined
+      && (!Number.isSafeInteger(declaration.maxItems)
+        || (declaration.maxItems as number) < 0)) {
       invalid(context, [...path, 'maxItems'], 'non_negative_safe_integer_required');
     }
     validateValueDeclaration(

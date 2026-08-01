@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import type { TaggedValue } from '../src/value.js';
+import type { JsonValue, TaggedValue } from '../src/value.js';
+import type { ValueOfDeclaration } from '../src/schema-authoring.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import type { DatabaseView, QueryObserver } from '../src/observer.js';
 import {
@@ -102,6 +103,51 @@ const returning = typedReturning('matches', projected);
 type IsAny<Value> = 0 extends (1 & Value) ? true : false;
 
 describe('literal-schema and query type authoring', () => {
+  it('infers omitted record optional lists as exact required fields', () => {
+    const declaration = {
+      kind: 'union',
+      alternatives: [
+        {
+          kind: 'record',
+          fields: {
+            action: { kind: 'string', values: ['move'] },
+            path: { kind: 'array', items: { kind: 'string' } },
+            to: { kind: 'array', items: { kind: 'string' } }
+          }
+        },
+        {
+          kind: 'record',
+          fields: {
+            action: { kind: 'string', values: ['set'] },
+            path: { kind: 'array', items: { kind: 'string' } },
+            value: { kind: 'json' },
+            note: { kind: 'string' }
+          },
+          optional: ['note']
+        }
+      ]
+    } as const;
+    type Operation = ValueOfDeclaration<typeof declaration>;
+
+    expectTypeOf<Operation>().toEqualTypeOf<
+      | {
+          readonly action: 'move';
+          readonly path: readonly string[];
+          readonly to: readonly string[];
+        }
+      | {
+          readonly action: 'set';
+          readonly path: readonly string[];
+          readonly value: JsonValue;
+          readonly note?: string;
+        }
+    >();
+
+    const narrowed = (operation: Operation): readonly string[] | JsonValue =>
+      operation.action === 'move' ? operation.to : operation.value;
+    expect(narrowed).toBeTypeOf('function');
+  });
+
   it('preserves the portable runtime values while inferring rows, tuple keys, parameters, aliases, and results', () => {
     expect(schema.body.relations.people.relationId).toBe('example.person');
     expect(typedQueryBody(projected)).toMatchObject({

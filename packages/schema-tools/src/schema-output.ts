@@ -163,7 +163,9 @@ const valueJsonSchema = (
     return {
       type: 'array',
       items: valueJsonSchema(declaration.items, names),
-      maxItems: declaration.maxItems
+      ...(declaration.maxItems === undefined
+        ? {}
+        : { maxItems: declaration.maxItems })
     };
   }
   if (declaration.kind === 'tuple') {
@@ -276,7 +278,10 @@ const scalarLabel = (scalar: ScalarDeclaration): string => {
 const valueLabel = (declaration: ValueDeclaration): string => {
   if (declaration.kind === 'null') return 'null';
   if (declaration.kind === 'array') {
-    return 'array<' + valueLabel(declaration.items) + '>[' + declaration.maxItems + ']';
+    const itemContract = 'array<' + valueLabel(declaration.items) + '>';
+    return declaration.maxItems === undefined
+      ? itemContract
+      : itemContract + '[' + declaration.maxItems + ']';
   }
   if (declaration.kind === 'tuple') {
     return '[' + declaration.items.map(valueLabel).join(', ') + ']';
