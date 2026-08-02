@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.8.1.tgz
+npm install ./tarstate-core-0.9.0.tgz
 ```
 
 ## Choose the application path
