@@ -141,7 +141,7 @@ const measureTitleOnlyFileProjection = () => {
   };
 };
 
-const measureRecursiveScalarProjection = (rowCount) => {
+const measureRecursiveStructuredProjection = (rowCount) => {
   const schema = prepareSchema({
     relations: { pieces: {
       relationId: 'performance.pieces',
@@ -150,7 +150,13 @@ const measureRecursiveScalarProjection = (rowCount) => {
         occurrenceId: { type: { kind: 'string' } },
         parentOccurrenceId: { type: { kind: 'string' }, nullable: true },
         order: { type: { kind: 'integer' } },
-        name: { type: { kind: 'string' } }
+        name: { type: { kind: 'string' } },
+        position: {
+          type: {
+            kind: 'tuple',
+            items: [{ kind: 'number' }, { kind: 'number' }]
+          }
+        }
       }
     } }
   });
@@ -184,7 +190,8 @@ const measureRecursiveScalarProjection = (rowCount) => {
           value: 'recursive-parent-element-identity'
         },
         order: { kind: 'source-metadata', value: 'collection-position' },
-        name: { path: ['name'], write: {} }
+        name: { path: ['name'], write: {} },
+        position: { path: ['position'], write: {} }
       }
     } }
   }, schemaRef, schema.value);
@@ -201,6 +208,7 @@ const measureRecursiveScalarProjection = (rowCount) => {
   let document = Automerge.from({
     children: Array.from({ length: rowCount }, (_, index) => ({
       name: 'piece:' + index,
+      position: [index, index],
       children: []
     }))
   });
@@ -211,37 +219,55 @@ const measureRecursiveScalarProjection = (rowCount) => {
   const initialStarted = performance.now();
   let previous = binding.project(snapshot(document));
   const initialMilliseconds = performance.now() - initialStarted;
-  const firstChangedDocument = Automerge.change(document, (draft) => {
-    draft.children[0].name = 'changed:0';
-  });
-  const diffStarted = performance.now();
-  const patches = Automerge.diff(
-    firstChangedDocument,
-    Automerge.getHeads(document),
-    Automerge.getHeads(firstChangedDocument)
-  );
-  const diffMilliseconds = performance.now() - diffStarted;
-  const incrementalSamples = [];
-  let retainedRows = rowCount;
-  let incremental;
-  for (let sample = 0; sample < 7; sample += 1) {
-    document = sample === 0
-      ? firstChangedDocument
-      : Automerge.change(document, (draft) => {
-          draft.children[0].name = 'changed:' + sample;
-        });
-    const incrementalStarted = performance.now();
-    incremental = binding.project(snapshot(document));
-    incrementalSamples.push(performance.now() - incrementalStarted);
-    let retained = 0;
-    for (let index = 0; index < rowCount; index += 1) {
-      if (incremental.rows[index] === previous.rows[index]) retained += 1;
+  const measureUpdates = (change) => {
+    const firstChangedDocument = Automerge.change(document, (draft) => {
+      change(draft, 0);
+    });
+    const diffStarted = performance.now();
+    const patches = Automerge.diff(
+      firstChangedDocument,
+      Automerge.getHeads(document),
+      Automerge.getHeads(firstChangedDocument)
+    );
+    const diffMilliseconds = performance.now() - diffStarted;
+    const incrementalSamples = [];
+    let retainedRows = rowCount;
+    let incremental;
+    for (let sample = 0; sample < 7; sample += 1) {
+      document = sample === 0
+        ? firstChangedDocument
+        : Automerge.change(document, (draft) => {
+            change(draft, sample);
+          });
+      const incrementalStarted = performance.now();
+      incremental = binding.project(snapshot(document));
+      incrementalSamples.push(performance.now() - incrementalStarted);
+      let retained = 0;
+      for (let index = 0; index < rowCount; index += 1) {
+        if (incremental.rows[index] === previous.rows[index]) retained += 1;
+      }
+      retainedRows = Math.min(retainedRows, retained);
+      previous = incremental;
     }
-    retainedRows = Math.min(retainedRows, retained);
-    previous = incremental;
-  }
-  incrementalSamples.sort((left, right) => left - right);
-  const incrementalMilliseconds = incrementalSamples[Math.floor(incrementalSamples.length / 2)];
+    incrementalSamples.sort((left, right) => left - right);
+    return {
+      patchCount: patches.length,
+      patches: patches.map(({ action, path }) => ({ action, path })),
+      diffMilliseconds: Number(diffMilliseconds.toFixed(3)),
+      incrementalMilliseconds: Number(
+        incrementalSamples[Math.floor(incrementalSamples.length / 2)].toFixed(3)
+      ),
+      incrementalSamples: incrementalSamples.map((value) => Number(value.toFixed(3))),
+      retainedRows,
+      exact: incremental.completeness === 'exact'
+    };
+  };
+  const scalarUpdate = measureUpdates((draft, sample) => {
+    draft.children[0].name = 'changed:' + sample;
+  });
+  const structuredUpdate = measureUpdates((draft, sample) => {
+    draft.children[0].position[0] = -sample - 1;
+  });
   const freshBinding = createAutomergeMappedStorageBinding({
     id: 'performance:recursive',
     mapping: mapping.value
@@ -251,16 +277,14 @@ const measureRecursiveScalarProjection = (rowCount) => {
   const fullMilliseconds = performance.now() - fullStarted;
   return {
     rowCount,
-    patchCount: patches.length,
-    patches: patches.map(({ action, path }) => ({ action, path })),
-    diffMilliseconds: Number(diffMilliseconds.toFixed(3)),
     initialMilliseconds: Number(initialMilliseconds.toFixed(3)),
-    incrementalMilliseconds: Number(incrementalMilliseconds.toFixed(3)),
-    incrementalSamples: incrementalSamples.map((value) => Number(value.toFixed(3))),
     fullMilliseconds: Number(fullMilliseconds.toFixed(3)),
-    retainedRows,
-    exact: incremental.completeness === 'exact' && full.completeness === 'exact',
-    equivalent: JSON.stringify(incremental) === JSON.stringify(full)
+    scalarUpdate,
+    structuredUpdate,
+    exact: scalarUpdate.exact
+      && structuredUpdate.exact
+      && full.completeness === 'exact',
+    equivalent: JSON.stringify(previous) === JSON.stringify(full)
   };
 };
 
@@ -268,7 +292,7 @@ const projections = [measureProjection(400), measureProjection(800)];
 const staleEvents = measureStaleEvent(800, 1_000);
 const valueAdoption = measureValueAdoption(2_000);
 const titleOnlyFile = measureTitleOnlyFileProjection();
-const recursiveScalarProjection = measureRecursiveScalarProjection(5_000);
+const recursiveStructuredProjection = measureRecursiveStructuredProjection(5_000);
 const contracts = {
   exactProjectionWithinBound: projections[0].completeness === 'exact' && projections[0].milliseconds <= 50,
   hostileDepthIsBounded: projections[1].completeness === 'unknown' && projections[1].propertyCount <= 513 && projections[1].milliseconds <= 50,
@@ -279,11 +303,14 @@ const contracts = {
     && titleOnlyFile.fields.join(',') === 'id,name',
   unobservedFileContentChangeReusesProjection: titleOnlyFile.reusedAfterContentChange
     && titleOnlyFile.updateMilliseconds <= 50,
-  recursiveScalarProjectionIsIncremental: recursiveScalarProjection.exact
-    && recursiveScalarProjection.equivalent
-    && recursiveScalarProjection.retainedRows === recursiveScalarProjection.rowCount - 1
-    && recursiveScalarProjection.incrementalMilliseconds <= 50
-    && recursiveScalarProjection.incrementalMilliseconds * 2 < recursiveScalarProjection.fullMilliseconds
+  recursiveStructuredProjectionIsIncremental: recursiveStructuredProjection.exact
+    && recursiveStructuredProjection.equivalent
+    && recursiveStructuredProjection.scalarUpdate.retainedRows === recursiveStructuredProjection.rowCount - 1
+    && recursiveStructuredProjection.structuredUpdate.retainedRows === recursiveStructuredProjection.rowCount - 1
+    && recursiveStructuredProjection.scalarUpdate.incrementalMilliseconds <= 50
+    && recursiveStructuredProjection.structuredUpdate.incrementalMilliseconds <= 50
+    && recursiveStructuredProjection.scalarUpdate.incrementalMilliseconds * 2 < recursiveStructuredProjection.fullMilliseconds
+    && recursiveStructuredProjection.structuredUpdate.incrementalMilliseconds * 2 < recursiveStructuredProjection.fullMilliseconds
 };
 const failures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
 
@@ -294,7 +321,7 @@ process.stdout.write(JSON.stringify({
   staleEvents,
   valueAdoption,
   titleOnlyFile,
-  recursiveScalarProjection,
+  recursiveStructuredProjection,
   node: process.version
 }, null, 2) + '\n');
 if (failures.length > 0) throw new Error('Automerge performance contracts failed: ' + failures.join(', '));

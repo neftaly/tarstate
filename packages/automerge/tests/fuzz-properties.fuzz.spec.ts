@@ -34,12 +34,13 @@ type TestDraft = Parameters<Automerge.ChangeFn<TestDoc>>[0];
 type RecursivePiece = {
   name: string;
   rotation: number;
+  position: [number, number];
   ignored?: number;
   children: RecursivePiece[];
 };
 type RecursiveDocument = { children: RecursivePiece[] };
 type RecursiveEdit = {
-  readonly kind: 'rename' | 'rotate' | 'ignore' | 'insert-root' | 'delete-root'
+  readonly kind: 'rename' | 'rotate' | 'position' | 'ignore' | 'insert-root' | 'delete-root'
     | 'insert-child' | 'delete-child';
   readonly first: number;
   readonly second: number;
@@ -104,6 +105,7 @@ const recursiveEditArbitrary: fc.Arbitrary<RecursiveEdit> = fc.record({
   kind: fc.constantFrom(
     'rename' as const,
     'rotate' as const,
+    'position' as const,
     'ignore' as const,
     'insert-root' as const,
     'delete-root' as const,
@@ -122,7 +124,13 @@ const recursiveMapping = (() => {
       key: ['name'],
       fields: {
         name: { type: { kind: 'string' } },
-        rotation: { type: { kind: 'number' } }
+        rotation: { type: { kind: 'number' } },
+        position: {
+          type: {
+            kind: 'tuple',
+            items: [{ kind: 'number' }, { kind: 'number' }]
+          }
+        }
       }
     } }
   });
@@ -147,7 +155,10 @@ const recursiveMapping = (() => {
       keys: {
         name: { kind: 'field', path: ['name'] }
       },
-      fields: { rotation: { path: ['rotation'], write: {} } }
+      fields: {
+        rotation: { path: ['rotation'], write: {} },
+        position: { path: ['position'], write: {} }
+      }
     } }
   };
   const mapping = compileStorageMapping(body, schemaRef, schema.value);
@@ -646,12 +657,24 @@ describe('Automerge shrinking model properties', () => {
           {
             name: 'root:0',
             rotation: 0,
-            children: [{ name: 'child:0', rotation: 0, children: [] }]
+            position: [0, 0],
+            children: [{
+              name: 'child:0',
+              rotation: 0,
+              position: [0, 0],
+              children: []
+            }]
           },
           {
             name: 'root:1',
             rotation: 0,
-            children: [{ name: 'child:1', rotation: 0, children: [] }]
+            position: [1, 1],
+            children: [{
+              name: 'child:1',
+              rotation: 0,
+              position: [1, 1],
+              children: []
+            }]
           }
         ]
       }, { actor: '3'.repeat(64) });
@@ -801,6 +824,9 @@ const applyRecursiveEdit = (
     case 'rotate':
       if (root !== undefined) root.rotation = edit.value;
       break;
+    case 'position':
+      if (root !== undefined) root.position[edit.second % 2] = edit.value;
+      break;
     case 'ignore':
       if (root !== undefined) root.ignored = edit.value;
       break;
@@ -808,6 +834,7 @@ const applyRecursiveEdit = (
       draft.children.splice(edit.first % (draft.children.length + 1), 0, {
         name: `inserted-root:${edit.value}`,
         rotation: edit.value,
+        position: [edit.value, edit.value],
         children: []
       });
       break;
@@ -819,6 +846,7 @@ const applyRecursiveEdit = (
         root.children.splice(edit.second % (root.children.length + 1), 0, {
           name: `inserted-child:${edit.value}`,
           rotation: edit.value,
+          position: [edit.value, edit.value],
           children: []
         });
       }

@@ -42,7 +42,7 @@ import {
   planPropertyEdit
 } from './property-edits.js';
 import { valueAtAutomergePath } from './path-access.js';
-import { createAutomergeStorageScalarCodec } from './scalar-codec.js';
+import { createAutomergeStorageValueCodec } from './storage-value-codec.js';
 import {
   conflictsAlongMappedPaths,
   locateProjectedCandidate,
@@ -148,7 +148,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
   const declaredReadFootprint = automergePathFootprint([...relationReadEntries.values()].flat());
   const declaredWriteFootprint = automergePathFootprint([...relations.values()].flatMap(({ mapping: relationMapping }) => mappedWriteEntries(relationMapping)));
   const writeCapabilities = automergeWriteCapabilities(relations, registry);
-  const scalarCodec = createAutomergeStorageScalarCodec();
+  const valueCodec = createAutomergeStorageValueCodec();
   const projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeMappedStorageRow>>>();
   const previousProjections = new Map<string, PreviousProjection>();
   const recursiveStates = new Map<string, Map<string, RecursiveMappedProjectionState>>();
@@ -247,7 +247,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
             selectedFields,
             selectedValuePaths: paths,
             registry,
-            scalarDecoder: scalarCodec.decode,
+            scalarDecoder: valueCodec.decode,
             locatorNamespace,
             sourceId: snapshot.sourceId,
             previousRow
@@ -261,7 +261,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
               patches,
               previous: previousRow,
               registry,
-              scalarDecoder: scalarCodec.decode
+              scalarDecoder: valueCodec.decode
             }),
           rowKey: (row) => canonicalizeJson(row.key as JsonValue)
         });
@@ -278,7 +278,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
           sourceId: snapshot.sourceId,
           relationIds: fullProjectionRelations,
           ...(selectedFields === undefined ? {} : { fieldsByRelation: selectedFields }),
-          scalarDecoder: scalarCodec.decode,
+          scalarDecoder: valueCodec.decode,
           sourceMetadata: automergeSourceMetadata
         });
     const soleRelationId = selected.size === 1
@@ -545,7 +545,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
           fields: edit.fields,
           schema: mapping.schema,
           ...(registry === undefined ? {} : { registry: registry }),
-          scalarCodec: scalarCodec
+          valueCodec
         });
         if ('issues' in planned) issues.push(...planned.issues);
         else intents.push(planned.intent);
@@ -565,7 +565,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
           edit.fields,
           mapping.schema,
           registry,
-          scalarCodec
+          valueCodec
         );
         if ('issues' in planned) issues.push(...planned.issues);
         else {
@@ -722,7 +722,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
           continue;
         }
         if (samePortableJson(row.fields[field], parsed.value)) continue;
-        const encoded = scalarCodec.encode({
+        const encoded = valueCodec.encode({
           value: parsed.value,
           declaration,
           relationId: edit.relationId,
@@ -930,7 +930,7 @@ const planMappedInsert = <T extends object>(
   fields: Readonly<Record<string, JsonValue>>,
   schema: CompiledStorageMapping['schema'],
   registry: CapabilityRegistry | undefined,
-  scalarCodec: ReturnType<typeof createAutomergeStorageScalarCodec>
+  valueCodec: ReturnType<typeof createAutomergeStorageValueCodec>
 ): { readonly intent: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> } } | { readonly issues: readonly Issue[] } => {
   const collectionMapping = compiled.mapping.collection;
   if (collectionMapping.kind === 'singleton'
@@ -988,7 +988,7 @@ const planMappedInsert = <T extends object>(
       }
     } else if (mapping.kind === 'field') {
       const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
-      const encoded = scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
+      const encoded = valueCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
       if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
       if (!setStoragePath(physical, mapping.path, encoded.value)) {
         return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
@@ -1005,7 +1005,7 @@ const planMappedInsert = <T extends object>(
       return { issues: [bindingIssue('mapping.field_read_only', snapshot.sourceId, relationId, candidatePath, { field })] };
     }
     const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
-    const encoded = scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
+    const encoded = valueCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
     if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
     if (!setStoragePath(physical, mapping.path, encoded.value)) {
       return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
@@ -1129,7 +1129,7 @@ type GeneratedKeyInsertPlan<T extends object> = {
   readonly fields: Readonly<Record<string, JsonValue>>;
   readonly schema: CompiledStorageMapping['schema'];
   readonly registry?: CapabilityRegistry;
-  readonly scalarCodec: ReturnType<typeof createAutomergeStorageScalarCodec>;
+  readonly valueCodec: ReturnType<typeof createAutomergeStorageValueCodec>;
 };
 
 const planGeneratedKeyInsert = <T extends object>(
@@ -1181,7 +1181,7 @@ const planGeneratedKeyInsert = <T extends object>(
         issues.push(...parsed.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, collection.path)));
         continue;
       }
-      const encoded = input.scalarCodec.encode({
+      const encoded = input.valueCodec.encode({
         value: parsed.value,
         declaration,
         relationId,

@@ -7,6 +7,7 @@ import {
 import {
   compileStorageMapping,
   prepareSchema,
+  projectStorage,
   relationLiteral,
   sealSchema,
   sealStorageMapping,
@@ -62,6 +63,17 @@ type TreePiece = {
 
 type TreeDoc = {
   children: TreePiece[];
+};
+
+type StructuredDoc = {
+  id: string;
+  surfaceSize: [number, number];
+  settings: {
+    anchor: [number, number];
+    labels: string[];
+  };
+  choice: { kind: 'named'; name: string } | [number];
+  nullable: null;
 };
 
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
@@ -220,6 +232,100 @@ const immutableTextSingletonFixture = async () => {
     registry
   });
   return { runtime, source, binding };
+};
+
+const structuredSingletonFixture = () => {
+  const schema = prepareSchema({
+    relations: {
+      workspace: {
+        relationId: 'relation:structured-workspace',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string' } },
+          surfaceSize: {
+            type: {
+              kind: 'tuple',
+              items: [{ kind: 'number' }, { kind: 'number' }]
+            }
+          },
+          settings: {
+            type: {
+              kind: 'record',
+              fields: {
+                anchor: {
+                  kind: 'tuple',
+                  items: [{ kind: 'number' }, { kind: 'number' }]
+                },
+                labels: {
+                  kind: 'array',
+                  items: { kind: 'string' },
+                  maxItems: 8
+                }
+              }
+            }
+          },
+          choice: {
+            type: {
+              kind: 'union',
+              alternatives: [
+                {
+                  kind: 'record',
+                  fields: {
+                    kind: { kind: 'string', values: ['named'] },
+                    name: { kind: 'string' }
+                  }
+                },
+                { kind: 'tuple', items: [{ kind: 'number' }] }
+              ]
+            }
+          },
+          nullable: { type: { kind: 'null' } }
+        }
+      }
+    }
+  });
+  if (!schema.success) throw new Error('structured schema fixture failed');
+  const schemaRef = {
+    id: 'urn:test:structured-workspace',
+    contentHash: hash('9')
+  };
+  const mapping = compileStorageMapping({
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: {
+      'relation:structured-workspace': {
+        collection: { kind: 'singleton', path: [], absent: 'invalid' },
+        keys: { id: { kind: 'field', path: ['id'] } },
+        fields: {
+          surfaceSize: { path: ['surfaceSize'], write: {} },
+          settings: { path: ['settings'], write: {} },
+          choice: { path: ['choice'], write: {} },
+          nullable: { path: ['nullable'], write: {} }
+        }
+      }
+    }
+  }, schemaRef, schema.value);
+  if (!mapping.success) throw new Error('structured mapping fixture failed');
+  const value: StructuredDoc = {
+    id: 'workspace',
+    surfaceSize: [2, 2],
+    settings: { anchor: [0, 1], labels: ['one', 'two'] },
+    choice: { kind: 'named', name: 'board' },
+    nullable: null
+  };
+  const runtime = new AutomergeSourceRuntime({
+    sourceId: 'source:structured-workspace',
+    doc: Automerge.from<StructuredDoc>(value)
+  });
+  const source = new AutomergeAtomicSource({
+    runtime,
+    operationEpoch: 'epoch:structured-workspace'
+  });
+  const binding = createAutomergeMappedStorageBinding<StructuredDoc>({
+    id: 'binding:structured-workspace',
+    mapping: mapping.value
+  });
+  return { binding, mapping: mapping.value, runtime, source, value };
 };
 
 const arrayFixture = async (identity: 'source' | 'field') => {
@@ -811,6 +917,62 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     })).resolves.toMatchObject({
       outcome: 'rejected',
       issues: [{ code: 'mapping.field_read_only' }]
+    });
+    source.close();
+  });
+
+  it('adopts mapped structured Automerge fields before strict schema parsing', () => {
+    const {
+      binding,
+      mapping,
+      runtime,
+      source,
+      value
+    } = structuredSingletonFixture();
+    const projected = binding.project(source.snapshot());
+    const plain = projectStorage(mapping, value)
+      .relations.get('relation:structured-workspace')?.rows[0]?.row;
+
+    expect(projected).toMatchObject({ completeness: 'exact', issues: [] });
+    expect(projected.rows[0]?.fields).toEqual(plain);
+    expect(projected.rows[0]?.fields).toEqual({
+      id: 'workspace',
+      surfaceSize: [2, 2],
+      settings: { anchor: [0, 1], labels: ['one', 'two'] },
+      choice: { kind: 'named', name: 'board' },
+      nullable: null
+    });
+    expect(Object.isFrozen(projected.rows[0]?.fields.surfaceSize)).toBe(true);
+    expect(Object.isFrozen(projected.rows[0]?.fields.settings)).toBe(true);
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, (draft) => {
+      draft.choice = [7];
+    }));
+    expect(binding.project(source.snapshot())).toMatchObject({
+      completeness: 'exact',
+      rows: [{ fields: { choice: [7] } }],
+      issues: []
+    });
+
+    const base = runtime.snapshot().storage;
+    const left = Automerge.change(
+      Automerge.clone(base, { actor: '5'.repeat(64) }),
+      (draft) => { draft.surfaceSize[0] = 3; }
+    );
+    const right = Automerge.change(
+      Automerge.clone(base, { actor: '6'.repeat(64) }),
+      (draft) => { draft.surfaceSize[0] = 4; }
+    );
+    runtime.replace(Automerge.merge(left, right));
+
+    expect(binding.project(source.snapshot())).toMatchObject({
+      completeness: 'unknown',
+      rows: [],
+      issues: [{
+        code: 'automerge.value_conflicted',
+        path: ['surfaceSize', 0],
+        details: { alternatives: 2 }
+      }]
     });
     source.close();
   });

@@ -11,9 +11,10 @@ import type {
   StorageScalarCodecInput,
   StorageScalarDecoder
 } from '@tarstate/core/schema';
+import { adoptConflictFreeAutomergeJsonValue } from '../document/json-value.js';
 
-/** Canonical scalar conversion at the Automerge storage boundary. */
-export const createAutomergeStorageScalarCodec = (): {
+/** Canonical mapped-value conversion at the Automerge storage boundary. */
+export const createAutomergeStorageValueCodec = (): {
   readonly decode: StorageScalarDecoder;
   readonly encode: (input: StorageScalarCodecInput) => ParseResult<unknown>;
 } => {
@@ -24,7 +25,9 @@ export const createAutomergeStorageScalarCodec = (): {
         return success(input.value.toString());
       }
       if (input.declaration.type.kind !== 'bytes' || !(input.value instanceof Uint8Array)) {
-        return success(input.value);
+        return isAutomergeContainer(input.value)
+          ? adoptConflictFreeAutomergeJsonValue(input.value)
+          : success(input.value);
       }
       const cached = logicalBytes.get(input.value);
       if (cached !== undefined) return success(cached);
@@ -37,6 +40,15 @@ export const createAutomergeStorageScalarCodec = (): {
       return safeMaterializePortableBytes(input.value);
     }
   };
+};
+
+const isAutomergeContainer = (value: unknown): value is object => {
+  if (value === null || typeof value !== 'object') return false;
+  try {
+    return typeof Automerge.getObjectId(value) === 'string';
+  } catch {
+    return false;
+  }
 };
 
 const success = <Value>(value: Value): ParseResult<Value> => ({ success: true, value, issues: [] });
