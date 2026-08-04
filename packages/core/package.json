@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/core",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "description": "Portable relational semantics and source protocols for Tarstate",
   "license": "MIT",
@@ -115,6 +115,10 @@
     "./schema": {
       "types": "./dist/schema/index.d.ts",
       "import": "./dist/schema/index.js"
+    },
+    "./schema/adapter": {
+      "types": "./dist/schema/adapter/index.d.ts",
+      "import": "./dist/schema/adapter/index.js"
     },
     "./source": {
       "types": "./dist/source/index.d.ts",

@@ -11,9 +11,16 @@ import {
   parseRelationCandidate,
   parseScalarValueForField,
   projectStorage,
+  type BoundRow,
   type CompiledStorageMapping,
+  type StorageScalarDecoder,
   type SourceMetadataResolver
 } from '@tarstate/core/schema';
+import {
+  inspectMappedStorageOccurrences,
+  projectMappedStorageOccurrence,
+  type MappedStorageOccurrence
+} from '@tarstate/core/schema/adapter';
 import {
   type BindingRelationWriteCapabilities,
   type LogicalEdit,
@@ -37,25 +44,22 @@ import {
 import { valueAtAutomergePath } from './path-access.js';
 import { createAutomergeStorageScalarCodec } from './scalar-codec.js';
 import {
-  affectedMappedRelations,
   conflictsAlongMappedPaths,
   locateProjectedCandidate,
   mappedReadEntries,
+  mappedProjectionChange,
   mappedWriteEntries
 } from './mapped-projection.js';
 import type { AutomergeSourceCommand } from '../source/runtime.js';
+import type { AutomergeMappedStorageRow } from './mapped-storage-model.js';
+import {
+  createRecursiveMappedProjectionState,
+  updateRecursiveMappedProjection,
+  type RecursiveMappedProjectionState
+} from './recursive-mapped-projection.js';
+import { projectRecursiveScalarPatches } from './recursive-scalar-patch.js';
 
-export type AutomergeMappedStorageRow = {
-  readonly relationId: string;
-  readonly key: readonly [JsonValue, ...JsonValue[]];
-  readonly fields: Readonly<Record<string, JsonValue>>;
-  readonly locator: {
-    readonly namespace: string;
-    readonly token: JsonValue;
-    readonly rowIncarnation: string;
-  };
-  readonly storagePath: AutomergePath;
-};
+export type { AutomergeMappedStorageRow } from './mapped-storage-model.js';
 
 export type AutomergeMappedStorageBindingOptions = {
   readonly id?: string;
@@ -147,6 +151,12 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
   const scalarCodec = createAutomergeStorageScalarCodec();
   const projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeMappedStorageRow>>>();
   const previousProjections = new Map<string, PreviousProjection>();
+  const recursiveStates = new Map<string, Map<string, RecursiveMappedProjectionState>>();
+  const rememberPrevious = (key: string, projection: PreviousProjection): void => {
+    rememberPreviousProjection(previousProjections, key, projection, (evicted) => {
+      recursiveStates.delete(evicted);
+    });
+  };
 
   const project = (
     snapshot: SourceSnapshot<Automerge.Doc<T>>,
@@ -156,6 +166,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
       return { rows: [], completeness: 'unknown', issues: [sourceIssue(snapshot.sourceId, snapshot.state)] };
     }
+    const storage = snapshot.storage;
     const selected = requestedRelations === undefined
       ? relationSelection
       : new Set(relationIds.filter((relationId) => requestedRelations.has(relationId)));
@@ -184,12 +195,18 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
           relationId,
           mappedReadEntries((relations.get(relationId) as MappedRelation).mapping, paths)
         ]));
-    const affected = previous?.result.completeness === 'exact'
-      ? affectedMappedRelations(snapshot.sourceId, snapshot.storage, previous, selectedReadEntries)
+    const change = previous?.result.completeness === 'exact'
+      ? mappedProjectionChange(
+          snapshot.sourceId,
+          snapshot.storage,
+          previous,
+          selectedReadEntries
+        )
       : undefined;
-    if (affected !== undefined && affected.size === 0 && previous !== undefined) {
+    const affected = change?.relationIds;
+    if (affected?.size === 0 && previous !== undefined) {
       rememberProjection(projections, snapshot.storage, cacheKey, previous.result);
-      rememberPreviousProjection(previousProjections, cacheKey, {
+      rememberPrevious(cacheKey, {
         sourceId: snapshot.sourceId,
         heads: Automerge.getHeads(snapshot.storage),
         result: previous.result
@@ -197,92 +214,145 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
       return previous.result;
     }
     const projectedRelations = affected ?? selected;
-    const projection = projectStorage(mapping, snapshot.storage, {
-      ...(registry === undefined ? {} : { registry: registry }),
-      sourceId: snapshot.sourceId,
-      relationIds: projectedRelations,
-      ...(selectedFields === undefined ? {} : { fieldsByRelation: selectedFields }),
-      scalarDecoder: scalarCodec.decode,
-      sourceMetadata: automergeSourceMetadata
-    });
-    const rows: AutomergeMappedStorageRow[] = affected === undefined || previous === undefined
-      ? []
-      : previous.result.rows.filter((row) => !affected.has(row.relationId));
+    const fullProjectionRelations = new Set(projectedRelations);
+    const nextRecursiveStates = new Map(recursiveStates.get(cacheKey) ?? []);
+    const incrementalRows = new Map<string, readonly AutomergeMappedStorageRow[]>();
+    if (change !== undefined && previous !== undefined) {
+      for (const relationId of projectedRelations) {
+        const compiled = relations.get(relationId);
+        const state = nextRecursiveStates.get(relationId);
+        if (compiled?.mapping.collection.kind !== 'recursive-array'
+          || state === undefined) {
+          continue;
+        }
+        const paths = selectedValuePaths.get(relationId) ?? [];
+        const updated = updateRecursiveMappedProjection({
+          storage,
+          collection: compiled.mapping.collection,
+          valuePaths: paths,
+          patches: change.patches,
+          previous: state,
+          inspect: () => inspectMappedStorageOccurrences(
+            mapping,
+            storage,
+            relationId,
+            snapshot.sourceId
+          ),
+          project: (occurrence, previousRow) => projectIncrementalRecursiveRow({
+            storage,
+            mapping,
+            compiled,
+            relationId,
+            occurrence,
+            selectedFields,
+            selectedValuePaths: paths,
+            registry,
+            scalarDecoder: scalarCodec.decode,
+            locatorNamespace,
+            sourceId: snapshot.sourceId,
+            previousRow
+          }),
+          projectPatches: (previousRow, rowPath, patches) =>
+            projectRecursiveScalarPatches({
+              schema: mapping.schema,
+              compiled,
+              relationId,
+              rowPath,
+              patches,
+              previous: previousRow,
+              registry,
+              scalarDecoder: scalarCodec.decode
+            }),
+          rowKey: (row) => canonicalizeJson(row.key as JsonValue)
+        });
+        if (updated.kind === 'fallback') continue;
+        fullProjectionRelations.delete(relationId);
+        incrementalRows.set(relationId, updated.state.rows);
+        nextRecursiveStates.set(relationId, updated.state);
+      }
+    }
+    const projection = fullProjectionRelations.size === 0
+      ? undefined
+      : projectStorage(mapping, snapshot.storage, {
+          ...(registry === undefined ? {} : { registry: registry }),
+          sourceId: snapshot.sourceId,
+          relationIds: fullProjectionRelations,
+          ...(selectedFields === undefined ? {} : { fieldsByRelation: selectedFields }),
+          scalarDecoder: scalarCodec.decode,
+          sourceMetadata: automergeSourceMetadata
+        });
+    const soleRelationId = selected.size === 1
+      ? selected.values().next().value
+      : undefined;
+    const soleIncrementalRows = soleRelationId === undefined
+      || fullProjectionRelations.size > 0
+      ? undefined
+      : incrementalRows.get(soleRelationId);
+    const rows: AutomergeMappedStorageRow[] = soleIncrementalRows === undefined
+      ? affected === undefined || previous === undefined
+        ? []
+        : previous.result.rows.filter((row) => !affected.has(row.relationId))
+      : soleIncrementalRows as AutomergeMappedStorageRow[];
     const issues: Issue[] = affected === undefined || previous === undefined
       ? []
       : previous.result.issues.filter((issue) => issue.relationId === undefined || !affected.has(issue.relationId));
     const previousRows = previous === undefined
       ? undefined
-      : indexPreviousRows(previous.result.rows, projectedRelations);
+      : indexPreviousRows(previous.result.rows, fullProjectionRelations);
     let incomplete = false;
     for (const [relationId, compiled] of relations) {
       if (!projectedRelations.has(relationId)) continue;
-      const relation = projection.relations.get(relationId);
+      const incrementallyProjected = incrementalRows.get(relationId);
+      if (incrementallyProjected !== undefined) {
+        if (incrementallyProjected !== rows) {
+          for (const row of incrementallyProjected) rows.push(row);
+        }
+        continue;
+      }
+      const relation = projection?.relations.get(relationId);
       if (relation === undefined) {
         incomplete = true;
         issues.push(bindingIssue('mapping.relation_missing', snapshot.sourceId, relationId));
+        nextRecursiveStates.delete(relationId);
         continue;
       }
       issues.push(...relation.issues.map((issue) => rebaseProjectionIssue(issue, compiled.mapping.collection.path)));
       if (relation.completeness !== 'exact') incomplete = true;
+      const projectedRelationRows: AutomergeMappedStorageRow[] = [];
       for (const projected of relation.rows) {
-        const located = locateProjectedCandidate(snapshot.storage, compiled.mapping, projected.locator);
-        if ('issue' in located) {
+        const adopted = adoptAutomergeMappedRow({
+          storage: snapshot.storage,
+          compiled,
+          relationId,
+          projected,
+          selectedValuePaths: selectedValuePaths.get(relationId) ?? [],
+          locatorNamespace,
+          sourceId: snapshot.sourceId,
+          ...(previousRows === undefined ? {} : { previousRows })
+        });
+        if (!adopted.success) {
           incomplete = true;
-          issues.push(bindingIssue(located.issue, snapshot.sourceId, relationId, compiled.mapping.collection.path));
+          issues.push(...adopted.issues);
           continue;
         }
-        const { candidate, path, collectionConflict } = located;
-        if (collectionConflict !== undefined) {
-          incomplete = true;
-          issues.push(createIssue({
-            code: collectionConflict.code, phase: 'query', severity: 'warning', retry: 'manual_repair',
-            sourceId: snapshot.sourceId, relationId, path,
-            details: { changeHashes: collectionConflict.changeHashes }
-          }));
-          continue;
-        }
-        const mappedConflicts = conflictsAlongMappedPaths(
-          snapshot.storage,
-          path,
-          selectedValuePaths.get(relationId) ?? []
+        rows.push(adopted.row);
+        projectedRelationRows.push(adopted.row);
+      }
+      if (compiled.mapping.collection.kind === 'recursive-array'
+        && relation.completeness === 'exact'
+        && projectedRelationRows.length === relation.rows.length) {
+        const state = createRecursiveMappedProjectionState(
+          compiled.mapping.collection,
+          projectedRelationRows
         );
-        if (mappedConflicts.length > 0) {
-          incomplete = true;
-          issues.push(...mappedConflicts.map((conflict) => createIssue({
-            code: 'automerge.conflict_observed', phase: 'query', severity: 'warning', retry: 'manual_repair',
-            sourceId: snapshot.sourceId, relationId, path: conflict.path,
-            details: { changeHashes: conflict.changeHashes }
-          })));
-          continue;
-        }
-        const objectId = candidate === null || typeof candidate !== 'object' ? null : Automerge.getObjectId(candidate);
-        if (typeof objectId !== 'string') {
-          incomplete = true;
-          issues.push(bindingIssue('automerge.row_identity_unavailable', snapshot.sourceId, relationId, path));
-          continue;
-        }
-        const previousRow = previousRows?.get(compoundKey(
-          relationId,
-          compoundKey(locatorNamespace, objectId, objectId)
-        ));
-        rows.push(previousRow !== undefined
-          && sameProjectedRow(
-            previousRow,
-            projected.key,
-            projected.row as Readonly<Record<string, JsonValue>>,
-            path
-          )
-          ? previousRow
-          : Object.freeze({
-          relationId,
-          key: projected.key,
-          fields: projected.row as Readonly<Record<string, JsonValue>>,
-          locator: Object.freeze({ namespace: locatorNamespace, token: objectId, rowIncarnation: objectId }),
-          storagePath: Object.freeze(path)
-          }));
+        if (state === undefined) nextRecursiveStates.delete(relationId);
+        else nextRecursiveStates.set(relationId, state);
+      } else {
+        nextRecursiveStates.delete(relationId);
       }
     }
+    if (nextRecursiveStates.size === 0) recursiveStates.delete(cacheKey);
+    else recursiveStates.set(cacheKey, nextRecursiveStates);
     if (previous !== undefined
       && incomplete === (previous.result.completeness !== 'exact')
       && issues.length === 0
@@ -295,7 +365,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
         cacheKey,
         previous.result
       );
-      rememberPreviousProjection(previousProjections, cacheKey, {
+      rememberPrevious(cacheKey, {
         sourceId: snapshot.sourceId,
         heads: Automerge.getHeads(snapshot.storage),
         result: previous.result
@@ -308,7 +378,7 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
       issues: Object.freeze(issues)
     });
     rememberProjection(projections, snapshot.storage, cacheKey, result);
-    rememberPreviousProjection(previousProjections, cacheKey, {
+    rememberPrevious(cacheKey, {
       sourceId: snapshot.sourceId,
       heads: Automerge.getHeads(snapshot.storage),
       result
@@ -703,6 +773,155 @@ export const createAutomergeMappedStorageBinding = <T extends object>(
   });
 };
 
+const projectIncrementalRecursiveRow = <T extends object>(input: {
+  readonly storage: Automerge.Doc<T>;
+  readonly mapping: CompiledStorageMapping;
+  readonly compiled: MappedRelation;
+  readonly relationId: string;
+  readonly occurrence: MappedStorageOccurrence;
+  readonly selectedFields: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+  readonly selectedValuePaths: readonly AutomergePath[];
+  readonly registry: CapabilityRegistry | undefined;
+  readonly scalarDecoder: StorageScalarDecoder;
+  readonly locatorNamespace: string;
+  readonly sourceId: string;
+  readonly previousRow: AutomergeMappedStorageRow | undefined;
+}): AutomergeMappedStorageRow | undefined => {
+  const projected = projectMappedStorageOccurrence(
+    input.mapping,
+    input.relationId,
+    input.occurrence,
+    {
+      ...(input.registry === undefined ? {} : { registry: input.registry }),
+      sourceId: input.sourceId,
+      ...(input.selectedFields === undefined
+        ? {}
+        : { fieldsByRelation: input.selectedFields }),
+      scalarDecoder: input.scalarDecoder,
+      sourceMetadata: automergeSourceMetadata
+    }
+  );
+  if (!projected.success) return undefined;
+  const adopted = adoptAutomergeMappedRow({
+    storage: input.storage,
+    compiled: input.compiled,
+    relationId: input.relationId,
+    projected: projected.value,
+    selectedValuePaths: input.selectedValuePaths,
+    locatorNamespace: input.locatorNamespace,
+    sourceId: input.sourceId,
+    ...(input.previousRow === undefined ? {} : { previousRow: input.previousRow })
+  });
+  return adopted.success ? adopted.row : undefined;
+};
+
+const adoptAutomergeMappedRow = <T extends object>(input: {
+  readonly storage: Automerge.Doc<T>;
+  readonly compiled: MappedRelation;
+  readonly relationId: string;
+  readonly projected: BoundRow;
+  readonly selectedValuePaths: readonly AutomergePath[];
+  readonly locatorNamespace: string;
+  readonly sourceId: string;
+  readonly previousRows?: ReadonlyMap<string, AutomergeMappedStorageRow>;
+  readonly previousRow?: AutomergeMappedStorageRow;
+}): {
+  readonly success: true;
+  readonly row: AutomergeMappedStorageRow;
+} | {
+  readonly success: false;
+  readonly issues: readonly Issue[];
+} => {
+  const located = locateProjectedCandidate(
+    input.storage,
+    input.compiled.mapping,
+    input.projected.locator
+  );
+  if ('issue' in located) {
+    return {
+      success: false,
+      issues: [bindingIssue(
+        located.issue,
+        input.sourceId,
+        input.relationId,
+        input.compiled.mapping.collection.path
+      )]
+    };
+  }
+  const { candidate, path, collectionConflict } = located;
+  if (collectionConflict !== undefined) {
+    return {
+      success: false,
+      issues: [createIssue({
+        code: collectionConflict.code,
+        phase: 'query',
+        severity: 'warning',
+        retry: 'manual_repair',
+        sourceId: input.sourceId,
+        relationId: input.relationId,
+        path,
+        details: { changeHashes: collectionConflict.changeHashes }
+      })]
+    };
+  }
+  const mappedConflicts = conflictsAlongMappedPaths(
+    input.storage,
+    path,
+    input.selectedValuePaths
+  );
+  if (mappedConflicts.length > 0) {
+    return {
+      success: false,
+      issues: mappedConflicts.map((conflict) => createIssue({
+        code: 'automerge.conflict_observed',
+        phase: 'query',
+        severity: 'warning',
+        retry: 'manual_repair',
+        sourceId: input.sourceId,
+        relationId: input.relationId,
+        path: conflict.path,
+        details: { changeHashes: conflict.changeHashes }
+      }))
+    };
+  }
+  const objectId = candidate === null || typeof candidate !== 'object'
+    ? null
+    : Automerge.getObjectId(candidate);
+  if (typeof objectId !== 'string') {
+    return {
+      success: false,
+      issues: [bindingIssue(
+        'automerge.row_identity_unavailable',
+        input.sourceId,
+        input.relationId,
+        path
+      )]
+    };
+  }
+  const previous = input.previousRow ?? input.previousRows?.get(compoundKey(
+    input.relationId,
+    compoundKey(input.locatorNamespace, objectId, objectId)
+  ));
+  const fields = input.projected.row as Readonly<Record<string, JsonValue>>;
+  return {
+    success: true,
+    row: previous !== undefined
+      && sameProjectedRow(previous, input.projected.key, fields, path)
+      ? previous
+      : Object.freeze({
+          relationId: input.relationId,
+          key: input.projected.key,
+          fields,
+          locator: Object.freeze({
+            namespace: input.locatorNamespace,
+            token: objectId,
+            rowIncarnation: objectId
+          }),
+          storagePath: Object.freeze(path)
+        })
+  };
+};
+
 const planMappedInsert = <T extends object>(
   snapshot: SourceSnapshot<Automerge.Doc<T>>,
   compiled: MappedRelation,
@@ -1077,10 +1296,13 @@ const rememberProjection = <Storage extends object, Row>(
 const rememberPreviousProjection = (
   cache: Map<string, PreviousProjection>,
   key: string,
-  projection: PreviousProjection
+  projection: PreviousProjection,
+  onEvict: (key: string) => void
 ): void => {
   if (!cache.has(key) && cache.size >= 64) {
-    cache.delete(cache.keys().next().value as string);
+    const evicted = cache.keys().next().value as string;
+    cache.delete(evicted);
+    onEvict(evicted);
   }
   cache.set(key, projection);
 };

@@ -296,6 +296,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'database/external-store/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
   'database/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime', 'attachment-runtime', 'observer-contract', 'observer', 'system'],
   'schema/index.ts': ['foundation', 'capability', 'source-contract', 'schema'],
+  'schema/adapter/index.ts': ['foundation', 'capability', 'source-contract', 'schema'],
   'transactions/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime']
 }));
 

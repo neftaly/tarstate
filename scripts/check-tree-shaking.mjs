@@ -149,11 +149,12 @@ const cases = [
     // Automerge itself remains external. This covers Tarstate's complete
     // conflict-aware attachment, retained causal publication, transaction,
     // strict exact-basis adoption and text positions, structured field
-    // contracts, bounded recursive mappings, and observation closure.
+    // contracts, bounded recursive mappings, adapter-private incremental
+    // recursive projection, and observation closure.
     // Optional sibling entries can perturb shared chunk names and compression
     // without changing this closure. Keep a raw bound as the code-growth ratchet.
-    maxBytes: 302_000,
-    maxGzipBytes: 76_500
+    maxBytes: 311_000,
+    maxGzipBytes: 79_000
   }
 ];
 

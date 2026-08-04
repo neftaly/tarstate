@@ -2,6 +2,11 @@ import * as Automerge from '@automerge/automerge';
 import fc from 'fast-check';
 import { describe, expect, vi } from 'vitest';
 import { isValidUtf16TextSplice } from '@tarstate/core/transactions';
+import {
+  compileStorageMapping,
+  prepareSchema,
+  type StorageMappingBody
+} from '@tarstate/core/schema';
 import { viewAutomergeDocumentAtBasis } from '../src/view/index.js';
 import {
   AutomergeAtomicSource,
@@ -13,6 +18,7 @@ import {
   type AutomergeSourceCommitResult
 } from '../src/source/runtime.js';
 import { propertyTest } from '../../core/tests/support/property-test.js';
+import { createAutomergeMappedStorageBinding } from '../src/adapter/mapped-storage.js';
 
 type TestDoc = {
   count: number;
@@ -24,6 +30,21 @@ type TestDoc = {
 
 type ModelDoc = Omit<TestDoc, 'counter'> & { counter: number };
 type TestDraft = Parameters<Automerge.ChangeFn<TestDoc>>[0];
+
+type RecursivePiece = {
+  name: string;
+  rotation: number;
+  ignored?: number;
+  children: RecursivePiece[];
+};
+type RecursiveDocument = { children: RecursivePiece[] };
+type RecursiveEdit = {
+  readonly kind: 'rename' | 'rotate' | 'ignore' | 'insert-root' | 'delete-root'
+    | 'insert-child' | 'delete-child';
+  readonly first: number;
+  readonly second: number;
+  readonly value: number;
+};
 
 type Edit =
   | { readonly kind: 'set-count'; readonly value: number }
@@ -79,6 +100,60 @@ const actionArbitrary: fc.Arbitrary<Action> = fc.oneof(
   }) },
   { weight: 1, arbitrary: fc.record({ kind: fc.constant('retire'), epoch: fc.nat({ max: 3 }) }) }
 );
+const recursiveEditArbitrary: fc.Arbitrary<RecursiveEdit> = fc.record({
+  kind: fc.constantFrom(
+    'rename' as const,
+    'rotate' as const,
+    'ignore' as const,
+    'insert-root' as const,
+    'delete-root' as const,
+    'insert-child' as const,
+    'delete-child' as const
+  ),
+  first: fc.nat({ max: 12 }),
+  second: fc.nat({ max: 12 }),
+  value: fc.integer({ min: -100, max: 100 })
+});
+
+const recursiveMapping = (() => {
+  const schema = prepareSchema({
+    relations: { pieces: {
+      relationId: 'fuzz.pieces',
+      key: ['name'],
+      fields: {
+        name: { type: { kind: 'string' } },
+        rotation: { type: { kind: 'number' } }
+      }
+    } }
+  });
+  if (!schema.success) throw new Error('Recursive fuzz schema preparation failed');
+  const schemaRef = {
+    id: 'urn:fuzz:recursive-schema',
+    contentHash: `sha256:${'e'.repeat(64)}` as const
+  };
+  const body: StorageMappingBody = {
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: { 'fuzz.pieces': {
+      collection: {
+        kind: 'recursive-array',
+        path: ['children'],
+        descendants: ['children'],
+        absent: 'invalid',
+        maxDepth: 8,
+        maxRows: 128,
+        maxTraversalSteps: 512
+      },
+      keys: {
+        name: { kind: 'field', path: ['name'] }
+      },
+      fields: { rotation: { path: ['rotation'], write: {} } }
+    } }
+  };
+  const mapping = compileStorageMapping(body, schemaRef, schema.value);
+  if (!mapping.success) throw new Error('Recursive fuzz mapping preparation failed');
+  return mapping.value;
+})();
 
 const initialModel = (): ModelDoc => ({ count: 0, records: {}, items: [], counter: 0, text: '' });
 const initialDocument = (): Automerge.Doc<TestDoc> => Automerge.from<TestDoc>({
@@ -563,6 +638,48 @@ describe('Automerge shrinking model properties', () => {
     }
   ));
 
+  propertyTest('incremental recursive mapping equals fresh projection after every edit', fc.property(
+    fc.array(recursiveEditArbitrary, { maxLength: 24 }),
+    (edits) => {
+      let document = Automerge.from<RecursiveDocument>({
+        children: [
+          {
+            name: 'root:0',
+            rotation: 0,
+            children: [{ name: 'child:0', rotation: 0, children: [] }]
+          },
+          {
+            name: 'root:1',
+            rotation: 0,
+            children: [{ name: 'child:1', rotation: 0, children: [] }]
+          }
+        ]
+      }, { actor: '3'.repeat(64) });
+      const binding = createAutomergeMappedStorageBinding<RecursiveDocument>({
+        id: 'binding:recursive-fuzz',
+        mapping: recursiveMapping
+      });
+      let previous = binding.project(recursiveSnapshot(document));
+      for (const edit of edits) {
+        document = Automerge.change(document, (draft) => {
+          applyRecursiveEdit(draft, edit);
+        });
+        const incremental = binding.project(recursiveSnapshot(document));
+        const fresh = createAutomergeMappedStorageBinding<RecursiveDocument>({
+          id: 'binding:recursive-fuzz',
+          mapping: recursiveMapping
+        }).project(recursiveSnapshot(document));
+        expect(incremental).toEqual(fresh);
+        if (edit.kind === 'ignore'
+          && previous.completeness === 'exact'
+          && incremental.completeness === 'exact') {
+          expect(incremental).toBe(previous);
+        }
+        previous = incremental;
+      }
+    }
+  ));
+
   propertyTest('every retained historical head set materializes exactly', fc.property(
     fc.array(safeString, { maxLength: 16 }),
     fc.nat(),
@@ -658,4 +775,58 @@ const assertDocument = (document: Automerge.Doc<TestDoc>, model: ModelDoc): void
   expect([...document.items]).toEqual(model.items);
   expect(Number(document.counter)).toBe(model.counter);
   expect(document.text).toBe(model.text);
+};
+
+const recursiveSnapshot = (storage: Automerge.Doc<RecursiveDocument>) => ({
+  sourceId: 'source:recursive-fuzz',
+  operationEpoch: 'epoch:recursive-fuzz',
+  basis: { heads: Automerge.getHeads(storage) },
+  state: 'ready' as const,
+  freshness: 'current' as const,
+  storage,
+  issues: []
+});
+
+const applyRecursiveEdit = (
+  draft: Parameters<Automerge.ChangeFn<RecursiveDocument>>[0],
+  edit: RecursiveEdit
+): void => {
+  const root = draft.children.length === 0
+    ? undefined
+    : draft.children[edit.first % draft.children.length];
+  switch (edit.kind) {
+    case 'rename':
+      if (root !== undefined) root.name = `renamed:${edit.value}`;
+      break;
+    case 'rotate':
+      if (root !== undefined) root.rotation = edit.value;
+      break;
+    case 'ignore':
+      if (root !== undefined) root.ignored = edit.value;
+      break;
+    case 'insert-root':
+      draft.children.splice(edit.first % (draft.children.length + 1), 0, {
+        name: `inserted-root:${edit.value}`,
+        rotation: edit.value,
+        children: []
+      });
+      break;
+    case 'delete-root':
+      if (root !== undefined) draft.children.splice(edit.first % draft.children.length, 1);
+      break;
+    case 'insert-child':
+      if (root !== undefined) {
+        root.children.splice(edit.second % (root.children.length + 1), 0, {
+          name: `inserted-child:${edit.value}`,
+          rotation: edit.value,
+          children: []
+        });
+      }
+      break;
+    case 'delete-child':
+      if (root !== undefined && root.children.length > 0) {
+        root.children.splice(edit.second % root.children.length, 1);
+      }
+      break;
+  }
 };

@@ -31,6 +31,7 @@ export const corePublicEntryNames = [
   'query/model',
   'query/prepare',
   'schema',
+  'schema/adapter',
   'source',
   'transactions',
   'transactions/authoring',

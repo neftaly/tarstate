@@ -56,6 +56,7 @@ type LinkDoc = {
 
 type TreePiece = {
   name: string;
+  note?: string;
   children: TreePiece[];
 };
 
@@ -378,7 +379,19 @@ const recursiveArrayFixture = async () => {
     mapping: compiled.value,
     registry
   });
-  return { runtime, source, binding };
+  const projectFresh = () => createAutomergeMappedStorageBinding<TreeDoc>({
+    id: 'binding:recursive-array',
+    mapping: compiled.value,
+    registry
+  }).project(source.snapshot());
+  return {
+    runtime,
+    source,
+    binding,
+    mapping: compiled.value,
+    registry,
+    projectFresh
+  };
 };
 
 const commit = (basis: JsonValue, operationId: string, digit: string) => ({
@@ -387,8 +400,14 @@ const commit = (basis: JsonValue, operationId: string, digit: string) => ({
 
 describe('compiled-mapping-backed Automerge storage binding', () => {
   it('projects and edits recursive rows through stable Automerge identities', async () => {
-    const { runtime, source, binding } = await recursiveArrayFixture();
+    const {
+      runtime,
+      source,
+      binding,
+      projectFresh
+    } = await recursiveArrayFixture();
     const initial = binding.project(source.snapshot());
+    expect(initial).toEqual(projectFresh());
     expect(initial).toMatchObject({
       completeness: 'exact',
       issues: [],
@@ -447,6 +466,7 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       }
     ));
     const beforeEdit = binding.project(source.snapshot());
+    expect(beforeEdit).toEqual(projectFresh());
     const stableRoot = beforeEdit.rows.find(({ fields }) =>
       fields.name === 'Root');
     const previousGrandchild = beforeEdit.rows.find(({ fields }) =>
@@ -475,6 +495,7 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       .toBe('Changed');
 
     const shifted = binding.project(source.snapshot());
+    expect(shifted).toEqual(projectFresh());
     expect(shifted.rows.find(({ key }) => key[0] === stableRoot.key[0]))
       .toBe(stableRoot);
     expect(shifted.rows.find(({ key }) =>
@@ -499,6 +520,97 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     });
     expect(deleted.outcome).toBe('committed');
     expect(runtime.snapshot().storage.children[1]?.children).toEqual([]);
+    expect(binding.project(source.snapshot())).toEqual(projectFresh());
+    source.close();
+  });
+
+  it('matches a fresh recursive projection across ignored, scalar, structural, and merged changes', async () => {
+    const {
+      runtime,
+      source,
+      binding,
+      mapping,
+      registry,
+      projectFresh
+    } = await recursiveArrayFixture();
+    const initial = binding.project(source.snapshot());
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, (draft) => {
+      draft.children[0]!.note = 'not selected';
+    }));
+    const ignored = binding.project(source.snapshot());
+    expect(ignored).toBe(initial);
+    expect(ignored).toEqual(projectFresh());
+
+    const rowsBeforeScalar = ignored.rows;
+    runtime.replace(Automerge.change(runtime.snapshot().storage, (draft) => {
+      draft.children[0]!.children[0]!.name = 'Renamed 😀 child';
+    }));
+    const scalar = binding.project(source.snapshot());
+    expect(scalar).toEqual(projectFresh());
+    expect(scalar.rows.filter((row, index) => row !== rowsBeforeScalar[index]))
+      .toHaveLength(1);
+    const historical = source.snapshot();
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, (draft) => {
+      draft.children[0]!.children.unshift({ name: 'Inserted', children: [] });
+    }));
+    expect(binding.project(source.snapshot())).toEqual(projectFresh());
+
+    const base = runtime.snapshot().storage;
+    const local = Automerge.change(
+      Automerge.clone(base, { actor: '1'.repeat(64) }),
+      (draft) => { draft.children[0]!.name = 'Locally renamed'; }
+    );
+    const remote = Automerge.change(
+      Automerge.clone(base, { actor: '2'.repeat(64) }),
+      (draft) => { draft.children[1]!.name = 'Remotely renamed'; }
+    );
+    runtime.replace(Automerge.merge(local, remote));
+    expect(binding.project(source.snapshot())).toEqual(projectFresh());
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, (draft) => {
+      const moved = draft.children[0]!.children[0];
+      if (moved === undefined) return;
+      const copy = {
+        name: moved.name,
+        children: moved.children.map((child) => ({
+          name: child.name,
+          children: []
+        }))
+      };
+      draft.children[0]!.children.splice(0, 1);
+      draft.children[1]!.children.push(copy);
+    }));
+    expect(binding.project(source.snapshot())).toEqual(projectFresh());
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, (draft) => {
+      draft.children.splice(1, 1);
+    }));
+    expect(binding.project(source.snapshot())).toEqual(projectFresh());
+
+    const historicalProjection = binding.project(historical);
+    const freshHistorical = createAutomergeMappedStorageBinding<TreeDoc>({
+      id: 'binding:recursive-array',
+      mapping,
+      registry
+    }).project(historical);
+    expect(historicalProjection).toEqual(freshHistorical);
+    expect(historicalProjection.completeness).toBe('exact');
+
+    const conflictBase = runtime.snapshot().storage;
+    const conflictLeft = Automerge.change(
+      Automerge.clone(conflictBase, { actor: '3'.repeat(64) }),
+      (draft) => { draft.children[0]!.name = 'Conflict left'; }
+    );
+    const conflictRight = Automerge.change(
+      Automerge.clone(conflictBase, { actor: '4'.repeat(64) }),
+      (draft) => { draft.children[0]!.name = 'Conflict right'; }
+    );
+    runtime.replace(Automerge.merge(conflictLeft, conflictRight));
+    const conflicted = binding.project(source.snapshot());
+    expect(conflicted).toEqual(projectFresh());
+    expect(conflicted.completeness).toBe('unknown');
     source.close();
   });
 

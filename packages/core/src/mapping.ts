@@ -291,7 +291,7 @@ const projectStorageRelations = (
   let completeness: BindingProjection['completeness'] = 'exact';
   for (const [relationId, compiled] of binding.relations) {
     if (options.relationIds !== undefined && !options.relationIds.has(relationId)) continue;
-    const extracted = extractCandidates(
+    const extracted = extractMappedStorageCandidatesInternal(
       snapshot,
       compiled.mapping.collection,
       relationId,
@@ -301,7 +301,12 @@ const projectStorageRelations = (
     const rejectedLocators: MappingLocator[] = [];
     const relationIssues = [...extracted.issues];
     for (const candidate of extracted.candidates) {
-      const projected = projectCandidate(candidate, compiled, relationId, options);
+      const projected = projectMappedStorageCandidateInternal(
+        candidate,
+        compiled,
+        relationId,
+        options
+      );
       if (projected.success) rawCandidates.push({ value: projected.value, locator: candidate.locator });
       else { rejectedLocators.push(candidate.locator); relationIssues.push(...projected.issues); }
     }
@@ -444,7 +449,7 @@ const planStorageIntentDetails = (
   };
 };
 
-type ExtractedCandidate = {
+export type MappedStorageOccurrence = {
   readonly candidate: unknown;
   readonly parentCandidate?: unknown;
   readonly locator: MappingLocator;
@@ -452,12 +457,12 @@ type ExtractedCandidate = {
   readonly absolutePath: StoragePath;
 };
 
-const extractCandidates = (
+export const extractMappedStorageCandidatesInternal = (
   snapshot: unknown,
   collection: CollectionMapping,
   relationId: RelationId,
   sourceId?: string
-): { candidates: readonly ExtractedCandidate[]; issues: readonly Issue[]; complete: boolean } => {
+): { candidates: readonly MappedStorageOccurrence[]; issues: readonly Issue[]; complete: boolean } => {
   const resolved = readDataPath(snapshot, collection.path);
   if (!resolved.present) {
     if (resolved.reason === 'inspection_failed') return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: resolved.reason, error: resolved.error }, undefined, sourceId, relationId)], complete: false };
@@ -523,7 +528,7 @@ const extractCandidates = (
   if (!isRecord(resolved.value)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { expected: 'object-map' }, undefined, sourceId, relationId)], complete: false };
   try {
     const descriptors = Object.getOwnPropertyDescriptors(resolved.value);
-    const candidates: ExtractedCandidate[] = [];
+    const candidates: MappedStorageOccurrence[] = [];
     for (const key of Object.keys(descriptors).sort()) {
       const descriptor = descriptors[key];
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', [...collection.path, key], { reason: 'descriptor' }, undefined, sourceId, relationId)], complete: false };
@@ -541,7 +546,7 @@ const extractRecursiveArrayCandidates = (
   relationId: RelationId,
   sourceId?: string
 ): {
-  readonly candidates: readonly ExtractedCandidate[];
+  readonly candidates: readonly MappedStorageOccurrence[];
   readonly issues: readonly Issue[];
   readonly complete: boolean;
 } => {
@@ -614,8 +619,8 @@ const isRecursiveLocatorFor = (
   return true;
 };
 
-const projectCandidate = (
-  candidate: ExtractedCandidate,
+export const projectMappedStorageCandidateInternal = (
+  candidate: MappedStorageOccurrence,
   compiled: { readonly relation: PreparedRelation; readonly mapping: RelationStorageMapping },
   relationId: RelationId,
   options: ProjectStorageOptions
@@ -672,7 +677,7 @@ const projectCandidate = (
 };
 
 const projectSourceMetadata = (
-  candidate: ExtractedCandidate,
+  candidate: MappedStorageOccurrence,
   mapping: SourceMetadataMapping,
   compiled: { readonly relation: PreparedRelation },
   relationId: RelationId,
@@ -953,8 +958,9 @@ const mappingIssuePhase = (code: string): 'resolve' | 'query' | 'parse' => {
   return 'parse';
 };
 
-const mappingIssue = (code: string, path: readonly unknown[], details?: unknown, requiredCapabilities?: readonly CapabilityRef[], sourceId?: string, relationId?: string, retry: 'after_input' | 'after_capability' | 'manual_repair' = requiredCapabilities === undefined ? 'after_input' : 'after_capability'): Issue => createIssue({
+export const mappingIssueInternal = (code: string, path: readonly unknown[], details?: unknown, requiredCapabilities?: readonly CapabilityRef[], sourceId?: string, relationId?: string, retry: 'after_input' | 'after_capability' | 'manual_repair' = requiredCapabilities === undefined ? 'after_input' : 'after_capability'): Issue => createIssue({
   code, phase: mappingIssuePhase(code), severity: 'error', retry, path,
   ...(details === undefined ? {} : { details }), ...(requiredCapabilities === undefined ? {} : { requiredCapabilities }), ...(sourceId === undefined ? {} : { sourceId }), ...(relationId === undefined ? {} : { relationId })
 });
-const mappingFailure = (code: string, path: readonly unknown[], details?: unknown, sourceId?: string, relationId?: string, retry?: 'after_input' | 'after_capability' | 'manual_repair'): ParseResult<never> => ({ success: false, issues: [mappingIssue(code, path, details, undefined, sourceId, relationId, retry)] });
+const mappingIssue = mappingIssueInternal;
+const mappingFailure = (code: string, path: readonly unknown[], details?: unknown, sourceId?: string, relationId?: string, retry?: 'after_input' | 'after_capability' | 'manual_repair'): ParseResult<never> => ({ success: false, issues: [mappingIssueInternal(code, path, details, undefined, sourceId, relationId, retry)] });

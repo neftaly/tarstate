@@ -103,12 +103,15 @@ export const locateProjectedCandidate = (
   };
 };
 
-export const affectedMappedRelations = <T extends object>(
+export const mappedProjectionChange = <T extends object>(
   sourceId: string,
   storage: Automerge.Doc<T>,
   previous: { readonly sourceId: string; readonly heads: readonly string[] },
   relationReadEntries: ReadonlyMap<string, readonly AutomergePathFootprintEntry[]>
-): ReadonlySet<string> | undefined => {
+): {
+  readonly patches: ReturnType<typeof Automerge.diff>;
+  readonly relationIds: ReadonlySet<string>;
+} | undefined => {
   if (sourceId !== previous.sourceId || !Automerge.hasHeads(storage, [...previous.heads])) return undefined;
   const patches = Automerge.diff(storage, [...previous.heads], Automerge.getHeads(storage));
   const affected = new Set<string>();
@@ -117,7 +120,7 @@ export const affectedMappedRelations = <T extends object>(
       affected.add(relationId);
     }
   }
-  return affected;
+  return { patches, relationIds: affected };
 };
 
 export const conflictsAlongMappedPaths = (

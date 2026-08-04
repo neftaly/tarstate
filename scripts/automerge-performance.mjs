@@ -141,10 +141,134 @@ const measureTitleOnlyFileProjection = () => {
   };
 };
 
+const measureRecursiveScalarProjection = (rowCount) => {
+  const schema = prepareSchema({
+    relations: { pieces: {
+      relationId: 'performance.pieces',
+      key: ['occurrenceId'],
+      fields: {
+        occurrenceId: { type: { kind: 'string' } },
+        parentOccurrenceId: { type: { kind: 'string' }, nullable: true },
+        order: { type: { kind: 'integer' } },
+        name: { type: { kind: 'string' } }
+      }
+    } }
+  });
+  if (!schema.success) throw new Error('Performance recursive schema preparation failed');
+  const schemaRef = {
+    id: 'urn:performance:recursive',
+    contentHash: `sha256:${'b'.repeat(64)}`
+  };
+  const mapping = compileStorageMapping({
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: { 'performance.pieces': {
+      collection: {
+        kind: 'recursive-array',
+        path: ['children'],
+        descendants: ['children'],
+        absent: 'invalid',
+        maxDepth: 8,
+        maxRows: rowCount + 1,
+        maxTraversalSteps: rowCount * 2 + 1
+      },
+      keys: {
+        occurrenceId: {
+          kind: 'source-metadata',
+          value: 'collection-element-identity'
+        }
+      },
+      fields: {
+        parentOccurrenceId: {
+          kind: 'source-metadata',
+          value: 'recursive-parent-element-identity'
+        },
+        order: { kind: 'source-metadata', value: 'collection-position' },
+        name: { path: ['name'], write: {} }
+      }
+    } }
+  }, schemaRef, schema.value);
+  if (!mapping.success) throw new Error('Performance recursive mapping preparation failed');
+  const snapshot = (storage) => ({
+    sourceId: 'performance:recursive',
+    operationEpoch: 'performance:epoch',
+    basis: { heads: Automerge.getHeads(storage) },
+    state: 'ready',
+    freshness: 'current',
+    storage,
+    issues: []
+  });
+  let document = Automerge.from({
+    children: Array.from({ length: rowCount }, (_, index) => ({
+      name: 'piece:' + index,
+      children: []
+    }))
+  });
+  const binding = createAutomergeMappedStorageBinding({
+    id: 'performance:recursive',
+    mapping: mapping.value
+  });
+  const initialStarted = performance.now();
+  let previous = binding.project(snapshot(document));
+  const initialMilliseconds = performance.now() - initialStarted;
+  const firstChangedDocument = Automerge.change(document, (draft) => {
+    draft.children[0].name = 'changed:0';
+  });
+  const diffStarted = performance.now();
+  const patches = Automerge.diff(
+    firstChangedDocument,
+    Automerge.getHeads(document),
+    Automerge.getHeads(firstChangedDocument)
+  );
+  const diffMilliseconds = performance.now() - diffStarted;
+  const incrementalSamples = [];
+  let retainedRows = rowCount;
+  let incremental;
+  for (let sample = 0; sample < 7; sample += 1) {
+    document = sample === 0
+      ? firstChangedDocument
+      : Automerge.change(document, (draft) => {
+          draft.children[0].name = 'changed:' + sample;
+        });
+    const incrementalStarted = performance.now();
+    incremental = binding.project(snapshot(document));
+    incrementalSamples.push(performance.now() - incrementalStarted);
+    let retained = 0;
+    for (let index = 0; index < rowCount; index += 1) {
+      if (incremental.rows[index] === previous.rows[index]) retained += 1;
+    }
+    retainedRows = Math.min(retainedRows, retained);
+    previous = incremental;
+  }
+  incrementalSamples.sort((left, right) => left - right);
+  const incrementalMilliseconds = incrementalSamples[Math.floor(incrementalSamples.length / 2)];
+  const freshBinding = createAutomergeMappedStorageBinding({
+    id: 'performance:recursive',
+    mapping: mapping.value
+  });
+  const fullStarted = performance.now();
+  const full = freshBinding.project(snapshot(document));
+  const fullMilliseconds = performance.now() - fullStarted;
+  return {
+    rowCount,
+    patchCount: patches.length,
+    patches: patches.map(({ action, path }) => ({ action, path })),
+    diffMilliseconds: Number(diffMilliseconds.toFixed(3)),
+    initialMilliseconds: Number(initialMilliseconds.toFixed(3)),
+    incrementalMilliseconds: Number(incrementalMilliseconds.toFixed(3)),
+    incrementalSamples: incrementalSamples.map((value) => Number(value.toFixed(3))),
+    fullMilliseconds: Number(fullMilliseconds.toFixed(3)),
+    retainedRows,
+    exact: incremental.completeness === 'exact' && full.completeness === 'exact',
+    equivalent: JSON.stringify(incremental) === JSON.stringify(full)
+  };
+};
+
 const projections = [measureProjection(400), measureProjection(800)];
 const staleEvents = measureStaleEvent(800, 1_000);
 const valueAdoption = measureValueAdoption(2_000);
 const titleOnlyFile = measureTitleOnlyFileProjection();
+const recursiveScalarProjection = measureRecursiveScalarProjection(5_000);
 const contracts = {
   exactProjectionWithinBound: projections[0].completeness === 'exact' && projections[0].milliseconds <= 50,
   hostileDepthIsBounded: projections[1].completeness === 'unknown' && projections[1].propertyCount <= 513 && projections[1].milliseconds <= 50,
@@ -154,7 +278,12 @@ const contracts = {
     && titleOnlyFile.initialMilliseconds <= 50
     && titleOnlyFile.fields.join(',') === 'id,name',
   unobservedFileContentChangeReusesProjection: titleOnlyFile.reusedAfterContentChange
-    && titleOnlyFile.updateMilliseconds <= 50
+    && titleOnlyFile.updateMilliseconds <= 50,
+  recursiveScalarProjectionIsIncremental: recursiveScalarProjection.exact
+    && recursiveScalarProjection.equivalent
+    && recursiveScalarProjection.retainedRows === recursiveScalarProjection.rowCount - 1
+    && recursiveScalarProjection.incrementalMilliseconds <= 50
+    && recursiveScalarProjection.incrementalMilliseconds * 2 < recursiveScalarProjection.fullMilliseconds
 };
 const failures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
 
@@ -165,6 +294,7 @@ process.stdout.write(JSON.stringify({
   staleEvents,
   valueAdoption,
   titleOnlyFile,
+  recursiveScalarProjection,
   node: process.version
 }, null, 2) + '\n');
 if (failures.length > 0) throw new Error('Automerge performance contracts failed: ' + failures.join(', '));

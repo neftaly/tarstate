@@ -2,7 +2,40 @@
 export * from '../codec.js';
 export * from '../constraints.js';
 export * from '../lens.js';
-export * from '../mapping.js';
+export {
+  compileStorageMapping,
+  planStorageIntents,
+  planStoragePatch,
+  projectStorage,
+  sealStorageMapping
+} from '../mapping.js';
+export type {
+  AbsentFieldMapping,
+  BindingProjection,
+  BoundRelation,
+  BoundRow,
+  CollectionMapping,
+  CompiledStorageMapping,
+  FieldMapping,
+  KeyMapping,
+  MappedStorageIntent,
+  MappingLocator,
+  ProjectStorageOptions,
+  RecursiveArrayCollectionMapping,
+  RelationStorageMapping,
+  SourceMetadataMapping,
+  SourceMetadataResolver,
+  SourceMetadataResolverInput,
+  StorageEditPlan,
+  StorageIntentPlan,
+  StorageMappingArtifact,
+  StorageMappingBody,
+  StoragePath,
+  StorageScalarCodecInput,
+  StorageScalarDecoder,
+  StoredFieldMapping,
+  StoredFieldWriteMapping
+} from '../mapping.js';
 export {
   parseLogicalKey,
   parseRelationCandidate,

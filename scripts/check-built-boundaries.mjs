@@ -55,6 +55,7 @@ try {
   assertClosure('query/incremental/index.js', 217_500, ['internal-observer-query-maintenance', 'observer-maintenance-contracts', 'memory-source', 'transaction-executor']);
   // Includes storage-mapping compilation and authority-separated recursive traversal budgets.
   assertClosure('schema/index.js', 115_500, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
+  assertClosure('schema/adapter/index.js', 120_000, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
   assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/adapter/index.js', 25_000, ['query-incremental', 'internal-observer-query-maintenance', 'system-relations', 'transaction-executor']);
